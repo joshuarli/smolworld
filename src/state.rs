@@ -1,9 +1,12 @@
 use crate::config::validate_label;
-use crate::model::{format_mac, gateway_mac, Assignment, WorldConfig, WorldPaths, WorldState};
+use crate::model::{
+    format_mac, gateway_mac, ArtifactState, Assignment, LifecycleMetadata, LifecycleState,
+    RecoveryStatus, WorldConfig, WorldPaths, WorldState,
+};
 use crate::Result;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
@@ -11,6 +14,49 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATE_VERSION: u8 = 1;
+const LIFECYCLE_VERSION: u8 = 1;
+
+/// An advisory, kernel-backed per-world lock.
+///
+/// The lock file itself is persistent, but its exclusive lock is released by
+/// the operating system when the process exits. This is deliberately stronger
+/// than a PID marker or `create_new` directory: an interrupted `up` cannot
+/// leave a lock that blocks recovery, and two cooperating `up` processes cannot
+/// both pass acquisition.
+#[derive(Debug)]
+pub(crate) struct WorldLock {
+    _file: File,
+}
+
+impl WorldLock {
+    pub(crate) fn acquire(paths: &WorldPaths) -> Result<Self> {
+        ensure_private_dir(&paths.state_dir)?;
+        let path = paths.lock_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| format!("open world lock {}: {error}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod world lock {}: {error}", path.display()))?;
+        if let Err(error) = file.try_lock() {
+            match error {
+                TryLockError::WouldBlock => {
+                    return Err(format!(
+                        "world is already locked by another lifecycle operation ({})",
+                        path.display()
+                    ));
+                }
+                TryLockError::Error(error) => {
+                    return Err(format!("lock {}: {error}", path.display()));
+                }
+            }
+        }
+        Ok(Self { _file: file })
+    }
+}
 
 pub(crate) fn world_paths(config_path: &Path) -> Result<WorldPaths> {
     let canonical_config = fs::canonicalize(config_path)
@@ -41,6 +87,267 @@ pub(crate) fn fnv1a(input: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+pub(crate) fn load_lifecycle(path: &Path) -> Result<Option<LifecycleMetadata>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut version = None;
+    let mut state = None;
+    let mut owner_pid = None;
+    let mut owner_pid_seen = false;
+    let mut generation = None;
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["version", value] => {
+                if version.is_some() {
+                    return Err("lifecycle repeats version".into());
+                }
+                version = Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|_| "lifecycle has invalid version".to_string())?,
+                );
+            }
+            ["state", value] => {
+                if state.is_some() {
+                    return Err("lifecycle repeats state".into());
+                }
+                state = Some(
+                    LifecycleState::parse(value)
+                        .ok_or_else(|| "lifecycle has invalid state".to_string())?,
+                );
+            }
+            ["owner_pid", "-"] => {
+                if owner_pid_seen {
+                    return Err("lifecycle repeats owner_pid".into());
+                }
+                owner_pid_seen = true;
+                owner_pid = Some(None);
+            }
+            ["owner_pid", value] => {
+                if owner_pid_seen {
+                    return Err("lifecycle repeats owner_pid".into());
+                }
+                let pid = value
+                    .parse::<u32>()
+                    .map_err(|_| "lifecycle has invalid owner PID".to_string())?;
+                if pid == 0 {
+                    return Err("lifecycle owner PID must be positive".into());
+                }
+                owner_pid_seen = true;
+                owner_pid = Some(Some(pid));
+            }
+            ["generation", value] => {
+                if generation.is_some() {
+                    return Err("lifecycle repeats generation".into());
+                }
+                generation = Some(
+                    u64::from_str_radix(value, 16)
+                        .map_err(|_| "lifecycle has invalid generation".to_string())?,
+                );
+            }
+            _ => return Err("lifecycle contains an unknown or malformed line".into()),
+        }
+    }
+    if version != Some(LIFECYCLE_VERSION) {
+        return Err(format!(
+            "lifecycle format is not version {LIFECYCLE_VERSION}"
+        ));
+    }
+    let state = state.ok_or_else(|| "lifecycle is missing state".to_string())?;
+    if !owner_pid_seen {
+        return Err("lifecycle is missing owner PID".into());
+    }
+    let generation = generation.ok_or_else(|| "lifecycle is missing generation".to_string())?;
+    let owner_pid = if owner_pid_seen {
+        owner_pid.flatten()
+    } else {
+        None
+    };
+    LifecycleMetadata::new(state, owner_pid, generation).map(Some)
+}
+
+pub(crate) fn write_lifecycle(paths: &WorldPaths, lifecycle: LifecycleMetadata) -> Result<()> {
+    ensure_private_dir(&paths.state_dir)?;
+    let temporary = paths
+        .state_dir
+        .join(format!("lifecycle.{}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("chmod {}: {error}", temporary.display()))?;
+    writeln!(file, "version\t{LIFECYCLE_VERSION}")
+        .map_err(|error| format!("write lifecycle: {error}"))?;
+    writeln!(file, "state\t{}", lifecycle.state.as_str())
+        .map_err(|error| format!("write lifecycle: {error}"))?;
+    match lifecycle.owner_pid {
+        Some(pid) => writeln!(file, "owner_pid\t{pid}"),
+        None => writeln!(file, "owner_pid\t-"),
+    }
+    .map_err(|error| format!("write lifecycle: {error}"))?;
+    writeln!(file, "generation\t{:016x}", lifecycle.generation)
+        .map_err(|error| format!("write lifecycle: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync lifecycle: {error}"))?;
+    fs::rename(&temporary, paths.lifecycle_path())
+        .map_err(|error| format!("rename {}: {error}", paths.lifecycle_path().display()))?;
+    Ok(())
+}
+
+/// Remove only abandoned atomic-write temporary files for this world's state
+/// directory. The caller must hold [`WorldLock`] before invoking this helper;
+/// the lock makes it safe to remove a temporary left by an interrupted writer
+/// without racing another lifecycle operation.
+pub(crate) fn remove_stale_temporary_files(paths: &WorldPaths) -> Result<usize> {
+    match fs::symlink_metadata(&paths.state_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "state path is not a directory: {}",
+                paths.state_dir.display()
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "inspect state directory {}: {error}",
+                paths.state_dir.display()
+            ));
+        }
+    }
+
+    let entries = fs::read_dir(&paths.state_dir).map_err(|error| {
+        format!(
+            "read state directory {}: {error}",
+            paths.state_dir.display()
+        )
+    })?;
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "read state directory {}: {error}",
+                paths.state_dir.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if !is_state_temporary_file(&name) {
+            continue;
+        }
+        // Inspect without following symlinks. A replacement race can only
+        // make remove_file unlink the replacement directory entry; it cannot
+        // remove the symlink target.
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("inspect {}: {error}", entry.path().display()));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove {}: {error}", entry.path().display())),
+        }
+    }
+    Ok(removed)
+}
+
+fn is_state_temporary_file(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    ["state.", "lifecycle."]
+        .iter()
+        .any(|prefix| name.starts_with(prefix) && name.ends_with(".tmp"))
+        && name.len() > ".tmp".len() + 1
+}
+
+pub(crate) fn mark_starting(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let lifecycle = LifecycleMetadata::new(
+        LifecycleState::Starting,
+        Some(std::process::id()),
+        previous.generation.wrapping_add(1),
+    )?;
+    write_lifecycle(paths, lifecycle)?;
+    Ok(lifecycle)
+}
+
+pub(crate) fn mark_created(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(paths, LifecycleState::Created, &[LifecycleState::Starting])
+}
+
+pub(crate) fn mark_attached(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(
+        paths,
+        LifecycleState::Attached,
+        &[LifecycleState::Created, LifecycleState::Attached],
+    )
+}
+
+pub(crate) fn mark_running(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(
+        paths,
+        LifecycleState::Running,
+        &[LifecycleState::Attached, LifecycleState::Running],
+    )
+}
+
+pub(crate) fn mark_absent(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let lifecycle = LifecycleMetadata::new(LifecycleState::Absent, None, previous.generation)?;
+    write_lifecycle(paths, lifecycle)?;
+    Ok(lifecycle)
+}
+
+fn transition_lifecycle(
+    paths: &WorldPaths,
+    next: LifecycleState,
+    allowed_previous: &[LifecycleState],
+) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if !allowed_previous.contains(&previous.state) {
+        return Err(format!(
+            "cannot transition lifecycle from {} to {}",
+            previous.state.as_str(),
+            next.as_str()
+        ));
+    }
+    let lifecycle = LifecycleMetadata::new(next, previous.owner_pid, previous.generation)?;
+    write_lifecycle(paths, lifecycle)?;
+    Ok(lifecycle)
+}
+
+pub(crate) fn inspect_recovery(paths: &WorldPaths) -> Result<RecoveryStatus> {
+    Ok(RecoveryStatus {
+        state_file: artifact_state(&paths.state_file)?,
+        lifecycle_file: artifact_state(&paths.lifecycle_path())?,
+        runtime_dir: artifact_state(&paths.runtime_dir)?,
+        lifecycle: load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default(),
+    })
+}
+
+fn artifact_state(path: &Path) -> Result<ArtifactState> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(ArtifactState::Present),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ArtifactState::Missing),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+    }
 }
 
 pub(crate) fn load_state(path: &Path) -> Result<Option<WorldState>> {
@@ -279,23 +586,59 @@ pub(crate) fn parse_mac(value: &str) -> Result<[u8; 6]> {
 mod tests {
     use super::*;
     use crate::config::parse_config;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TemporaryWorld {
+        root: PathBuf,
+        paths: WorldPaths,
+    }
+
+    impl TemporaryWorld {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = env::temp_dir().join(format!(
+                "smolworld-state-test-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let state_dir = root.join("state");
+            Self {
+                paths: WorldPaths {
+                    canonical_config: root.join("demo/.smolworld"),
+                    config_dir: root.join("demo"),
+                    hash: 42,
+                    state_file: state_dir.join("state"),
+                    state_dir,
+                    runtime_dir: root.join("runtime"),
+                },
+                root,
+            }
+        }
+    }
+
+    impl Drop for TemporaryWorld {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn config() -> WorldConfig {
         parse_config(
-            r#"
-[world]
-name = "demo"
-
-[network]
-subnet = "10.89.0.0/24"
-
-[machines.redis]
-image = "./redis.tar"
-
-[machines.client]
-image = "./redis.tar"
-depends_on = ["redis"]
+            r#"world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  redis:
+    image: ./redis.tar
+  client:
+    image: ./redis.tar
+    depends_on: [redis]
 "#,
         )
         .unwrap()
@@ -354,5 +697,112 @@ depends_on = ["redis"]
             .assignments
             .values()
             .all(|assignment| assignment.ip != config.network.gateway));
+    }
+
+    #[test]
+    fn legacy_state_defaults_to_recorded_but_absent() {
+        let world = TemporaryWorld::new();
+        let state = WorldState {
+            seed: 7,
+            assignments: BTreeMap::new(),
+        };
+        write_state(&world.paths, &state).unwrap();
+
+        assert_eq!(load_state(&world.paths.state_file).unwrap(), Some(state));
+        assert_eq!(load_lifecycle(&world.paths.lifecycle_path()).unwrap(), None);
+
+        let recovery = inspect_recovery(&world.paths).unwrap();
+        assert!(recovery.is_recorded_but_absent());
+        assert!(!recovery.needs_recovery());
+    }
+
+    #[test]
+    fn lifecycle_transitions_round_trip_and_recover_interrupted_start() {
+        let world = TemporaryWorld::new();
+        write_state(
+            &world.paths,
+            &WorldState {
+                seed: 7,
+                assignments: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+
+        let starting = mark_starting(&world.paths).unwrap();
+        assert_eq!(starting.state, LifecycleState::Starting);
+        assert_eq!(starting.owner_pid, Some(std::process::id()));
+        assert_eq!(starting.generation, 1);
+        assert!(inspect_recovery(&world.paths).unwrap().needs_recovery());
+
+        let created = mark_created(&world.paths).unwrap();
+        assert_eq!(created.state, LifecycleState::Created);
+        let attached = mark_attached(&world.paths).unwrap();
+        assert_eq!(attached.state, LifecycleState::Attached);
+        let running = mark_running(&world.paths).unwrap();
+        assert_eq!(running.state, LifecycleState::Running);
+        assert!(inspect_recovery(&world.paths).unwrap().needs_recovery());
+
+        let absent = mark_absent(&world.paths).unwrap();
+        assert_eq!(absent.state, LifecycleState::Absent);
+        assert_eq!(absent.generation, starting.generation);
+        let recovery = inspect_recovery(&world.paths).unwrap();
+        assert!(recovery.is_recorded_but_absent());
+        assert!(!recovery.needs_recovery());
+    }
+
+    #[test]
+    fn lifecycle_transitions_reject_skipped_startup_milestones() {
+        let world = TemporaryWorld::new();
+        assert!(mark_created(&world.paths).is_err());
+        mark_starting(&world.paths).unwrap();
+        assert!(mark_running(&world.paths).is_err());
+    }
+
+    #[test]
+    fn world_lock_is_exclusive_and_releases_after_drop() {
+        let world = TemporaryWorld::new();
+        let first = WorldLock::acquire(&world.paths).unwrap();
+        let second = WorldLock::acquire(&world.paths);
+        assert!(second.is_err());
+
+        drop(first);
+        let _third = WorldLock::acquire(&world.paths).unwrap();
+    }
+
+    #[test]
+    fn stale_temporary_cleanup_is_narrow_and_does_not_follow_symlinks() {
+        let world = TemporaryWorld::new();
+        ensure_private_dir(&world.paths.state_dir).unwrap();
+        fs::write(world.paths.state_dir.join("state.123.tmp"), b"old state").unwrap();
+        fs::write(
+            world.paths.state_dir.join("lifecycle.123.tmp"),
+            b"old lifecycle",
+        )
+        .unwrap();
+        fs::write(world.paths.state_dir.join("state"), b"keep").unwrap();
+        fs::write(world.paths.state_dir.join("state.123"), b"keep").unwrap();
+        fs::write(world.paths.state_dir.join("lifecycle.123.tmp.bak"), b"keep").unwrap();
+        fs::create_dir(world.paths.state_dir.join("state.456.tmp")).unwrap();
+
+        let sibling = world.root.join("sibling");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("state.789.tmp"), b"keep").unwrap();
+
+        let target = world.root.join("outside-target");
+        fs::write(&target, b"do not remove").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, world.paths.state_dir.join("state.link.tmp")).unwrap();
+
+        assert_eq!(remove_stale_temporary_files(&world.paths).unwrap(), 2);
+        assert!(!world.paths.state_dir.join("state.123.tmp").exists());
+        assert!(!world.paths.state_dir.join("lifecycle.123.tmp").exists());
+        assert!(world.paths.state_dir.join("state").exists());
+        assert!(world.paths.state_dir.join("state.123").exists());
+        assert!(world.paths.state_dir.join("lifecycle.123.tmp.bak").exists());
+        assert!(world.paths.state_dir.join("state.456.tmp").is_dir());
+        assert!(sibling.join("state.789.tmp").exists());
+        assert_eq!(fs::read(&target).unwrap(), b"do not remove");
+        #[cfg(unix)]
+        assert!(world.paths.state_dir.join("state.link.tmp").exists());
     }
 }

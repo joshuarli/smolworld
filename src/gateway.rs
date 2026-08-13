@@ -229,17 +229,15 @@ mod tests {
     fn answers_arp_and_dns_a() {
         let config = parse_config(
             r#"
-[world]
-name = "demo"
-
-[network]
-subnet = "10.89.0.0/24"
-
-[machines.redis]
-image = "./redis.tar"
-
-[machines.client]
-image = "./redis.tar"
+world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  redis:
+    image: ./redis.tar
+  client:
+    image: ./redis.tar
 "#,
         )
         .unwrap();
@@ -278,6 +276,58 @@ image = "./redis.tar"
         let reply = gateway.handle(&request).unwrap();
         assert_eq!(&reply[14 + 20 + 8 + 4..14 + 20 + 8 + 8], &[0, 1, 0, 1]);
         assert!(reply.ends_with(&state.assignments["redis"].ip.octets()));
+    }
+
+    #[test]
+    fn ignores_truncated_and_malformed_ip_or_dns_frames() {
+        let config = parse_config(
+            r#"
+world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  redis:
+    image: ./redis.tar
+"#,
+        )
+        .unwrap();
+        let state = allocate_state(
+            Some(WorldState {
+                seed: 7,
+                assignments: BTreeMap::new(),
+            }),
+            &config,
+            &WorldPaths {
+                canonical_config: PathBuf::from("/tmp/demo/.smolworld"),
+                config_dir: PathBuf::from("/tmp/demo"),
+                hash: 42,
+                state_dir: PathBuf::from("/tmp/unused"),
+                state_file: PathBuf::from("/tmp/unused/state"),
+                runtime_dir: PathBuf::from("/tmp/unused/runtime"),
+            },
+        )
+        .unwrap();
+        let gateway = Gateway::new(&config, &state);
+        assert_eq!(gateway.handle(&[]), None);
+        assert_eq!(gateway.handle(&[0; 41]), None);
+
+        let request = dns_request(
+            [2, 0, 0, 0, 0, 9],
+            [10, 89, 0, 9],
+            gateway.mac,
+            gateway.ip,
+            "redis",
+        );
+        assert_eq!(gateway.handle(&request[..request.len() - 1]), None);
+
+        let mut invalid_protocol = request.clone();
+        invalid_protocol[23] = 6;
+        assert_eq!(gateway.handle(&invalid_protocol), None);
+
+        let mut invalid_total_length = request;
+        invalid_total_length[16..18].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert_eq!(gateway.handle(&invalid_total_length), None);
     }
 
     fn dns_request(

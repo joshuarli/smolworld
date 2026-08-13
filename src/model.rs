@@ -66,10 +66,131 @@ pub(crate) struct Assignment {
     pub(crate) smolvm_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldState {
     pub(crate) seed: u64,
     pub(crate) assignments: BTreeMap<String, Assignment>,
+}
+
+/// Durable lifecycle is kept separate from [`WorldState`] for compatibility
+/// with the original allocation record. `WorldState` is constructed directly
+/// by the gateway and switch tests, while lifecycle transitions are owned by
+/// the runtime supervisor through the state APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleState {
+    /// No machine records or runtime sockets are expected to be present.
+    Absent,
+    /// An `up` operation has claimed the world and may have created nothing,
+    /// some machines, or all machines when it is interrupted.
+    Starting,
+    /// Machine records have been created but the world has not attached all
+    /// guest NICs yet.
+    Created,
+    /// All expected guest NICs have attached to the world switch. This is an
+    /// attachment milestone, not a health/readiness claim.
+    Attached,
+    /// Startup completed and the supervisor owns the world lifecycle.
+    Running,
+}
+
+impl LifecycleState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Starting => "starting",
+            Self::Created => "created",
+            Self::Attached => "attached",
+            Self::Running => "running",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "absent" => Some(Self::Absent),
+            "starting" => Some(Self::Starting),
+            "created" => Some(Self::Created),
+            "attached" => Some(Self::Attached),
+            "running" => Some(Self::Running),
+            _ => None,
+        }
+    }
+
+    /// Every non-absent state can own external smolvm records or sockets.
+    /// After the per-world lock is acquired, these states therefore require
+    /// recovery before a new start can safely proceed.
+    pub(crate) fn needs_recovery(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+/// The durable lifecycle sidecar for one allocation state. `owner_pid` is
+/// diagnostic and identifies the process that last advanced an active world;
+/// the lock itself, rather than the PID, is the concurrency authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LifecycleMetadata {
+    pub(crate) state: LifecycleState,
+    pub(crate) owner_pid: Option<u32>,
+    pub(crate) generation: u64,
+}
+
+impl Default for LifecycleMetadata {
+    fn default() -> Self {
+        Self {
+            state: LifecycleState::Absent,
+            owner_pid: None,
+            generation: 0,
+        }
+    }
+}
+
+impl LifecycleMetadata {
+    pub(crate) fn new(
+        state: LifecycleState,
+        owner_pid: Option<u32>,
+        generation: u64,
+    ) -> std::result::Result<Self, String> {
+        if state == LifecycleState::Absent && owner_pid.is_some() {
+            return Err("absent lifecycle cannot have an owner PID".into());
+        }
+        if state != LifecycleState::Absent && owner_pid == Some(0) {
+            return Err("lifecycle owner PID must be positive".into());
+        }
+        Ok(Self {
+            state,
+            owner_pid,
+            generation,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactState {
+    Missing,
+    Present,
+}
+
+/// Read-only evidence used by `up` before it mutates external smolvm state.
+/// Callers should acquire [`WorldLock`](crate::state::WorldLock) first. With
+/// the lock held, a present runtime directory is leftover state from an
+/// earlier owner and must be cleaned before creating a new switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryStatus {
+    pub(crate) state_file: ArtifactState,
+    pub(crate) lifecycle_file: ArtifactState,
+    pub(crate) runtime_dir: ArtifactState,
+    pub(crate) lifecycle: LifecycleMetadata,
+}
+
+impl RecoveryStatus {
+    pub(crate) fn is_recorded_but_absent(&self) -> bool {
+        self.state_file == ArtifactState::Present
+            && self.lifecycle.state == LifecycleState::Absent
+            && self.runtime_dir == ArtifactState::Missing
+    }
+
+    pub(crate) fn needs_recovery(&self) -> bool {
+        self.lifecycle.state.needs_recovery() || self.runtime_dir == ArtifactState::Present
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +201,22 @@ pub(crate) struct WorldPaths {
     pub(crate) state_dir: PathBuf,
     pub(crate) state_file: PathBuf,
     pub(crate) runtime_dir: PathBuf,
+}
+
+impl WorldPaths {
+    /// The lock file is intentionally stable and is never deleted. The
+    /// operating-system file lock is released automatically when its owner
+    /// exits, so a leftover path cannot become a stale lock.
+    pub(crate) fn lock_path(&self) -> PathBuf {
+        self.state_dir.join("world.lock")
+    }
+
+    /// Lifecycle metadata is a sidecar so old allocation records remain
+    /// readable and existing `WorldState` constructors remain source
+    /// compatible.
+    pub(crate) fn lifecycle_path(&self) -> PathBuf {
+        self.state_dir.join("lifecycle")
+    }
 }
 
 pub(crate) fn format_mac(mac: [u8; 6]) -> String {

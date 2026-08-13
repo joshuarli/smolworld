@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use yaml_rust2::{Yaml, YamlLoader};
 
 pub(crate) fn load_config(path: &Path) -> Result<WorldConfig> {
     let text =
@@ -12,210 +13,125 @@ pub(crate) fn load_config(path: &Path) -> Result<WorldConfig> {
 }
 
 pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
-    #[derive(Clone)]
-    enum Section {
-        None,
-        World,
-        Network,
-        Machine(String),
-    }
+    let documents = YamlLoader::load_from_str(input)
+        .map_err(|error| format!(".smolworld YAML parse error: {error}"))?;
+    let [document] = documents.as_slice() else {
+        return Err(".smolworld must contain exactly one YAML document".into());
+    };
+    let root = yaml_hash(document, ".smolworld")?;
+    reject_unknown(root, &["world", "network", "machines"], ".smolworld")?;
 
-    let mut section = Section::None;
-    let mut seen = HashSet::new();
-    let mut world_name = None;
-    let mut subnet = None;
-    let mut gateway = None;
-    let mut dns = None;
-    let mut domain = None;
-    let mut machines: BTreeMap<String, MachineConfigBuilder> = BTreeMap::new();
+    let world = yaml_hash(required_key(root, "world", ".smolworld")?, "world")?;
+    reject_unknown(world, &["name"], "world")?;
+    let name = yaml_string(required_key(world, "name", "world")?, "world.name")?;
+    validate_label(&name).map_err(|reason| format!("world.name: {reason}"))?;
 
-    for (line_number, raw_line) in input.lines().enumerate() {
-        let line = strip_comment(raw_line).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            if !line.ends_with(']') || line.starts_with("[[") {
-                return Err(config_error(line_number, "expected a single table header"));
-            }
-            let header = &line[1..line.len() - 1];
-            section = match header {
-                "world" => Section::World,
-                "network" => Section::Network,
-                _ => {
-                    let Some(name) = header.strip_prefix("machines.") else {
-                        return Err(config_error(
-                            line_number,
-                            format!("unsupported table [{header}]"),
-                        ));
-                    };
-                    validate_label(name).map_err(|reason| config_error(line_number, reason))?;
-                    if machines.contains_key(name) {
-                        return Err(config_error(
-                            line_number,
-                            format!("duplicate machine '{name}'"),
-                        ));
-                    }
-                    machines.insert(name.to_string(), MachineConfigBuilder::default());
-                    Section::Machine(name.to_string())
-                }
-            };
-            continue;
-        }
-
-        let (key, value) = split_assignment(line)
-            .ok_or_else(|| config_error(line_number, "expected KEY = VALUE"))?;
-        let section_name = match &section {
-            Section::None => {
-                return Err(config_error(
-                    line_number,
-                    "key appears before a table header",
-                ))
-            }
-            Section::World => "world".to_string(),
-            Section::Network => "network".to_string(),
-            Section::Machine(name) => format!("machines.{name}"),
-        };
-        if !seen.insert(format!("{section_name}.{key}")) {
-            return Err(config_error(line_number, format!("duplicate key '{key}'")));
-        }
-
-        match &section {
-            Section::World if key == "name" => {
-                world_name =
-                    Some(parse_string(value).map_err(|reason| config_error(line_number, reason))?);
-            }
-            Section::Network if key == "subnet" => {
-                subnet =
-                    Some(parse_string(value).map_err(|reason| config_error(line_number, reason))?);
-            }
-            Section::Network if key == "gateway" => {
-                gateway =
-                    Some(parse_ipv4(value).map_err(|reason| config_error(line_number, reason))?);
-            }
-            Section::Network if key == "dns" => {
-                dns = Some(parse_ipv4(value).map_err(|reason| config_error(line_number, reason))?);
-            }
-            Section::Network if key == "domain" => {
-                domain =
-                    Some(parse_string(value).map_err(|reason| config_error(line_number, reason))?);
-            }
-            Section::Machine(name) => {
-                let machine = machines
-                    .get_mut(name)
-                    .expect("machine section inserted above");
-                match key {
-                    "image" => {
-                        machine.image = Some(
-                            parse_string(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "command" => {
-                        machine.command = Some(
-                            parse_string_array(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "depends_on" => {
-                        machine.depends_on = Some(
-                            parse_string_array(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "cpus" => {
-                        machine.cpus = Some(
-                            parse_positive_integer(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "memory_mib" => {
-                        machine.memory_mib = Some(
-                            parse_positive_integer(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "storage_gib" => {
-                        machine.storage_gib = Some(
-                            parse_positive_integer(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    "overlay_gib" => {
-                        machine.overlay_gib = Some(
-                            parse_positive_integer(value)
-                                .map_err(|reason| config_error(line_number, reason))?,
-                        )
-                    }
-                    _ => {
-                        return Err(config_error(
-                            line_number,
-                            format!("unsupported machine key '{key}'"),
-                        ))
-                    }
-                }
-            }
-            Section::World | Section::Network => {
-                return Err(config_error(
-                    line_number,
-                    format!("unsupported key '{key}'"),
-                ))
-            }
-            Section::None => unreachable!(),
-        }
-    }
-
-    let name = world_name.ok_or_else(|| "missing [world].name".to_string())?;
-    validate_label(&name).map_err(|reason| format!("[world].name: {reason}"))?;
-    let subnet = parse_subnet(&subnet.ok_or_else(|| "missing [network].subnet".to_string())?)?;
-    let gateway = gateway.unwrap_or_else(|| gateway_ip(subnet));
-    let dns = dns.unwrap_or(gateway);
+    let network = yaml_hash(required_key(root, "network", ".smolworld")?, "network")?;
+    reject_unknown(network, &["subnet", "gateway", "dns", "domain"], "network")?;
+    let subnet_value = yaml_string(
+        required_key(network, "subnet", "network")?,
+        "network.subnet",
+    )?;
+    let subnet = parse_subnet(&subnet_value)?;
+    let gateway = optional_key(network, "gateway")
+        .map(|value| yaml_ipv4(value, "network.gateway"))
+        .transpose()?
+        .unwrap_or_else(|| gateway_ip(subnet));
+    let dns = optional_key(network, "dns")
+        .map(|value| yaml_ipv4(value, "network.dns"))
+        .transpose()?
+        .unwrap_or(gateway);
     validate_network_identity(subnet, gateway, dns)?;
-    let domain = domain.unwrap_or_else(|| name.clone());
-    validate_domain(&domain).map_err(|reason| format!("[network].domain: {reason}"))?;
-    if machines.is_empty() {
-        return Err("at least one [machines.NAME] table is required".into());
+    let domain = optional_key(network, "domain")
+        .map(|value| yaml_string(value, "network.domain"))
+        .transpose()?
+        .unwrap_or_else(|| name.clone());
+    validate_domain(&domain).map_err(|reason| format!("network.domain: {reason}"))?;
+
+    let machine_values = yaml_hash(required_key(root, "machines", ".smolworld")?, "machines")?;
+    if machine_values.is_empty() {
+        return Err("machines must contain at least one machine".into());
     }
-    let machines = machines
-        .into_iter()
-        .map(|(name, builder)| {
-            let image = builder
-                .image
-                .ok_or_else(|| format!("[machines.{name}].image is required"))?;
-            if image.is_empty() {
-                return Err(format!("[machines.{name}].image must not be empty"));
+    let mut machines = BTreeMap::new();
+    for (machine_key, machine_value) in machine_values {
+        let machine_name = match machine_key {
+            Yaml::String(value) => value.clone(),
+            _ => return Err("machines keys must be strings".into()),
+        };
+        validate_label(&machine_name)
+            .map_err(|reason| format!("machines.{machine_name}: {reason}"))?;
+        let path = format!("machines.{machine_name}");
+        let machine = yaml_hash(machine_value, &path)?;
+        reject_unknown(
+            machine,
+            &[
+                "image",
+                "command",
+                "depends_on",
+                "cpus",
+                "memory_mib",
+                "storage_gib",
+                "overlay_gib",
+            ],
+            &path,
+        )?;
+        let image = yaml_string(
+            required_key(machine, "image", &path)?,
+            &format!("{path}.image"),
+        )?;
+        if image.is_empty() {
+            return Err(format!("{path}.image must not be empty"));
+        }
+        let command = optional_key(machine, "command")
+            .map(|value| yaml_string_array(value, &format!("{path}.command")))
+            .transpose()?
+            .unwrap_or_default();
+        let depends_on = optional_key(machine, "depends_on")
+            .map(|value| yaml_string_array(value, &format!("{path}.depends_on")))
+            .transpose()?
+            .unwrap_or_default();
+        let mut unique_dependencies = HashSet::new();
+        for dependency in &depends_on {
+            validate_label(dependency).map_err(|reason| format!("{path}.depends_on: {reason}"))?;
+            if !unique_dependencies.insert(dependency) {
+                return Err(format!("{path}.depends_on repeats '{dependency}'"));
             }
-            let depends_on = builder.depends_on.unwrap_or_default();
-            let mut unique_dependencies = HashSet::new();
-            for dependency in &depends_on {
-                validate_label(dependency)
-                    .map_err(|reason| format!("[machines.{name}].depends_on: {reason}"))?;
-                if !unique_dependencies.insert(dependency) {
-                    return Err(format!(
-                        "[machines.{name}].depends_on repeats '{dependency}'"
-                    ));
-                }
-            }
-            let defaults = MachineResources::default();
-            let resources = MachineResources {
-                cpus: builder.cpus.unwrap_or(defaults.cpus),
-                memory_mib: builder.memory_mib.unwrap_or(defaults.memory_mib),
-                storage_gib: builder.storage_gib.unwrap_or(defaults.storage_gib),
-                overlay_gib: builder.overlay_gib.unwrap_or(defaults.overlay_gib),
-            };
-            validate_resources(resources)
-                .map_err(|reason| format!("[machines.{name}]: {reason}"))?;
-            Ok((
-                name,
+        }
+        let defaults = MachineResources::default();
+        let resources = MachineResources {
+            cpus: optional_key(machine, "cpus")
+                .map(|value| yaml_positive_integer(value, &format!("{path}.cpus")))
+                .transpose()?
+                .unwrap_or(defaults.cpus),
+            memory_mib: optional_key(machine, "memory_mib")
+                .map(|value| yaml_positive_integer(value, &format!("{path}.memory_mib")))
+                .transpose()?
+                .unwrap_or(defaults.memory_mib),
+            storage_gib: optional_key(machine, "storage_gib")
+                .map(|value| yaml_positive_integer(value, &format!("{path}.storage_gib")))
+                .transpose()?
+                .unwrap_or(defaults.storage_gib),
+            overlay_gib: optional_key(machine, "overlay_gib")
+                .map(|value| yaml_positive_integer(value, &format!("{path}.overlay_gib")))
+                .transpose()?
+                .unwrap_or(defaults.overlay_gib),
+        };
+        validate_resources(resources).map_err(|reason| format!("{path}: {reason}"))?;
+        if machines
+            .insert(
+                machine_name.clone(),
                 MachineConfig {
                     image,
-                    command: builder.command.unwrap_or_default(),
+                    command,
                     depends_on,
                     resources,
                 },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
+            )
+            .is_some()
+        {
+            return Err(format!("machines repeats '{machine_name}'"));
+        }
+    }
     let config = WorldConfig {
         name,
         network: NetworkConfig {
@@ -230,123 +146,69 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
     Ok(config)
 }
 
-#[derive(Default)]
-pub(crate) struct MachineConfigBuilder {
-    image: Option<String>,
-    command: Option<Vec<String>>,
-    depends_on: Option<Vec<String>>,
-    cpus: Option<u8>,
-    memory_mib: Option<u32>,
-    storage_gib: Option<u64>,
-    overlay_gib: Option<u64>,
-}
-
-pub(crate) fn config_error(line_number: usize, reason: impl std::fmt::Display) -> String {
-    format!(".smolworld line {}: {reason}", line_number + 1)
-}
-
-pub(crate) fn strip_comment(value: &str) -> &str {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, character) in value.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' && quoted {
-            escaped = true;
-        } else if character == '"' {
-            quoted = !quoted;
-        } else if character == '#' && !quoted {
-            return &value[..index];
-        }
-    }
+fn yaml_hash<'a>(value: &'a Yaml, path: &str) -> Result<&'a yaml_rust2::yaml::Hash> {
     value
+        .as_hash()
+        .ok_or_else(|| format!("{path} must be a mapping"))
 }
 
-pub(crate) fn split_assignment(line: &str) -> Option<(&str, &str)> {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, character) in line.char_indices() {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' && quoted {
-            escaped = true;
-        } else if character == '"' {
-            quoted = !quoted;
-        } else if character == '=' && !quoted {
-            let key = line[..index].trim();
-            let value = line[index + 1..].trim();
-            if !key.is_empty() && !value.is_empty() {
-                return Some((key, value));
-            }
-            return None;
-        }
-    }
-    None
+fn required_key<'a>(hash: &'a yaml_rust2::yaml::Hash, key: &str, path: &str) -> Result<&'a Yaml> {
+    hash.get(&Yaml::String(key.to_string()))
+        .ok_or_else(|| format!("{path}.{key} is required"))
 }
 
-pub(crate) fn parse_string(value: &str) -> Result<String> {
-    let (parsed, rest) = parse_string_prefix(value)?;
-    if rest.trim().is_empty() {
-        Ok(parsed)
-    } else {
-        Err("unexpected text after string".into())
-    }
+fn optional_key<'a>(hash: &'a yaml_rust2::yaml::Hash, key: &str) -> Option<&'a Yaml> {
+    hash.get(&Yaml::String(key.to_string()))
 }
 
-pub(crate) fn parse_string_prefix(value: &str) -> Result<(String, &str)> {
-    let value = value.trim_start();
-    let Some(rest) = value.strip_prefix('"') else {
-        return Err("expected a double-quoted string".into());
-    };
-    let mut result = String::new();
-    let mut escaped = false;
-    for (index, character) in rest.char_indices() {
-        if escaped {
-            match character {
-                '"' | '\\' => result.push(character),
-                'n' => result.push('\n'),
-                _ => return Err("unsupported string escape".into()),
-            }
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Ok((result, &rest[index + character.len_utf8()..]));
-        } else {
-            result.push(character);
-        }
-    }
-    Err("unterminated string".into())
-}
-
-pub(crate) fn parse_string_array(value: &str) -> Result<Vec<String>> {
-    let mut rest = value.trim_start();
-    let Some(after_open) = rest.strip_prefix('[') else {
-        return Err("expected an array of double-quoted strings".into());
-    };
-    rest = after_open.trim_start();
-    let mut result = Vec::new();
-    if let Some(after_close) = rest.strip_prefix(']') {
-        if after_close.trim().is_empty() {
-            return Ok(result);
-        }
-        return Err("unexpected text after array".into());
-    }
-    loop {
-        let (item, after_item) = parse_string_prefix(rest)?;
-        result.push(item);
-        rest = after_item.trim_start();
-        if let Some(after_close) = rest.strip_prefix(']') {
-            if after_close.trim().is_empty() {
-                return Ok(result);
-            }
-            return Err("unexpected text after array".into());
-        }
-        let Some(after_comma) = rest.strip_prefix(',') else {
-            return Err("array items must be separated by commas".into());
+fn reject_unknown(hash: &yaml_rust2::yaml::Hash, allowed: &[&str], path: &str) -> Result<()> {
+    for key in hash.keys() {
+        let Yaml::String(key) = key else {
+            return Err(format!("{path} keys must be strings"));
         };
-        rest = after_comma.trim_start();
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{path} contains unsupported key '{key}'"));
+        }
     }
+    Ok(())
+}
+
+fn yaml_string(value: &Yaml, path: &str) -> Result<String> {
+    match value {
+        Yaml::String(value) => Ok(value.clone()),
+        _ => Err(format!("{path} must be a string")),
+    }
+}
+
+fn yaml_string_array(value: &Yaml, path: &str) -> Result<Vec<String>> {
+    let Yaml::Array(values) = value else {
+        return Err(format!("{path} must be an array of strings"));
+    };
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| yaml_string(value, &format!("{path}[{index}]")))
+        .collect()
+}
+
+fn yaml_ipv4(value: &Yaml, path: &str) -> Result<Ipv4Addr> {
+    let value = yaml_string(value, path)?;
+    value
+        .parse()
+        .map_err(|_| format!("{path} must be a valid IPv4 address"))
+}
+
+fn yaml_positive_integer<T>(value: &Yaml, path: &str) -> Result<T>
+where
+    T: TryFrom<i64>,
+{
+    let Yaml::Integer(value) = value else {
+        return Err(format!("{path} must be a positive integer"));
+    };
+    if *value <= 0 {
+        return Err(format!("{path} must be greater than zero"));
+    }
+    T::try_from(*value).map_err(|_| format!("{path} is out of range"))
 }
 
 pub(crate) fn validate_label(value: &str) -> Result<()> {
@@ -380,30 +242,6 @@ pub(crate) fn parse_subnet(value: &str) -> Result<[u8; 4]> {
         return Err("[network].subnet must be the /24 network address ending in .0".into());
     }
     Ok(octets)
-}
-
-pub(crate) fn parse_ipv4(value: &str) -> Result<Ipv4Addr> {
-    let value = parse_string(value)?;
-    value
-        .parse()
-        .map_err(|_| "expected a valid IPv4 address".to_string())
-}
-
-pub(crate) fn parse_positive_integer<T>(value: &str) -> Result<T>
-where
-    T: std::str::FromStr + PartialEq + From<u8>,
-{
-    let value = value.trim();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("expected a positive integer".into());
-    }
-    let parsed = value
-        .parse::<T>()
-        .map_err(|_| "integer is out of range".to_string())?;
-    if parsed == T::from(0) {
-        return Err("must be greater than zero".into());
-    }
-    Ok(parsed)
 }
 
 pub(crate) fn validate_network_identity(
@@ -490,19 +328,17 @@ mod tests {
     fn config() -> WorldConfig {
         parse_config(
             r#"
-[world]
-name = "demo"
-
-[network]
-subnet = "10.89.0.0/24"
-
-[machines.redis]
-image = "./redis.tar"
-
-[machines.client]
-image = "./redis.tar"
-command = ["sleep", "infinity"]
-depends_on = ["redis"]
+world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  redis:
+    image: ./redis.tar
+  client:
+    image: ./redis.tar
+    command: [sleep, infinity]
+    depends_on: [redis]
 "#,
         )
         .unwrap()
@@ -512,9 +348,17 @@ depends_on = ["redis"]
     fn is_strict_and_orders_dependencies() {
         let config = config();
         assert_eq!(topological_order(&config).unwrap(), ["redis", "client"]);
-        assert!(parse_config("[world]\nname = \"demo\"\n").is_err());
+        assert!(parse_config("world:\n  name: demo\n").is_err());
         assert!(parse_config(
-            "[world]\nname=\"demo\"\nunknown=\"x\"\n[network]\nsubnet=\"10.89.0.0/24\"\n[machines.a]\nimage=\"./x.tar\""
+            "world:\n  name: demo\n  unknown: x\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar"
+        )
+        .is_err());
+        assert!(parse_config(
+            "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar\n---\nworld: {}"
+        )
+        .is_err());
+        assert!(parse_config(
+            "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar\n    image: ./other.tar"
         )
         .is_err());
     }
@@ -536,21 +380,20 @@ depends_on = ["redis"]
     fn accepts_generic_network_and_machine_resources() {
         let config = parse_config(
             r#"
-[world]
-name = "lab"
-
-[network]
-subnet = "10.97.4.0/24"
-gateway = "10.97.4.9"
-dns = "10.97.4.9"
-domain = "lab.test"
-
-[machines.api]
-image = "./api.tar"
-cpus = 2
-memory_mib = 512
-storage_gib = 3
-overlay_gib = 2
+world:
+  name: lab
+network:
+  subnet: 10.97.4.0/24
+  gateway: 10.97.4.9
+  dns: 10.97.4.9
+  domain: lab.test
+machines:
+  api:
+    image: ./api.tar
+    cpus: 2
+    memory_mib: 512
+    storage_gib: 3
+    overlay_gib: 2
 "#,
         )
         .unwrap();
@@ -567,11 +410,11 @@ overlay_gib = 2
             }
         );
         assert!(parse_config(
-            "[world]\nname=\"lab\"\n[network]\nsubnet=\"10.97.4.0/24\"\ndns=\"10.97.4.2\"\n[machines.a]\nimage=\"./a.tar\""
+            "world:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\n  dns: 10.97.4.2\nmachines:\n  a:\n    image: ./a.tar"
         )
         .is_err());
         assert!(parse_config(
-            "[world]\nname=\"lab\"\n[network]\nsubnet=\"10.97.4.0/24\"\n[machines.a]\nimage=\"./a.tar\"\nmemory_mib=63"
+            "world:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\nmachines:\n  a:\n    image: ./a.tar\n    memory_mib: 63"
         )
         .is_err());
     }
