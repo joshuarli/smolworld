@@ -1,0 +1,15 @@
+[world]
+name = "redis-demo"
+
+[network]
+subnet = "10.89.0.0/24"
+domain = "redis-demo.test"
+
+[machines.redis]
+image = "./redis.tar"
+command = ["redis-server"]
+
+[machines.client]
+image = "./redis.tar"
+command = ["sleep", "infinity"]
+depends_on = ["redis"]

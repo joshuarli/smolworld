@@ -1,0 +1,9 @@
+[package]
+name = "smolworld"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal local L2 worlds for smolvm"
+
+[[bin]]
+name = "smolworld"
+path = "src/main.rs"
