@@ -102,7 +102,6 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     let order = topological_order(&config)?;
     let paths = v2_world_paths(config_path)?;
     let smolvm = smolvm_program();
-    verify_prepared_world(&config, &paths, &smolvm)?;
     let _world_lock = WorldLock::acquire_v2(&paths)?;
     let material = verify_prepared_world(&config, &paths, &smolvm)?;
 
