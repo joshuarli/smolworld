@@ -31,7 +31,8 @@ Configuration environment:
   SMOLWORLD_BUILD_AGENT_ROOTFS  Build a missing rootfs with smolvm's script
                                 (default: 1; set to 0 to require one).
   SMOLWORLD_BUILD_LIBKRUN       Rebuild libkrun with `make smolvm` (default: 0).
-  SMOLWORLD_LIBKRUN_DIR         Patched libkrun checkout for that build.
+  SMOLWORLD_LIBKRUN_DIR         Integrated smolvm libkrun source for that
+                                build (default: $SMOLVM_SOURCE_DIR/libkrun).
   SMOLWORLD_LIBKRUN_BUILD_FLAGS Make flags (default: BLK=1 NET=1 GPU=1).
   CODESIGN_IDENTITY             macOS signing identity (default: -).
   SMOLWORLD_INSTALL_PREFIX      Dedicated install directory
@@ -214,7 +215,7 @@ LIBKRUNFW="$SMOLVM_LIB_DIR/libkrunfw.5.dylib"
 if [[ "$SMOLWORLD_BUILD_LIBKRUN" == 1 ]]; then
     require_library "$LIBKRUNFW"
     [[ -f "$SMOLWORLD_LIBKRUN_DIR/Makefile" ]] \
-        || fail "patched libkrun checkout is unavailable at $SMOLWORLD_LIBKRUN_DIR"
+        || fail "integrated smolvm libkrun source is unavailable at $SMOLWORLD_LIBKRUN_DIR"
     grep -q '^smolvm:' "$SMOLWORLD_LIBKRUN_DIR/Makefile" \
         || fail "$SMOLWORLD_LIBKRUN_DIR/Makefile has no supported 'smolvm' build target"
     mkdir -p "$SMOLVM_LIB_DIR"

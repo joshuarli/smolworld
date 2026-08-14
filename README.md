@@ -16,10 +16,17 @@ export PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$P
 ```
 
 The installer expects a patched smolvm source checkout. By default it looks for
-`../smolvm` beside this checkout, and it uses that checkout's `lib/` directory
-as the runtime bundle. The bundle must contain the patched pair
+`../smolvm` beside this checkout, uses that checkout's `lib/` directory as the
+runtime bundle, and—when rebuilding libkrun—uses its integrated
+`libkrun/` source directory. The bundle must contain the patched pair
 `libkrun.dylib` and `libkrunfw.5.dylib`; the installer rejects Git LFS pointer
 files and checks that `libkrun` exports `krun_add_net_unixstream`.
+
+`SMOLWORLD_LIBKRUN_DIR` defaults to
+`$SMOLVM_SOURCE_DIR/libkrun`. A sibling `~/d/libkrun` checkout is not an
+implicit input: it may be rebased or used for independent libkrun work, but a
+smolworld install uses the libkrun source integrated with the selected smolvm
+checkout unless that variable is explicitly overridden.
 
 `libkrunfw` is a guest-kernel artifact, and this repository does not contain a
 complete macOS build procedure for its external kernel tree. The installer
@@ -64,7 +71,8 @@ SMOLVM_LIB_DIR                libkrun/libkrunfw bundle (default: $SMOLVM_SOURCE_
 SMOLVM_AGENT_ROOTFS           prepared agent rootfs
 SMOLWORLD_BUILD_AGENT_ROOTFS  build a missing rootfs (default: 1)
 SMOLWORLD_BUILD_LIBKRUN       rebuild libkrun with make smolvm (default: 0)
-SMOLWORLD_LIBKRUN_DIR         patched libkrun checkout for that rebuild
+SMOLWORLD_LIBKRUN_DIR         integrated smolvm libkrun source (default:
+                              $SMOLVM_SOURCE_DIR/libkrun)
 SMOLWORLD_LIBKRUN_BUILD_FLAGS make flags (default: BLK=1 NET=1 GPU=1)
 CODESIGN_IDENTITY             codesign identity (default: - for ad-hoc signing)
 SMOLWORLD_INSTALL_PREFIX      install directory (default: ~/.local/smolworld)
