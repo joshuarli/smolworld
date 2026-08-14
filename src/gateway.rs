@@ -220,43 +220,47 @@ pub(crate) fn ipv4_checksum(header: &[u8]) -> u16 {
 mod tests {
     use super::*;
     use crate::config::parse_config;
-    use crate::model::{WorldPaths, WorldState};
-    use crate::state::allocate_state;
+    use crate::model::{Assignment, WorldState};
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     #[test]
     fn answers_arp_and_dns_a() {
         let config = parse_config(
             r#"
+format: 2
 world:
   name: demo
 network:
   subnet: 10.89.0.0/24
 machines:
   redis:
-    image: ./redis.tar
+    smolfile: ./redis.Smolfile
   client:
-    image: ./redis.tar
+    smolfile: ./client.Smolfile
 "#,
         )
         .unwrap();
-        let state = allocate_state(
-            Some(WorldState {
-                seed: 7,
-                assignments: BTreeMap::new(),
-            }),
-            &config,
-            &WorldPaths {
-                canonical_config: PathBuf::from("/tmp/demo/.smolworld"),
-                config_dir: PathBuf::from("/tmp/demo"),
-                hash: 42,
-                state_dir: PathBuf::from("/tmp/unused"),
-                state_file: PathBuf::from("/tmp/unused/state"),
-                runtime_dir: PathBuf::from("/tmp/unused/runtime"),
-            },
-        )
-        .unwrap();
+        let state = WorldState {
+            seed: 7,
+            assignments: BTreeMap::from([
+                (
+                    "redis".to_string(),
+                    Assignment {
+                        ip: "10.89.0.2".parse().unwrap(),
+                        mac: [2, 0, 0, 0, 0, 2],
+                        smolvm_name: "smw-v2-redis".to_string(),
+                    },
+                ),
+                (
+                    "client".to_string(),
+                    Assignment {
+                        ip: "10.89.0.3".parse().unwrap(),
+                        mac: [2, 0, 0, 0, 0, 3],
+                        smolvm_name: "smw-v2-client".to_string(),
+                    },
+                ),
+            ]),
+        };
         let gateway = Gateway::new(&config, &state);
         let client_mac = [2, 0, 0, 0, 0, 9];
         let client_ip = [10, 89, 0, 9];
@@ -282,32 +286,28 @@ machines:
     fn ignores_truncated_and_malformed_ip_or_dns_frames() {
         let config = parse_config(
             r#"
+format: 2
 world:
   name: demo
 network:
   subnet: 10.89.0.0/24
 machines:
   redis:
-    image: ./redis.tar
+    smolfile: ./redis.Smolfile
 "#,
         )
         .unwrap();
-        let state = allocate_state(
-            Some(WorldState {
-                seed: 7,
-                assignments: BTreeMap::new(),
-            }),
-            &config,
-            &WorldPaths {
-                canonical_config: PathBuf::from("/tmp/demo/.smolworld"),
-                config_dir: PathBuf::from("/tmp/demo"),
-                hash: 42,
-                state_dir: PathBuf::from("/tmp/unused"),
-                state_file: PathBuf::from("/tmp/unused/state"),
-                runtime_dir: PathBuf::from("/tmp/unused/runtime"),
-            },
-        )
-        .unwrap();
+        let state = WorldState {
+            seed: 7,
+            assignments: BTreeMap::from([(
+                "redis".to_string(),
+                Assignment {
+                    ip: "10.89.0.2".parse().unwrap(),
+                    mac: [2, 0, 0, 0, 0, 2],
+                    smolvm_name: "smw-v2-redis".to_string(),
+                },
+            )]),
+        };
         let gateway = Gateway::new(&config, &state);
         assert_eq!(gateway.handle(&[]), None);
         assert_eq!(gateway.handle(&[0; 41]), None);

@@ -1,0 +1,13 @@
+# Redis service for the two-machine smolworld foundation gate.
+#
+# `../redis.tar` is a host-prepared local OCI archive. It is deliberately a
+# file path rather than a registry reference: smolworld's prepare boundary
+# must verify and lock this material without a Docker daemon or guest egress.
+
+image = "../redis.tar"
+entrypoint = ["redis-server"]
+
+cpus = 1
+memory = 256
+storage = 1
+overlay = 1

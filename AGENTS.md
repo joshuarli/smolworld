@@ -83,13 +83,14 @@ contract; update its users and tests deliberately when changing it.
 * Unknown/broadcast/multicast destination MACs flood to other attached ports;
   known unicast targets the learned port. Detach must remove the port and its
   FDB entries.
-* `up` owns only deterministic `smw-...` machine names recorded in its world
-  state. `down` and signal cleanup must never affect unrelated smolvm machines.
-* Images are local paths. Validate all configuration and inspectable runtime
-  prerequisites before state, listeners, or machines are created.
-* Default machine resources are intentionally small: 1 vCPU, 256 MiB RAM, and
-  1 GiB sparse storage/overlay. Per-machine overrides remain positive; memory
-  must be at least 64 MiB.
+* `up` owns only deterministic `smw-v2-...` machine names recorded in its v2
+  world state. `down` and signal cleanup must never affect unrelated smolvm
+  machines or v1 state.
+* Images are prepared local material referenced by Smolfiles. Validate all
+  configuration and inspectable runtime prerequisites before state, listeners,
+  or machines are created; guests never pull images.
+* Machine resources belong to the restricted Smolfile profile. smolworld does
+  not duplicate or override them in `.smolworld`.
 
 ## Runtime requirements
 
@@ -111,11 +112,16 @@ cargo clippy -- -D warnings
 git diff --check
 ```
 
-The real local integration test is opt-in because it creates VMs and needs
-Apple Hypervisor Framework plus prepared artifacts:
+The real local Redis foundation integration test is opt-in because it creates
+VMs and needs Apple Hypervisor Framework plus prepared artifacts. It must run
+without Docker, Compose, OrbStack, `DOCKER_HOST`, or a Docker socket:
 
 ```bash
-SMOLWORLD_E2E=1 bash tests/e2e-redis.sh
+SMOLWORLD_E2E=1 \
+SMOLWORLD_SMOLVM=/path/to/smolvm \
+SMOLVM_AGENT_ROOTFS=/path/to/agent-rootfs \
+SMOLVM_LIB_DIR=/path/to/smolvm/lib \
+bash tests/e2e-redis-foundation.sh
 ```
 
 It proves generic static DNS, Redis TCP through real virtio NICs, and exact
@@ -126,8 +132,8 @@ The companion smolvm patch has focused external-network tests. Run them with
 the local libkrun build when changing that boundary:
 
 ```bash
-LIBKRUN_DIR="$HOME/d/libkrun/target/release" \
-DYLD_LIBRARY_PATH="$HOME/d/libkrun/target/release" \
+LIBKRUN_DIR="$HOME/d/smolvm/lib" \
+DYLD_LIBRARY_PATH="$HOME/d/smolvm/lib" \
 cargo test -p smolvm external --lib
 ```
 

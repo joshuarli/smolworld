@@ -72,12 +72,12 @@ depends_on remains creation/start order only. Any service-specific waiting is an
 
 A Smolfile is a machine declaration, not by itself an immutable prepared image. Each world must therefore have a generated, sealed .smolworld.lock that binds:
 
-- canonical .smolworld bytes and every referenced Smolfile digest;
-- every selected image's immutable OCI digest and verified local material;
-- every seed-file source digest and destination/mode; and
+- canonical `.smolworld` bytes and every referenced Smolfile BLAKE3 identity;
+- every selected image's immutable OCI SHA-256 digest and BLAKE3-verified local material;
+- every seed-file source BLAKE3 identity and destination/mode; and
 - the smolvm external-world resolver ABI used to materialize it.
 
-The resolver is host-side. Guests never pull images and have no Internet egress. The preparation path must not require a Docker daemon, Docker socket, or OrbStack. Its exact implementation is a focused smolvm/smolworld design spike: it must produce a verified local material suitable for an externally networked persistent machine without exposing that material detail in the user-authored .smolworld grammar.
+The resolver is host-side. Guests never pull images and have no Internet egress. The preparation path must not require a Docker daemon, Docker socket, or OrbStack. smolvm resolves an immutable OCI `@sha256:` source through the host registry client, verifies OCI descriptors with SHA-256, writes a deterministic local Docker archive, and returns only its BLAKE3 local-material identity plus a generated local-only Smolfile. smolworld records those sealed receipts without parsing or reimplementing Smolfile semantics.
 
 Image acquisition is an explicit, mutating preparation boundary. The proposed command contract is:
 
@@ -184,21 +184,113 @@ Keeping historical facts is evidence retention, not runtime compatibility.
 
 This phase begins after the world-backed executor is stable and the second migration has been reviewed. It is not required for the Redis foundation gate, standalone Sentry gate, or the first Niceforge world-executor cutover.
 
+### Snapshot substrate decision
+
+The preferred VMM substrate is libkrun's macOS/HVF snapshot/restore work,
+not a guest-visible disk-copy protocol. The open upstream implementation
+captures RAM, vCPU/GIC/timer/RTC state and quiesced virtio transport state,
+then restores a fresh configured VM at the captured PC. That is the correct
+primitive for a fast world transition because it preserves process memory,
+TCP state, and the runner's in-progress filesystem state without replaying
+boot or workflow setup.
+
+Do not merge it into the canonical `smolvm/libkrun` submodule merely because
+the API exists. First pin the exact reviewed PR commit in a dedicated
+snapshot-integration branch and require the following smolvm conformance
+gate before it becomes the normal local build:
+
+1. pause, capture, restore, and resume one externally networked smolvm
+   machine at a fixed checkpoint identity;
+2. restore the same state under a distinct machine name, data directory, and
+   Unix-stream listener without reusing any captured host file descriptor;
+3. support the full declared Smolfile resources, including the required
+   multi-vCPU cases; and
+4. snapshot every device smolworld relies on, especially its external
+   virtio-net attachment and the runner's workspace/filesystem path, under
+   active I/O.
+
+PR #762 is an excellent foundation but is not yet that contract: it is open,
+uses a provisional C API, rejects multi-vCPU restore, does not offer
+capture-and-continue, and explicitly defers some device-internal state. Its
+documented device list does not establish our external Unix-stream
+virtio-net path. A world checkpoint cannot ship until those gaps have
+focused test evidence. Ignition is valuable as a research reference for
+lazy clonefile/MAP_SHARED restores, dirty-page tracking, immutable diff
+chains, and fan-out; it is not a drop-in smolvm replacement because its
+network/device and process contracts are different.
+
+The first production shape therefore uses eager, immutable snapshot
+directories. Once correctness is proven, the same `WorldState` manifest can
+refer to a parent plus dirty-memory/disk deltas, with a bounded chain-depth
+flattening policy. That makes CoW an acceleration detail rather than a new
+durable semantic.
+
 The logical objects are deliberately separate:
 
-    WorldState       = sealed topology/materials + workspace state + machine-state manifest
+    WorldState       = immutable DAG node: topology/materials + switch/workspace + machine-state manifest
+    WorldRun         = one mutable realization of a WorldState
     WorldTransition  = parent state + exact step attempt + outcome/evidence + child state
     WorldCheckpoint  = (WorldState, smolvm materializer ABI, acceleration artifact)
 
+    checkpoint(WorldRun) -> WorldState
+    restore(WorldState) -> WorldRun
+    fork(WorldState, N) -> WorldRun[N]
+
 A VM disk snapshot, RAM image, or smolvm fork is a checkpoint implementation; it is not the identity of a world state. Caches are similarly acceleration inputs only. A cache must not be the sole source of a semantically required dependency: the sealed material set must suffice for reproducible execution.
+
+The implementation boundary is equally deliberate. libkrun owns one VM's
+portable VMM/vCPU/device-state seam; smolvm owns machine lifecycle and guest
+interaction; smolworld owns the immutable world DAG and the state-logistics
+layer: manifests/CAS, memory and disk base/delta references, lazy
+materialization, working-set prefetch, reachability/retention, and identity
+policy. A snapshot file is an acceleration artifact referenced by a
+`MachineState`, never the durable definition of the world.
+
+Every checkpoint covers RAM, writable disk/overlay, virtual-device state,
+runner workspace, and switch state as one temporal cut. Restoring RAM from
+one state while keeping a disk overlay from another is invalid and can corrupt
+the guest filesystem. Host file descriptors, Unix listeners, and other
+host-local handles are excluded from snapshots; restore constructs fresh
+resources and rebinds them to the captured logical devices.
+
+Identity policy is explicit. A same-lineage restore may preserve guest static
+IP/MAC only after its source `WorldRun` is stopped and detached, because no
+two live worlds may share that private identity. Concurrent `fork` needs a
+new guest reseed protocol for static IPv4, MAC, machine identity, entropy and
+any guest credentials. It is not safe to claim branch fan-out merely by
+creating new host socket paths: the restored kernel would retain the captured
+static network identity. Fan-out remains deferred until smolvm and its guest
+agent prove that reseed contract.
 
 For each step, Niceforge uses a commit barrier:
 
 1. Record a lease-fenced, idempotent transition-capture intent before capture.
-2. Quiesce the world at the declared step boundary and capture every relevant machine and sealed workspace state.
-3. Verify and seal the resulting state manifest and checkpoint receipts as evidence.
-4. In one PostgreSQL transaction, validate the current lease/fence, attach the child world state, record the world transition, and append the matching step-terminal event.
-5. A crash before the transaction leaves only unreachable capture candidates; reconciliation may validate or delete those exact candidates. A crash after the transaction leaves a durable state receipt that must be revalidated before materialization.
+2. Close the smolworld switch at a new epoch: it stops delivering new
+   inter-machine frames and records its FDB plus any bounded queued frames.
+   New runner actions and `exec` calls are rejected at this boundary.
+3. Pause every VM concurrently while the switch is closed. Only after all VMs
+   are frozen may smolvm capture them; this prevents one machine from
+   observing a message that its peer's snapshot does not contain.
+4. Seal one `MachineState` receipt per machine (snapshot manifest, immutable
+   local-material identity, resource/device topology, and content digests),
+   plus the switch-epoch receipt and the runner workspace receipt, into one
+   `WorldState` manifest. The snapshot transport must be FD-free; restore
+   binds fresh switch listeners and fresh host descriptors from the manifest.
+5. Verify every receipt and write the content-addressed manifest as evidence.
+6. In one PostgreSQL transaction, validate the current lease/fence, attach the child world state, record the world transition, and append the matching step-terminal event.
+7. A crash before the transaction leaves only unreachable capture candidates; reconciliation may validate or delete those exact candidates. A crash after the transaction leaves a durable state receipt that must be revalidated before materialization.
+
+The captured VMs may exit after snapshot during the first implementation;
+the next runner action restores a fresh descendant world from the just-sealed
+state. That is slower than capture-and-continue but preserves the durable
+step boundary and works with libkrun's current limitation. A future pause /
+capture-and-continue API can eliminate the restore between successful steps
+without changing the state or transaction contract.
+
+No world-state `merge` operation is planned. Descendants are genealogical,
+not Git branches: Niceforge selects a successful child state by its evidence
+and evaluation, advances its logical pointer to that state, then releases
+unselected descendants through normal reachability-based GC.
 
 The same barrier runs for failed steps. Therefore a failure has a sealed state reference rather than only logs and a process exit code.
 
@@ -224,7 +316,10 @@ The initial local interface is intentionally a shell, not literal TCP OpenSSH. I
 5. Design and test Niceforge's new sealed world plan, SmolworldExecutor, and exact resource reconciliation behind the existing control-plane interfaces.
 6. Apply the execution-substrate migration and make world-backed plans the only executable plan ABI.
 7. Delete Compose/Docker execution paths and their compatibility tests/docs; retain only read-only historical evidence data.
-8. Prove coordinated capture and restore independently, then apply the lineage migration for world states, transitions, and checkpoints.
+8. Prove the libkrun snapshot integration branch against smolvm's external
+   virtio-net and full device/resource contract. Then prove coordinated
+   switch-epoch capture and restore independently before applying the lineage
+   migration for world states, transitions, and checkpoints.
 9. Add disposable failed-world shell access and its retention/cleanup tests.
 
 ## Required verification

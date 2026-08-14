@@ -1,9 +1,9 @@
-use crate::model::{gateway_ip, MachineConfig, MachineResources, NetworkConfig, WorldConfig};
+use crate::model::{gateway_ip, MachineConfig, NetworkConfig, SeedFile, WorldConfig};
 use crate::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use yaml_rust2::{Yaml, YamlLoader};
 
 pub(crate) fn load_config(path: &Path) -> Result<WorldConfig> {
@@ -19,7 +19,15 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
         return Err(".smolworld must contain exactly one YAML document".into());
     };
     let root = yaml_hash(document, ".smolworld")?;
-    reject_unknown(root, &["world", "network", "machines"], ".smolworld")?;
+    reject_unknown(
+        root,
+        &["format", "world", "network", "machines"],
+        ".smolworld",
+    )?;
+    let format = required_key(root, "format", ".smolworld")?;
+    if !matches!(format, Yaml::Integer(2)) {
+        return Err(".smolworld.format must be exactly 2".into());
+    }
 
     let world = yaml_hash(required_key(root, "world", ".smolworld")?, "world")?;
     reject_unknown(world, &["name"], "world")?;
@@ -62,30 +70,11 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
             .map_err(|reason| format!("machines.{machine_name}: {reason}"))?;
         let path = format!("machines.{machine_name}");
         let machine = yaml_hash(machine_value, &path)?;
-        reject_unknown(
-            machine,
-            &[
-                "image",
-                "command",
-                "depends_on",
-                "cpus",
-                "memory_mib",
-                "storage_gib",
-                "overlay_gib",
-            ],
-            &path,
+        reject_unknown(machine, &["smolfile", "depends_on", "seed_files"], &path)?;
+        let smolfile = yaml_world_relative_path(
+            required_key(machine, "smolfile", &path)?,
+            &format!("{path}.smolfile"),
         )?;
-        let image = yaml_string(
-            required_key(machine, "image", &path)?,
-            &format!("{path}.image"),
-        )?;
-        if image.is_empty() {
-            return Err(format!("{path}.image must not be empty"));
-        }
-        let command = optional_key(machine, "command")
-            .map(|value| yaml_string_array(value, &format!("{path}.command")))
-            .transpose()?
-            .unwrap_or_default();
         let depends_on = optional_key(machine, "depends_on")
             .map(|value| yaml_string_array(value, &format!("{path}.depends_on")))
             .transpose()?
@@ -97,34 +86,17 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
                 return Err(format!("{path}.depends_on repeats '{dependency}'"));
             }
         }
-        let defaults = MachineResources::default();
-        let resources = MachineResources {
-            cpus: optional_key(machine, "cpus")
-                .map(|value| yaml_positive_integer(value, &format!("{path}.cpus")))
-                .transpose()?
-                .unwrap_or(defaults.cpus),
-            memory_mib: optional_key(machine, "memory_mib")
-                .map(|value| yaml_positive_integer(value, &format!("{path}.memory_mib")))
-                .transpose()?
-                .unwrap_or(defaults.memory_mib),
-            storage_gib: optional_key(machine, "storage_gib")
-                .map(|value| yaml_positive_integer(value, &format!("{path}.storage_gib")))
-                .transpose()?
-                .unwrap_or(defaults.storage_gib),
-            overlay_gib: optional_key(machine, "overlay_gib")
-                .map(|value| yaml_positive_integer(value, &format!("{path}.overlay_gib")))
-                .transpose()?
-                .unwrap_or(defaults.overlay_gib),
-        };
-        validate_resources(resources).map_err(|reason| format!("{path}: {reason}"))?;
+        let seed_files = optional_key(machine, "seed_files")
+            .map(|value| parse_seed_files(value, &format!("{path}.seed_files")))
+            .transpose()?
+            .unwrap_or_default();
         if machines
             .insert(
                 machine_name.clone(),
                 MachineConfig {
-                    image,
-                    command,
+                    smolfile,
                     depends_on,
-                    resources,
+                    seed_files,
                 },
             )
             .is_some()
@@ -191,24 +163,94 @@ fn yaml_string_array(value: &Yaml, path: &str) -> Result<Vec<String>> {
         .collect()
 }
 
+fn yaml_path(value: &Yaml, path: &str) -> Result<PathBuf> {
+    let value = yaml_string(value, path)?;
+    if value.is_empty() {
+        return Err(format!("{path} must not be empty"));
+    }
+    Ok(PathBuf::from(value))
+}
+
+/// Authored world material must stay inside the world directory.  A prepared
+/// world is copied into a Niceforge snapshot before it is run, so an absolute
+/// host path or lexical escape would make its material lock non-portable and
+/// would let a snapshot silently consume an undeclared host input.
+fn yaml_world_relative_path(value: &Yaml, path: &str) -> Result<PathBuf> {
+    let value = yaml_path(value, path)?;
+    if value.is_absolute()
+        || value.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!(
+            "{path} must be a non-escaping path relative to the .smolworld file"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_seed_files(value: &Yaml, path: &str) -> Result<Vec<SeedFile>> {
+    let Yaml::Array(values) = value else {
+        return Err(format!("{path} must be an array of mappings"));
+    };
+    let mut seed_files = Vec::with_capacity(values.len());
+    let mut destinations = HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let item_path = format!("{path}[{index}]");
+        let item = yaml_hash(value, &item_path)?;
+        reject_unknown(item, &["source", "destination", "mode"], &item_path)?;
+        let source = yaml_world_relative_path(
+            required_key(item, "source", &item_path)?,
+            &format!("{item_path}.source"),
+        )?;
+        let destination = yaml_path(
+            required_key(item, "destination", &item_path)?,
+            &format!("{item_path}.destination"),
+        )?;
+        if !destination.is_absolute() {
+            return Err(format!(
+                "{item_path}.destination must be an absolute guest path"
+            ));
+        }
+        if !destinations.insert(destination.clone()) {
+            return Err(format!(
+                "{path} repeats destination '{}'",
+                destination.display()
+            ));
+        }
+        let mode = yaml_mode(
+            required_key(item, "mode", &item_path)?,
+            &format!("{item_path}.mode"),
+        )?;
+        seed_files.push(SeedFile {
+            source,
+            destination,
+            mode,
+        });
+    }
+    Ok(seed_files)
+}
+
+fn yaml_mode(value: &Yaml, path: &str) -> Result<u32> {
+    let value = yaml_string(value, path)?;
+    if value.len() != 4 || !value.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return Err(format!(
+            "{path} must be a four-digit octal mode such as \"0644\""
+        ));
+    }
+    u32::from_str_radix(&value, 8).map_err(|_| format!("{path} is out of range"))
+}
+
 fn yaml_ipv4(value: &Yaml, path: &str) -> Result<Ipv4Addr> {
     let value = yaml_string(value, path)?;
     value
         .parse()
         .map_err(|_| format!("{path} must be a valid IPv4 address"))
-}
-
-fn yaml_positive_integer<T>(value: &Yaml, path: &str) -> Result<T>
-where
-    T: TryFrom<i64>,
-{
-    let Yaml::Integer(value) = value else {
-        return Err(format!("{path} must be a positive integer"));
-    };
-    if *value <= 0 {
-        return Err(format!("{path} must be greater than zero"));
-    }
-    T::try_from(*value).map_err(|_| format!("{path} is out of range"))
 }
 
 pub(crate) fn validate_label(value: &str) -> Result<()> {
@@ -276,13 +318,6 @@ pub(crate) fn validate_domain(domain: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_resources(resources: MachineResources) -> Result<()> {
-    if resources.memory_mib < 64 {
-        return Err("memory_mib must be at least 64".into());
-    }
-    Ok(())
-}
-
 pub(crate) fn topological_order(config: &WorldConfig) -> Result<Vec<String>> {
     fn visit(
         name: &str,
@@ -328,16 +363,16 @@ mod tests {
     fn config() -> WorldConfig {
         parse_config(
             r#"
+format: 2
 world:
   name: demo
 network:
   subnet: 10.89.0.0/24
 machines:
   redis:
-    image: ./redis.tar
+    smolfile: ./redis.Smolfile
   client:
-    image: ./redis.tar
-    command: [sleep, infinity]
+    smolfile: ./client.Smolfile
     depends_on: [redis]
 "#,
         )
@@ -348,17 +383,30 @@ machines:
     fn is_strict_and_orders_dependencies() {
         let config = config();
         assert_eq!(topological_order(&config).unwrap(), ["redis", "client"]);
-        assert!(parse_config("world:\n  name: demo\n").is_err());
         assert!(parse_config(
-            "world:\n  name: demo\n  unknown: x\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar"
+            "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile"
+        )
+        .unwrap_err()
+        .contains("format"));
+        assert!(parse_config(
+            "format: 1\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile"
+        )
+        .unwrap_err()
+        .contains("exactly 2"));
+        assert!(parse_config(
+            "format: 2\nworld:\n  name: demo\n  unknown: x\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile"
         )
         .is_err());
         assert!(parse_config(
-            "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar\n---\nworld: {}"
+            "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile\n---\nformat: 2\nworld: {}"
         )
         .is_err());
         assert!(parse_config(
-            "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar\n    image: ./other.tar"
+            "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    image: ./x.tar"
+        )
+        .is_err());
+        assert!(parse_config(
+            "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    depends_on: []"
         )
         .is_err());
     }
@@ -377,9 +425,10 @@ machines:
     }
 
     #[test]
-    fn accepts_generic_network_and_machine_resources() {
+    fn accepts_seed_files_and_rejects_legacy_machine_fields() {
         let config = parse_config(
             r#"
+format: 2
 world:
   name: lab
 network:
@@ -389,11 +438,14 @@ network:
   domain: lab.test
 machines:
   api:
-    image: ./api.tar
-    cpus: 2
-    memory_mib: 512
-    storage_gib: 3
-    overlay_gib: 2
+    smolfile: ./api.Smolfile
+    seed_files:
+      - source: ./assets/config.xml
+        destination: /etc/app/config.xml
+        mode: "0644"
+      - source: ./assets/secret
+        destination: /run/app/secret
+        mode: "0600"
 "#,
         )
         .unwrap();
@@ -401,21 +453,57 @@ machines:
         assert_eq!(config.network.dns, config.network.gateway);
         assert_eq!(config.network.domain, "lab.test");
         assert_eq!(
-            config.machines["api"].resources,
-            MachineResources {
-                cpus: 2,
-                memory_mib: 512,
-                storage_gib: 3,
-                overlay_gib: 2,
-            }
+            config.machines["api"].smolfile,
+            PathBuf::from("./api.Smolfile")
         );
+        assert_eq!(
+            config.machines["api"].seed_files[0].source,
+            PathBuf::from("./assets/config.xml")
+        );
+        assert_eq!(
+            config.machines["api"].seed_files[0].destination,
+            PathBuf::from("/etc/app/config.xml")
+        );
+        assert_eq!(config.machines["api"].seed_files[0].mode, 0o644);
+        assert_eq!(config.machines["api"].seed_files[1].mode, 0o600);
         assert!(parse_config(
-            "world:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\n  dns: 10.97.4.2\nmachines:\n  a:\n    image: ./a.tar"
+            "format: 2\nworld:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\n  dns: 10.97.4.2\nmachines:\n  a:\n    smolfile: ./a.Smolfile"
         )
         .is_err());
         assert!(parse_config(
-            "world:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\nmachines:\n  a:\n    image: ./a.tar\n    memory_mib: 63"
+            "format: 2\nworld:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile\n    memory_mib: 512"
         )
+        .is_err());
+        assert!(parse_config(
+            "format: 2\nworld:\n  name: lab\nnetwork:\n  subnet: 10.97.4.0/24\nmachines:\n  a:\n    smolfile: /tmp/a.Smolfile"
+        )
+        .unwrap_err()
+        .contains("relative"));
+    }
+
+    #[test]
+    fn rejects_invalid_seed_file_declarations() {
+        let base = |seed_file| {
+            format!(
+                "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  api:\n    smolfile: ./api.Smolfile\n    seed_files:\n{seed_file}"
+            )
+        };
+        assert!(parse_config(&base(
+            "      - source: ./config\n        destination: relative\n        mode: \"0644\"\n"
+        ))
+        .is_err());
+        assert!(parse_config(&base(
+            "      - source: ./config\n        destination: /etc/config\n        mode: 0644\n"
+        ))
+        .is_err());
+        assert!(parse_config(&base(
+            "      - source: ./config\n        destination: /etc/config\n        mode: \"644\"\n"
+        ))
+        .is_err());
+        assert!(parse_config(&base("      - source: ./one\n        destination: /etc/config\n        mode: \"0644\"\n      - source: ./two\n        destination: /etc/config\n        mode: \"0600\"\n")).is_err());
+        assert!(parse_config(&base(
+            "      - source: ../outside\n        destination: /etc/config\n        mode: \"0644\"\n"
+        ))
         .is_err());
     }
 }

@@ -98,6 +98,9 @@ pub(crate) enum Cli {
     Check {
         config: PathBuf,
     },
+    Prepare {
+        config: PathBuf,
+    },
     Down {
         config: PathBuf,
     },
@@ -109,6 +112,11 @@ pub(crate) enum Cli {
         config: PathBuf,
         machine: String,
         command: Vec<String>,
+    },
+    Cp {
+        config: PathBuf,
+        source: String,
+        destination: String,
     },
 }
 
@@ -131,6 +139,10 @@ pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
             "check" => {
                 return command_config("check", config, &args[index + 1..])
                     .map(|config| Cli::Check { config })
+            }
+            "prepare" => {
+                return command_config("prepare", config, &args[index + 1..])
+                    .map(|config| Cli::Prepare { config })
             }
             "down" => {
                 return command_config("down", config, &args[index + 1..])
@@ -172,11 +184,32 @@ pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     command,
                 });
             }
+            "cp" => {
+                let (config, source, destination) = parse_cp_options(config, &args[index + 1..])?;
+                return Ok(Cli::Cp {
+                    config,
+                    source,
+                    destination,
+                });
+            }
             "-h" | "--help" => return Ok(Cli::Help),
             other => return Err(format!("unknown command or option '{other}'\n{}", usage())),
         }
     }
     Err(usage().into())
+}
+
+/// Parse one explicit file transfer. A `machine:/absolute/path` endpoint is
+/// interpreted by the runtime only after the world state has resolved that
+/// logical machine to its recorded smolvm name.
+fn parse_cp_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, String, String)> {
+    match rest {
+        [flag, path, source, destination] if flag == "-f" || flag == "--file" => {
+            Ok((PathBuf::from(path), source.clone(), destination.clone()))
+        }
+        [source, destination] => Ok((config, source.clone(), destination.clone())),
+        _ => Err("usage: smolworld cp [-f PATH] SRC DST".into()),
+    }
 }
 
 pub(crate) fn command_config(command: &str, config: PathBuf, rest: &[String]) -> Result<PathBuf> {
@@ -296,7 +329,7 @@ fn push_json_string(output: &mut String, value: &str) {
 }
 
 pub(crate) fn usage() -> &'static str {
-    "usage: smolworld [-f .smolworld] <check|up|down|ps>\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE -- COMMAND [ARG ...]"
+    "usage: smolworld [-f .smolworld] <check|prepare|up|down|ps>\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
 }
 
 #[cfg(test)]
@@ -313,6 +346,74 @@ mod tests {
             parse_cli(vec!["ps".into(), "--file".into(), "demo".into()]).unwrap(),
             Cli::Ps { config, format: PsFormat::Table } if config == PathBuf::from("demo")
         ));
+    }
+
+    #[test]
+    fn parses_prepare_with_file_flag_before_or_after_command() {
+        assert!(matches!(
+            parse_cli(vec!["-f".into(), "demo".into(), "prepare".into()]).unwrap(),
+            Cli::Prepare { config } if config == PathBuf::from("demo")
+        ));
+        assert!(matches!(
+            parse_cli(vec!["prepare".into(), "--file".into(), "demo".into()]).unwrap(),
+            Cli::Prepare { config } if config == PathBuf::from("demo")
+        ));
+        assert!(matches!(
+            parse_cli(vec!["prepare".into()]).unwrap(),
+            Cli::Prepare { config } if config == PathBuf::from(".smolworld")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_prepare_options() {
+        assert_eq!(
+            parse_cli(vec!["prepare".into(), "--file".into()])
+                .err()
+                .unwrap(),
+            "usage: smolworld prepare [-f PATH]"
+        );
+        assert_eq!(
+            parse_cli(vec!["prepare".into(), "extra".into()])
+                .err()
+                .unwrap(),
+            "usage: smolworld prepare [-f PATH]"
+        );
+    }
+
+    #[test]
+    fn parses_world_scoped_copy_endpoints() {
+        assert!(matches!(
+            parse_cli(vec![
+                "cp".into(),
+                "host-input.tar".into(),
+                "runner:/workspace/input.tar".into(),
+            ])
+            .unwrap(),
+            Cli::Cp { config, source, destination }
+                if config == PathBuf::from(".smolworld")
+                    && source == "host-input.tar"
+                    && destination == "runner:/workspace/input.tar"
+        ));
+        assert!(matches!(
+            parse_cli(vec![
+                "cp".into(),
+                "--file".into(),
+                "world.smolworld".into(),
+                "runner:/workspace/result.txt".into(),
+                "host-result.txt".into(),
+            ])
+            .unwrap(),
+            Cli::Cp { config, source, destination }
+                if config == PathBuf::from("world.smolworld")
+                    && source == "runner:/workspace/result.txt"
+                    && destination == "host-result.txt"
+        ));
+        assert_eq!(
+            parse_cli(vec!["cp".into(), "only-one-operand".into()])
+                .err()
+                .expect("copy invocation is invalid"),
+            "usage: smolworld cp [-f PATH] SRC DST"
+        );
     }
 
     #[test]

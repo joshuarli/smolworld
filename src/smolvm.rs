@@ -1,10 +1,266 @@
-use crate::model::{format_mac, MachineLaunch, NetworkConfig, WorldConfig, WorldPaths, WorldState};
+use crate::model::{format_mac, Assignment, MachineLaunch, NetworkConfig, WorldConfig, WorldState};
 use crate::Result;
 use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+
+/// One resolved external-world Smolfile observation returned by the companion
+/// smolvm command. It contains only the material identity smolworld must lock;
+/// workload fields remain owned by smolvm and are intentionally not duplicated
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalWorldMaterial {
+    pub(crate) smolfile: PathBuf,
+    pub(crate) local_archive: PathBuf,
+    pub(crate) image_digest: String,
+}
+
+/// The host-side result of smolvm's explicit external-world preparation
+/// boundary. The authored Smolfile remains the sealed user declaration;
+/// `prepared_smolfile` is its verified local-only equivalent used at launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedExternalWorldSmolfile {
+    pub(crate) authored_smolfile: PathBuf,
+    pub(crate) prepared_smolfile: PathBuf,
+    pub(crate) source_kind: String,
+    pub(crate) source_reference: String,
+    pub(crate) source_digest: String,
+}
+
+const EXTERNAL_WORLD_TSV_ABI: &str = "external-world-v2";
+const EXTERNAL_WORLD_PREPARE_TSV_ABI: &str = "external-world-prepare-v2";
+
+/// Invoke the only mutating Smolfile image boundary. smolvm owns registry
+/// protocol and archive construction; smolworld consumes only the versioned
+/// prepared Smolfile identity and never parses Smolfile syntax itself.
+pub(crate) fn materialize_external_world(
+    smolvm: &Path,
+    smolfile: &Path,
+) -> Result<PreparedExternalWorldSmolfile> {
+    let output = Command::new(smolvm)
+        .args([
+            "smolfile",
+            "materialize-external",
+            "--format",
+            "tsv",
+            "--smolfile",
+        ])
+        .arg(smolfile)
+        .output()
+        .map_err(|error| format!("run smolvm external-world materialization: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "smolvm external-world materialization exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+        "smolvm external-world materialization emitted non-UTF-8 output".to_string()
+    })?;
+    parse_external_world_prepare_tsv(stdout, smolfile)
+}
+
+fn parse_external_world_prepare_tsv(
+    output: &str,
+    expected_authored_smolfile: &Path,
+) -> Result<PreparedExternalWorldSmolfile> {
+    let record = output.strip_suffix('\n').ok_or_else(|| {
+        "smolvm external-world materialization must end with one newline".to_string()
+    })?;
+    if record.contains('\n') || record.contains('\r') {
+        return Err("smolvm external-world materialization emitted more than one record".into());
+    }
+    let fields: Vec<_> = record.split('\t').collect();
+    if fields.len() != 6 {
+        return Err(format!(
+            "smolvm external-world materialization returned {} TSV fields, expected 6",
+            fields.len()
+        ));
+    }
+    let [abi, authored, prepared, source_kind, source_reference, source_digest]: [&str; 6] =
+        fields.try_into().expect("field count checked above");
+    if abi != EXTERNAL_WORLD_PREPARE_TSV_ABI {
+        return Err(format!(
+            "unsupported smolvm external-world preparation ABI '{abi}'"
+        ));
+    }
+    let expected_authored = fs::canonicalize(expected_authored_smolfile).map_err(|error| {
+        format!(
+            "resolve authored Smolfile {}: {error}",
+            expected_authored_smolfile.display()
+        )
+    })?;
+    if Path::new(authored) != expected_authored {
+        return Err(
+            "smolvm external-world materialization returned a different authored Smolfile path"
+                .into(),
+        );
+    }
+    let prepared_smolfile = PathBuf::from(prepared);
+    if !prepared_smolfile.is_absolute() {
+        return Err(
+            "smolvm external-world materialization returned a relative prepared Smolfile".into(),
+        );
+    }
+    let prepared_smolfile = fs::canonicalize(&prepared_smolfile).map_err(|error| {
+        format!(
+            "resolve prepared Smolfile {}: {error}",
+            prepared_smolfile.display()
+        )
+    })?;
+    if !matches!(source_kind, "registry" | "local-archive") {
+        return Err(format!(
+            "smolvm external-world materialization returned unknown source kind '{source_kind}'"
+        ));
+    }
+    if source_reference.is_empty() || source_reference.contains(['\t', '\r', '\n']) {
+        return Err(
+            "smolvm external-world materialization returned an invalid source reference".into(),
+        );
+    }
+    let source_digest_is_valid = match source_kind {
+        "registry" => is_algorithm_digest(source_digest, "sha256"),
+        "local-archive" => is_algorithm_digest(source_digest, "blake3"),
+        _ => false,
+    };
+    if !source_digest_is_valid {
+        return Err(
+            "smolvm external-world materialization returned an invalid source digest".into(),
+        );
+    }
+    Ok(PreparedExternalWorldSmolfile {
+        authored_smolfile: expected_authored,
+        prepared_smolfile,
+        source_kind: source_kind.to_string(),
+        source_reference: source_reference.to_string(),
+        source_digest: source_digest.to_string(),
+    })
+}
+
+/// Invoke smolvm's read-only external-world resolver and parse its deliberately
+/// small versioned TSV record. This must run before smolworld allocates v2
+/// state, binds a listener, or creates a machine.
+pub(crate) fn validate_external_world(
+    smolvm: &Path,
+    smolfile: &Path,
+    assignment: &Assignment,
+    socket: &Path,
+    network: &NetworkConfig,
+) -> Result<ExternalWorldMaterial> {
+    let address = format!("{}/24", assignment.ip);
+    let output = Command::new(smolvm)
+        .args([
+            "smolfile",
+            "validate-external",
+            "--format",
+            "tsv",
+            "--smolfile",
+        ])
+        .arg(smolfile)
+        .args(["--net-unixstream"])
+        .arg(socket)
+        .args(["--net-address", &address, "--net-gateway"])
+        .arg(network.gateway.to_string())
+        .args(["--net-dns"])
+        .arg(network.dns.to_string())
+        .args(["--net-mac"])
+        .arg(format_mac(assignment.mac))
+        .output()
+        .map_err(|error| format!("run smolvm external-world validation: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "smolvm external-world validation exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "smolvm external-world validation emitted non-UTF-8 output".to_string())?;
+    parse_external_world_tsv(stdout, smolfile, assignment, socket, network)
+}
+
+fn parse_external_world_tsv(
+    output: &str,
+    expected_smolfile: &Path,
+    assignment: &Assignment,
+    expected_socket: &Path,
+    network: &NetworkConfig,
+) -> Result<ExternalWorldMaterial> {
+    let record = output
+        .strip_suffix('\n')
+        .ok_or_else(|| "smolvm external-world validation must end with one newline".to_string())?;
+    if record.contains('\n') || record.contains('\r') {
+        return Err("smolvm external-world validation emitted more than one record".into());
+    }
+    let fields: Vec<_> = record.split('\t').collect();
+    if fields.len() != 10 {
+        return Err(format!(
+            "smolvm external-world validation returned {} TSV fields, expected 10",
+            fields.len()
+        ));
+    }
+    let [abi, smolfile, image_kind, image_locator, image_digest, socket, guest_cidr, gateway, dns, mac]: [&str; 10] =
+        fields.try_into().expect("field count checked above");
+    if abi != EXTERNAL_WORLD_TSV_ABI {
+        return Err(format!("unsupported smolvm external-world ABI '{abi}'"));
+    }
+    let canonical_smolfile = fs::canonicalize(expected_smolfile)
+        .map_err(|error| format!("resolve Smolfile {}: {error}", expected_smolfile.display()))?;
+    if Path::new(smolfile) != canonical_smolfile {
+        return Err("smolvm external-world validation returned a different Smolfile path".into());
+    }
+    if socket != expected_socket.to_string_lossy() {
+        return Err("smolvm external-world validation returned a different Unix socket".into());
+    }
+    let expected_cidr = format!("{}/24", assignment.ip);
+    if guest_cidr != expected_cidr
+        || gateway != network.gateway.to_string()
+        || dns != network.dns.to_string()
+        || mac != format_mac(assignment.mac)
+    {
+        return Err(
+            "smolvm external-world validation returned a mismatched static network tuple".into(),
+        );
+    }
+    match image_kind {
+        "local-archive" => {
+            let local_archive = PathBuf::from(image_locator);
+            if !local_archive.is_absolute() {
+                return Err("smolvm external-world validation returned a relative local archive".into());
+            }
+            if is_algorithm_digest(image_digest, "blake3") {
+                return Ok(ExternalWorldMaterial {
+                    smolfile: canonical_smolfile,
+                    local_archive,
+                    image_digest: image_digest.to_string(),
+                });
+            }
+            Err("smolvm external-world validation returned an invalid local archive digest".into())
+        }
+        "local-directory" => Err(
+            "external worlds currently require a prepared local archive; directory material has no sealed tree digest"
+                .into(),
+        ),
+        "registry" => Err(format!(
+            "external world image '{image_locator}' is an immutable registry reference but no host materializer is available; provide a prepared local archive in the Smolfile"
+        )),
+        other => Err(format!("smolvm external-world validation returned unknown image kind '{other}'")),
+    }
+}
+
+fn is_algorithm_digest(value: &str, algorithm: &str) -> bool {
+    value
+        .strip_prefix(&format!("{algorithm}:"))
+        .is_some_and(|encoded| {
+            encoded.len() == 64
+                && encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
 
 pub(crate) fn smolvm_program() -> PathBuf {
     env::var_os("SMOLWORLD_SMOLVM")
@@ -24,16 +280,16 @@ pub(crate) fn require_smolvm(program: &Path) -> Result<()> {
 /// creates any state or machine. smolvm still owns its own discovery rules;
 /// these checks deliberately mirror only the local development paths that can
 /// be inspected without starting a VM.
-pub(crate) fn preflight(config: &WorldConfig, paths: &WorldPaths, smolvm: &Path) -> Result<()> {
+pub(crate) fn preflight(config: &WorldConfig, config_dir: &Path, smolvm: &Path) -> Result<()> {
     require_smolvm(smolvm)?;
     for machine in config.machines.values() {
-        let image = local_image_path(&paths.config_dir, &machine.image)?;
-        let metadata = fs::metadata(&image)
-            .map_err(|error| format!("inspect local image {}: {error}", image.display()))?;
-        if !metadata.is_file() && !metadata.is_dir() {
+        let smolfile = local_smolfile_path(config_dir, &machine.smolfile)?;
+        let metadata = fs::metadata(&smolfile)
+            .map_err(|error| format!("inspect Smolfile {}: {error}", smolfile.display()))?;
+        if !metadata.is_file() {
             return Err(format!(
-                "local image {} must be a Docker archive or unpacked rootfs directory",
-                image.display()
+                "Smolfile {} must be a regular file",
+                smolfile.display()
             ));
         }
     }
@@ -195,29 +451,32 @@ pub(crate) fn create_machine(
     launch: MachineLaunch<'_>,
     network: &NetworkConfig,
 ) -> Result<()> {
+    let name = launch.assignment.smolvm_name.clone();
+    let mut invocation = build_machine_create_command(smolvm, &launch, network);
+    status_result(
+        &format!("create machine {name}"),
+        invocation
+            .status()
+            .map_err(|error| format!("run smolvm machine create: {error}"))?,
+    )
+}
+
+/// Build the exact, restricted `machine create` invocation without starting
+/// it. The Smolfile is the machine declaration; smolworld supplies only its
+/// generated identity, complete external NIC tuple, and already-sealed
+/// pre-workload seed copies.
+fn build_machine_create_command(
+    smolvm: &Path,
+    launch: &MachineLaunch<'_>,
+    network: &NetworkConfig,
+) -> Command {
     let address = format!("{}/24", launch.assignment.ip);
-    let cpus = launch.resources.cpus.to_string();
-    let memory_mib = launch.resources.memory_mib.to_string();
-    let storage_gib = launch.resources.storage_gib.to_string();
-    let overlay_gib = launch.resources.overlay_gib.to_string();
     let mut invocation = Command::new(smolvm);
     invocation
         .args(["machine", "create", "--name"])
         .arg(&launch.assignment.smolvm_name)
-        .args(["--image"])
-        .arg(launch.image)
-        // The config validator has already made each resource value positive
-        // and retained the intentionally small local-world defaults.
-        .args([
-            "--cpus",
-            &cpus,
-            "--mem",
-            &memory_mib,
-            "--storage",
-            &storage_gib,
-            "--overlay",
-            &overlay_gib,
-        ])
+        .args(["--smolfile"])
+        .arg(launch.smolfile)
         .args(["--net", "--net-backend", "virtio-net", "--net-unixstream"])
         .arg(launch.socket)
         .args(["--net-address", &address, "--net-gateway"])
@@ -226,15 +485,16 @@ pub(crate) fn create_machine(
         .arg(network.dns.to_string())
         .args(["--net-mac"])
         .arg(format_mac(launch.assignment.mac));
-    if !launch.command.is_empty() {
-        invocation.arg("--").args(launch.command);
+    for seed in launch.seed_files {
+        invocation.args(["--seed-file"]);
+        invocation.arg(format!(
+            "{}={}:{:04o}",
+            seed.source.display(),
+            seed.destination.display(),
+            seed.mode
+        ));
     }
-    status_result(
-        &format!("create machine {}", launch.assignment.smolvm_name),
-        invocation
-            .status()
-            .map_err(|error| format!("run smolvm machine create: {error}"))?,
-    )
+    invocation
 }
 
 pub(crate) fn start_machine(smolvm: &Path, name: &str) -> Result<()> {
@@ -273,24 +533,39 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldState>) {
     }
 }
 
-pub(crate) fn local_image_path(config_dir: &Path, configured_image: &str) -> Result<PathBuf> {
-    let configured = Path::new(configured_image);
+pub(crate) fn local_smolfile_path(
+    config_dir: &Path,
+    configured_smolfile: &Path,
+) -> Result<PathBuf> {
+    let configured = configured_smolfile;
     let path = if configured.is_absolute() {
         configured.to_path_buf()
-    } else if configured_image.starts_with("./") || configured_image.starts_with("../") {
-        config_dir.join(configured)
     } else {
-        return Err(format!(
-            "image '{configured_image}' is a registry reference. This isolated PoC requires a local docker-save archive or unpacked rootfs path; use an absolute path or ./relative-path"
-        ));
+        config_dir.join(configured)
     };
-    fs::canonicalize(&path)
-        .map_err(|error| format!("resolve local image {}: {error}", path.display()))
+    fs::canonicalize(&path).map_err(|error| format!("resolve Smolfile {}: {error}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Assignment, SeedFile};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_launch<'a>(
+        assignment: &'a Assignment,
+        socket: &'a Path,
+        smolfile: &'a Path,
+        seed_files: &'a [SeedFile],
+    ) -> MachineLaunch<'a> {
+        MachineLaunch {
+            assignment,
+            socket,
+            smolfile,
+            seed_files,
+        }
+    }
 
     #[test]
     fn detects_the_macos_hypervisor_entitlement() {
@@ -298,5 +573,186 @@ mod tests {
             b"<key>com.apple.security.hypervisor</key><true/>"
         ));
         assert!(!has_hypervisor_entitlement(b"<dict></dict>"));
+    }
+
+    #[test]
+    fn machine_create_builder_keeps_the_complete_external_network_tuple() {
+        let assignment = Assignment {
+            ip: "10.89.0.17".parse().unwrap(),
+            mac: [0x02, 0, 0, 0, 0, 0x17],
+            smolvm_name: "smw-v2-demo-api".into(),
+        };
+        let seed_files = vec![SeedFile {
+            source: PathBuf::from("/tmp/clickhouse-config.xml"),
+            destination: PathBuf::from("/etc/clickhouse-server/config.d/world.xml"),
+            mode: 0o644,
+        }];
+        let launch = test_launch(
+            &assignment,
+            Path::new("/tmp/smw-v2-api.sock"),
+            Path::new("/tmp/api.Smolfile"),
+            &seed_files,
+        );
+        let network = NetworkConfig {
+            subnet: [10, 89, 0, 0],
+            gateway: "10.89.0.1".parse().unwrap(),
+            dns: "10.89.0.1".parse().unwrap(),
+            domain: "demo.test".into(),
+        };
+
+        let invocation = build_machine_create_command(Path::new("smolvm"), &launch, &network);
+        let args = invocation
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(invocation.get_program(), Path::new("smolvm"));
+        assert_eq!(
+            args,
+            vec![
+                "machine",
+                "create",
+                "--name",
+                "smw-v2-demo-api",
+                "--smolfile",
+                "/tmp/api.Smolfile",
+                "--net",
+                "--net-backend",
+                "virtio-net",
+                "--net-unixstream",
+                "/tmp/smw-v2-api.sock",
+                "--net-address",
+                "10.89.0.17/24",
+                "--net-gateway",
+                "10.89.0.1",
+                "--net-dns",
+                "10.89.0.1",
+                "--net-mac",
+                "02:00:00:00:00:17",
+                "--seed-file",
+                "/tmp/clickhouse-config.xml=/etc/clickhouse-server/config.d/world.xml:0644",
+            ]
+        );
+    }
+
+    #[test]
+    fn external_world_tsv_binds_the_exact_smolfile_material_and_network_tuple() {
+        let root = temporary_test_directory();
+        let smolfile = root.join("machine.Smolfile");
+        let archive = root.join("image.tar");
+        fs::write(&smolfile, "image = \"./image.tar\"\n").unwrap();
+        fs::write(&archive, b"prepared archive").unwrap();
+        let assignment = Assignment {
+            ip: "10.89.0.17".parse().unwrap(),
+            mac: [0x02, 0, 0, 0, 0, 0x17],
+            smolvm_name: "smw-v2-demo-machine".into(),
+        };
+        let network = NetworkConfig {
+            subnet: [10, 89, 0, 0],
+            gateway: "10.89.0.1".parse().unwrap(),
+            dns: "10.89.0.1".parse().unwrap(),
+            domain: "demo.test".into(),
+        };
+        let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
+        let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
+        let canonical_archive = fs::canonicalize(&archive).unwrap();
+        let output = format!(
+            "external-world-v2\t{}\tlocal-archive\t{}\tblake3:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            canonical_smolfile.display(),
+            canonical_archive.display(),
+            "a".repeat(64),
+            socket.display(),
+        );
+
+        let material =
+            parse_external_world_tsv(&output, &smolfile, &assignment, socket, &network).unwrap();
+
+        assert_eq!(material.smolfile, canonical_smolfile);
+        assert_eq!(material.local_archive, canonical_archive);
+        assert_eq!(material.image_digest, format!("blake3:{}", "a".repeat(64)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_world_tsv_rejects_unsealed_or_mismatched_material() {
+        let root = temporary_test_directory();
+        let smolfile = root.join("machine.Smolfile");
+        fs::write(&smolfile, "image = \"./image.tar\"\n").unwrap();
+        let assignment = Assignment {
+            ip: "10.89.0.17".parse().unwrap(),
+            mac: [0x02, 0, 0, 0, 0, 0x17],
+            smolvm_name: "smw-v2-demo-machine".into(),
+        };
+        let network = NetworkConfig {
+            subnet: [10, 89, 0, 0],
+            gateway: "10.89.0.1".parse().unwrap(),
+            dns: "10.89.0.1".parse().unwrap(),
+            domain: "demo.test".into(),
+        };
+        let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
+        let output = format!(
+            "external-world-v2\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\t/tmp/smw-v2-demo-machine.sock\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            canonical_smolfile.display(),
+            "a".repeat(64),
+            "a".repeat(64),
+        );
+
+        let error = parse_external_world_tsv(
+            &output,
+            &smolfile,
+            &assignment,
+            Path::new("/tmp/smw-v2-demo-machine.sock"),
+            &network,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("no host materializer is available"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_world_tsv_rejects_sha256_as_local_archive_identity() {
+        let root = temporary_test_directory();
+        let smolfile = root.join("machine.Smolfile");
+        let archive = root.join("image.tar");
+        fs::write(&smolfile, "image = \"./image.tar\"\n").unwrap();
+        fs::write(&archive, b"prepared archive").unwrap();
+        let assignment = Assignment {
+            ip: "10.89.0.17".parse().unwrap(),
+            mac: [0x02, 0, 0, 0, 0, 0x17],
+            smolvm_name: "smw-v2-demo-machine".into(),
+        };
+        let network = NetworkConfig {
+            subnet: [10, 89, 0, 0],
+            gateway: "10.89.0.1".parse().unwrap(),
+            dns: "10.89.0.1".parse().unwrap(),
+            domain: "demo.test".into(),
+        };
+        let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
+        let output = format!(
+            "external-world-v2\t{}\tlocal-archive\t{}\tsha256:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            fs::canonicalize(&smolfile).unwrap().display(),
+            fs::canonicalize(&archive).unwrap().display(),
+            "a".repeat(64),
+            socket.display(),
+        );
+
+        let error = parse_external_world_tsv(&output, &smolfile, &assignment, socket, &network)
+            .unwrap_err();
+        assert!(error.contains("invalid local archive digest"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temporary_test_directory() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "smolworld-smolvm-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

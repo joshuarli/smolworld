@@ -5,6 +5,7 @@ edition = "2021"
 description = "Minimal local L2 worlds for smolvm"
 
 [dependencies]
+blake3 = "1"
 yaml-rust2 = "0.11"
 
 [[bin]]

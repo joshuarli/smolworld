@@ -1,9 +1,8 @@
 use crate::gateway::Gateway;
-use crate::model::{format_mac, WorldConfig, WorldPaths, WorldState};
-use crate::state::{ensure_private_dir, fnv1a};
+use crate::model::{format_mac, WorldConfig, WorldState};
+use crate::state::fnv1a;
 use crate::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -30,21 +29,11 @@ pub(crate) enum SwitchEvent {
     Shutdown,
 }
 
-pub(crate) fn prepare_runtime_dir(path: &Path) -> Result<()> {
-    ensure_private_dir(path)
-}
-
-pub(crate) fn remove_runtime_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_dir_all(path).map_err(|error| format!("remove {}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-pub(crate) fn port_socket_path(paths: &WorldPaths, machine: &str) -> PathBuf {
-    paths
-        .runtime_dir
-        .join(format!("p-{:012x}.sock", fnv1a(machine.as_bytes())))
+/// Derive one deterministic listener socket inside an already-authorized
+/// runtime directory. The caller owns versioning of that directory; the
+/// switch deliberately has no knowledge of allocation-state formats.
+pub(crate) fn port_socket_path(runtime_dir: &Path, machine: &str) -> PathBuf {
+    runtime_dir.join(format!("p-{:012x}.sock", fnv1a(machine.as_bytes())))
 }
 
 pub(crate) fn spawn_port_acceptor(

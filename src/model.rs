@@ -19,44 +19,34 @@ pub(crate) struct NetworkConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachineConfig {
-    pub(crate) image: String,
-    pub(crate) command: Vec<String>,
+    /// Path to the machine's Smolfile. The contents belong to smolvm; the
+    /// world parser deliberately treats this as an opaque reference.
+    pub(crate) smolfile: PathBuf,
     pub(crate) depends_on: Vec<String>,
-    pub(crate) resources: MachineResources,
+    pub(crate) seed_files: Vec<SeedFile>,
 }
 
-/// The deliberately small default footprint for a local service VM. These are
-/// world defaults, not application-specific values: an individual machine can
-/// override any field in `.smolworld`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MachineResources {
-    pub(crate) cpus: u8,
-    pub(crate) memory_mib: u32,
-    pub(crate) storage_gib: u64,
-    pub(crate) overlay_gib: u64,
+/// A sealed host-file to guest-file copy declaration. The source is a host
+/// path that is checked and materialized by the host-side preparation path;
+/// smolworld never turns it into a live guest mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeedFile {
+    pub(crate) source: PathBuf,
+    pub(crate) destination: PathBuf,
+    /// Unix permission bits, represented as the numeric value of the exact
+    /// four-digit octal mode in the `.smolworld` file.
+    pub(crate) mode: u32,
 }
 
-impl Default for MachineResources {
-    fn default() -> Self {
-        Self {
-            cpus: 1,
-            memory_mib: 256,
-            storage_gib: 1,
-            overlay_gib: 1,
-        }
-    }
-}
-
-/// The already-resolved host inputs for one smolvm `machine create` call.
-/// Keeping this separate from `MachineConfig` makes the configuration-to-host
-/// boundary explicit: paths and static network identity have been validated
-/// before a subprocess is started.
+/// The host inputs for one smolvm external-world launch. Keeping this
+/// separate from `MachineConfig` makes the configuration-to-host boundary
+/// explicit: static network identity and the opaque Smolfile reference are
+/// passed to smolvm only after configuration validation.
 pub(crate) struct MachineLaunch<'a> {
     pub(crate) assignment: &'a Assignment,
     pub(crate) socket: &'a Path,
-    pub(crate) image: &'a Path,
-    pub(crate) command: &'a [String],
-    pub(crate) resources: MachineResources,
+    pub(crate) smolfile: &'a Path,
+    pub(crate) seed_files: &'a [SeedFile],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,32 +180,6 @@ impl RecoveryStatus {
 
     pub(crate) fn needs_recovery(&self) -> bool {
         self.lifecycle.state.needs_recovery() || self.runtime_dir == ArtifactState::Present
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct WorldPaths {
-    pub(crate) canonical_config: PathBuf,
-    pub(crate) config_dir: PathBuf,
-    pub(crate) hash: u64,
-    pub(crate) state_dir: PathBuf,
-    pub(crate) state_file: PathBuf,
-    pub(crate) runtime_dir: PathBuf,
-}
-
-impl WorldPaths {
-    /// The lock file is intentionally stable and is never deleted. The
-    /// operating-system file lock is released automatically when its owner
-    /// exits, so a leftover path cannot become a stale lock.
-    pub(crate) fn lock_path(&self) -> PathBuf {
-        self.state_dir.join("world.lock")
-    }
-
-    /// Lifecycle metadata is a sidecar so old allocation records remain
-    /// readable and existing `WorldState` constructors remain source
-    /// compatible.
-    pub(crate) fn lifecycle_path(&self) -> PathBuf {
-        self.state_dir.join("lifecycle")
     }
 }
 

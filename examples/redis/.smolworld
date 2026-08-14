@@ -1,15 +1,15 @@
-[world]
-name = "redis-demo"
+format: 2
 
-[network]
-subnet = "10.89.0.0/24"
-domain = "redis-demo.test"
+world:
+  name: redis-foundation
 
-[machines.redis]
-image = "./redis.tar"
-command = ["redis-server"]
+network:
+  subnet: 10.89.0.0/24
+  domain: redis-foundation.test
 
-[machines.client]
-image = "./redis.tar"
-command = ["sleep", "infinity"]
-depends_on = ["redis"]
+machines:
+  redis:
+    smolfile: ./smol/redis.Smolfile
+  runner:
+    smolfile: ./smol/runner.Smolfile
+    depends_on: [redis]

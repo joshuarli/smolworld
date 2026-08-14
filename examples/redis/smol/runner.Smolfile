@@ -1,0 +1,14 @@
+# Long-lived command runner for the two-machine smolworld foundation gate.
+#
+# The Redis archive includes `redis-cli`, which gives the test an explicit
+# runner action for checking DNS and TCP connectivity. This is workload test
+# behavior; smolworld does not provide readiness or health checks.
+
+image = "../redis.tar"
+entrypoint = ["sleep"]
+cmd = ["infinity"]
+
+cpus = 1
+memory = 256
+storage = 1
+overlay = 1
