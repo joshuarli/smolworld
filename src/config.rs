@@ -356,6 +356,35 @@ pub(crate) fn topological_order(config: &WorldConfig) -> Result<Vec<String>> {
     Ok(order)
 }
 
+/// Group machines into deterministic dependency waves. Machines in one wave
+/// have no dependency on another machine in that same wave, so host-side
+/// preparation and lifecycle operations may run concurrently. The wave
+/// boundary preserves the world contract that depends_on controls creation
+/// and start order.
+pub(crate) fn topological_waves(config: &WorldConfig) -> Result<Vec<Vec<String>>> {
+    let order = topological_order(config)?;
+    let mut depths = HashMap::new();
+    let mut waves: Vec<Vec<String>> = Vec::new();
+
+    for name in order {
+        let depth = config
+            .machines
+            .get(&name)
+            .expect("topological order contains configured machines")
+            .depends_on
+            .iter()
+            .map(|dependency| depths[dependency] + 1)
+            .max()
+            .unwrap_or(0);
+        depths.insert(name.clone(), depth);
+        if waves.len() <= depth {
+            waves.resize_with(depth + 1, Vec::new);
+        }
+        waves[depth].push(name);
+    }
+    Ok(waves)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +412,10 @@ machines:
     fn is_strict_and_orders_dependencies() {
         let config = config();
         assert_eq!(topological_order(&config).unwrap(), ["redis", "client"]);
+        assert_eq!(
+            topological_waves(&config).unwrap(),
+            [["redis".to_string()], ["client".to_string()]]
+        );
         assert!(parse_config(
             "world:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  a:\n    smolfile: ./a.Smolfile"
         )
@@ -422,6 +455,35 @@ machines:
             .depends_on
             .push("client".into());
         assert!(topological_order(&cyclic).unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn groups_independent_machines_into_one_wave() {
+        let config = parse_config(
+            r#"
+format: 2
+world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  client:
+    smolfile: ./client.Smolfile
+    depends_on: [redis]
+  redis:
+    smolfile: ./redis.Smolfile
+  postgres:
+    smolfile: ./postgres.Smolfile
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            topological_waves(&config).unwrap(),
+            vec![
+                vec!["redis".to_string(), "postgres".to_string()],
+                vec!["client".to_string()]
+            ]
+        );
     }
 
     #[test]

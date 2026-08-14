@@ -1,7 +1,7 @@
 use crate::cli::{
     format_ps, Cli, LifecycleState as DisplayLifecycleState, MachineStatus, PsFormat,
 };
-use crate::config::{load_config, topological_order};
+use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
 use crate::model::{format_mac, Assignment, LifecycleState, MachineLaunch, SeedFile, WorldConfig};
 use crate::smolvm::{
@@ -99,7 +99,7 @@ pub(crate) fn prepare(config_path: &Path) -> Result<()> {
 pub(crate) fn up(config_path: &Path) -> Result<()> {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     let config = load_config(config_path)?;
-    let order = topological_order(&config)?;
+    let waves = topological_waves(&config)?;
     let paths = v2_world_paths(config_path)?;
     let smolvm = smolvm_program();
     let _world_lock = WorldLock::acquire_v2(&paths)?;
@@ -161,34 +161,38 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
         }
         drop(attached_tx);
 
-        for name in &order {
-            let assignment = state.assignments.get(name).expect("allocated machine");
-            let smolfile = material
-                .smolfiles
-                .get(name)
-                .expect("prepared material has every configured machine");
-            let seed_files = prepared_seed_files(&paths.config_dir, &material, name)?;
-            create_machine(
-                &smolvm,
-                MachineLaunch {
-                    assignment,
-                    socket: socket_paths.get(name).expect("socket allocated"),
-                    smolfile: &smolfile.prepared_path,
-                    seed_files: &seed_files,
-                },
-                &config.network,
-            )?;
+        for wave in &waves {
+            parallel_machine_operations(wave, "create", |name| {
+                let assignment = state.assignments.get(name).expect("allocated machine");
+                let smolfile = material
+                    .smolfiles
+                    .get(name)
+                    .expect("prepared material has every configured machine");
+                let seed_files = prepared_seed_files(&paths.config_dir, &material, name)?;
+                create_machine(
+                    &smolvm,
+                    MachineLaunch {
+                        assignment,
+                        socket: socket_paths.get(name).expect("socket allocated"),
+                        smolfile: &smolfile.prepared_path,
+                        seed_files: &seed_files,
+                    },
+                    &config.network,
+                )
+            })?;
         }
         mark_v2_created(&paths)?;
-        for name in &order {
-            start_machine(
-                &smolvm,
-                &state
-                    .assignments
-                    .get(name)
-                    .expect("allocated machine")
-                    .smolvm_name,
-            )?;
+        for wave in &waves {
+            parallel_machine_operations(wave, "start", |name| {
+                start_machine(
+                    &smolvm,
+                    &state
+                        .assignments
+                        .get(name)
+                        .expect("allocated machine")
+                        .smolvm_name,
+                )
+            })?;
         }
 
         wait_for_attachments(&attached_rx, &config)?;
@@ -215,6 +219,47 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     let _ = remove_v2_runtime_dir(&paths);
     let _ = mark_v2_absent(&paths);
     result
+}
+
+/// Run one lifecycle operation concurrently for a dependency wave. Results
+/// are joined in declaration order so failures remain deterministic even when
+/// subprocesses finish in a different order. All workers are joined before an
+/// error is returned, allowing the outer cleanup path to see every partial
+/// machine the wave may have created.
+fn parallel_machine_operations<F>(names: &[String], operation: &str, task: F) -> Result<()>
+where
+    F: Fn(&str) -> Result<()> + Sync,
+{
+    parallel_machine_map(names, operation, task).map(|_| ())
+}
+
+/// Map one host-side operation over a deterministic machine list concurrently.
+/// The scoped workers are joined in input order, so a failure remains stable
+/// for callers while every worker has finished before cleanup begins.
+fn parallel_machine_map<T, F>(names: &[String], operation: &str, task: F) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn(&str) -> Result<T> + Sync,
+{
+    thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let task = &task;
+                scope.spawn(move || task(name))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(names)
+            .map(|(handle, name)| {
+                let result = handle
+                    .join()
+                    .map_err(|_| format!("{operation} machine '{name}' worker panicked"))?;
+                result.map_err(|error| format!("{operation} machine '{name}': {error}"))
+            })
+            .collect()
+    })
 }
 
 pub(crate) fn down(config_path: &Path) -> Result<()> {
@@ -415,74 +460,102 @@ fn prepare_world_material(
 ) -> Result<V2MaterialLock> {
     let mut lock =
         V2MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
-    for (index, (name, machine)) in config.machines.iter().enumerate() {
-        let assignment = validation_assignment(paths, config, name, index)?;
-        let socket = validation_socket_path(paths, name);
-        let authored_relative_path =
-            normalize_relative_path(&machine.smolfile, "configured Smolfile path")?;
-        let authored_smolfile =
-            sealed_relative_file(&paths.config_dir, &authored_relative_path, "Smolfile")?;
-        let preparation = materialize_external_world(smolvm, &authored_smolfile)?;
-        let material = validate_external_world(
-            smolvm,
-            &preparation.prepared_smolfile,
-            &assignment,
-            &socket,
-            &config.network,
-        )?;
-        let authored_digest = digest_file(&preparation.authored_smolfile)?;
-        let prepared_digest = digest_file(&material.smolfile)?;
+    let names: Vec<_> = config.machines.keys().cloned().collect();
+    let indices: BTreeMap<_, _> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    let prepared = parallel_machine_map(&names, "prepare material", |name| {
+        prepare_one_machine_material(config, paths, smolvm, name, indices[name])
+    })?;
+    for (name, prepared) in names.into_iter().zip(prepared) {
         if lock
             .smolfiles
-            .insert(
-                name.clone(),
-                V2SmolfileObservation {
-                    authored_relative_path,
-                    authored_digest,
-                    prepared_path: material.smolfile,
-                    prepared_digest,
-                },
-            )
+            .insert(name.clone(), prepared.smolfile)
             .is_some()
         {
             return Err(format!("material observation repeats machine '{name}'"));
         }
-        if lock
-            .images
-            .insert(
-                name.clone(),
-                V2ImageMaterial {
-                    machine: name.clone(),
-                    source_kind: preparation.source_kind,
-                    source_reference: preparation.source_reference,
-                    source_digest: preparation.source_digest,
-                    local_path: material.local_archive,
-                    image_digest: material.image_digest,
-                },
-            )
-            .is_some()
-        {
+        if lock.images.insert(name.clone(), prepared.image).is_some() {
             return Err(format!(
                 "material observation repeats image for machine '{name}'"
             ));
         }
-        for seed in &machine.seed_files {
+        lock.seeds.extend(prepared.seeds);
+    }
+    lock.validate()?;
+    Ok(lock)
+}
+
+struct PreparedMachineMaterial {
+    smolfile: V2SmolfileObservation,
+    image: V2ImageMaterial,
+    seeds: Vec<V2SeedObservation>,
+}
+
+fn prepare_one_machine_material(
+    config: &WorldConfig,
+    paths: &V2WorldPaths,
+    smolvm: &Path,
+    name: &str,
+    index: usize,
+) -> Result<PreparedMachineMaterial> {
+    let machine = config
+        .machines
+        .get(name)
+        .expect("prepared machine is configured");
+    let assignment = validation_assignment(paths, config, name, index)?;
+    let socket = validation_socket_path(paths, name);
+    let authored_relative_path =
+        normalize_relative_path(&machine.smolfile, "configured Smolfile path")?;
+    let authored_smolfile =
+        sealed_relative_file(&paths.config_dir, &authored_relative_path, "Smolfile")?;
+    let preparation = materialize_external_world(smolvm, &authored_smolfile)?;
+    let material = validate_external_world(
+        smolvm,
+        &preparation.prepared_smolfile,
+        &assignment,
+        &socket,
+        &config.network,
+    )?;
+    let authored_digest = digest_file(&preparation.authored_smolfile)?;
+    let prepared_digest = digest_file(&material.smolfile)?;
+    let seeds = machine
+        .seed_files
+        .iter()
+        .map(|seed| {
             let source_relative_path =
                 normalize_relative_path(&seed.source, "configured seed source")?;
             let source =
                 sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
             validate_seed_destination(&seed.destination)?;
-            lock.seeds.push(V2SeedObservation {
-                machine: name.clone(),
+            Ok(V2SeedObservation {
+                machine: name.to_string(),
                 source_relative_path,
                 destination: seed.destination.to_string_lossy().into_owned(),
                 mode: seed.mode,
                 digest: digest_file(&source)?,
-            });
-        }
-    }
-    lock.validate()?;
-    Ok(lock)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedMachineMaterial {
+        smolfile: V2SmolfileObservation {
+            authored_relative_path,
+            authored_digest,
+            prepared_path: material.smolfile,
+            prepared_digest,
+        },
+        image: V2ImageMaterial {
+            machine: name.to_string(),
+            source_kind: preparation.source_kind,
+            source_reference: preparation.source_reference,
+            source_digest: preparation.source_digest,
+            local_path: material.local_archive,
+            image_digest: material.image_digest,
+        },
+        seeds,
+    })
 }
 
 /// Revalidate a material lock without materializing or contacting a registry.
@@ -517,71 +590,18 @@ fn verify_material_lock(
         );
     }
 
-    let mut expected_seeds = Vec::new();
-    for (index, (name, machine)) in config.machines.iter().enumerate() {
-        let observation = prepared.smolfiles.get(name).ok_or_else(|| {
-            format!("world material is missing the Smolfile for machine '{name}'")
-        })?;
-        let authored_relative_path =
-            normalize_relative_path(&machine.smolfile, "configured Smolfile path")?;
-        let authored =
-            sealed_relative_file(&paths.config_dir, &authored_relative_path, "Smolfile")?;
-        if observation.authored_relative_path != authored_relative_path
-            || digest_file(&authored)? != observation.authored_digest
-        {
-            return Err(format!(
-                "authored Smolfile for machine '{name}' no longer matches the prepared world; run `smolworld prepare` again"
-            ));
-        }
-        let metadata = fs::metadata(&observation.prepared_path).map_err(|error| {
-            format!(
-                "inspect prepared Smolfile {}: {error}",
-                observation.prepared_path.display()
-            )
-        })?;
-        if !metadata.is_file()
-            || digest_file(&observation.prepared_path)? != observation.prepared_digest
-        {
-            return Err(format!(
-                "prepared Smolfile for machine '{name}' no longer matches the material lock; run `smolworld prepare` again"
-            ));
-        }
-        let assignment = validation_assignment(paths, config, name, index)?;
-        let socket = validation_socket_path(paths, name);
-        let material = validate_external_world(
-            smolvm,
-            &observation.prepared_path,
-            &assignment,
-            &socket,
-            &config.network,
-        )?;
-        let image = prepared
-            .images
-            .get(name)
-            .ok_or_else(|| format!("world material is missing the image for machine '{name}'"))?;
-        if material.smolfile != observation.prepared_path
-            || material.local_archive != image.local_path
-            || material.image_digest != image.image_digest
-        {
-            return Err(format!(
-                "prepared image for machine '{name}' no longer matches the material lock; run `smolworld prepare` again"
-            ));
-        }
-        for seed in &machine.seed_files {
-            let source_relative_path =
-                normalize_relative_path(&seed.source, "configured seed source")?;
-            let source =
-                sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
-            validate_seed_destination(&seed.destination)?;
-            expected_seeds.push(V2SeedObservation {
-                machine: name.clone(),
-                source_relative_path,
-                destination: seed.destination.to_string_lossy().into_owned(),
-                mode: seed.mode,
-                digest: digest_file(&source)?,
-            });
-        }
-    }
+    let names: Vec<_> = config.machines.keys().cloned().collect();
+    let indices: BTreeMap<_, _> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.as_str(), index))
+        .collect();
+    let mut expected_seeds = parallel_machine_map(&names, "verify material", |name| {
+        verify_one_machine_material(config, paths, smolvm, prepared, name, indices[name])
+    })?
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
     expected_seeds.sort_by(seed_identity);
     let mut locked_seeds = prepared.seeds.clone();
     locked_seeds.sort_by(seed_identity);
@@ -592,6 +612,86 @@ fn verify_material_lock(
         );
     }
     Ok(())
+}
+
+fn verify_one_machine_material(
+    config: &WorldConfig,
+    paths: &V2WorldPaths,
+    smolvm: &Path,
+    prepared: &V2MaterialLock,
+    name: &str,
+    index: usize,
+) -> Result<Vec<V2SeedObservation>> {
+    let machine = config
+        .machines
+        .get(name)
+        .expect("verified machine is configured");
+    let observation = prepared
+        .smolfiles
+        .get(name)
+        .ok_or_else(|| format!("world material is missing the Smolfile for machine '{name}'"))?;
+    let authored_relative_path =
+        normalize_relative_path(&machine.smolfile, "configured Smolfile path")?;
+    let authored = sealed_relative_file(&paths.config_dir, &authored_relative_path, "Smolfile")?;
+    if observation.authored_relative_path != authored_relative_path
+        || digest_file(&authored)? != observation.authored_digest
+    {
+        return Err(format!(
+            "authored Smolfile for machine '{name}' no longer matches the prepared world; run smolworld prepare again"
+        ));
+    }
+    let metadata = fs::metadata(&observation.prepared_path).map_err(|error| {
+        format!(
+            "inspect prepared Smolfile {}: {error}",
+            observation.prepared_path.display()
+        )
+    })?;
+    if !metadata.is_file()
+        || digest_file(&observation.prepared_path)? != observation.prepared_digest
+    {
+        return Err(format!(
+            "prepared Smolfile for machine '{name}' no longer matches the material lock; run smolworld prepare again"
+        ));
+    }
+    let assignment = validation_assignment(paths, config, name, index)?;
+    let socket = validation_socket_path(paths, name);
+    let material = validate_external_world(
+        smolvm,
+        &observation.prepared_path,
+        &assignment,
+        &socket,
+        &config.network,
+    )?;
+    let image = prepared
+        .images
+        .get(name)
+        .ok_or_else(|| format!("world material is missing the image for machine '{name}'"))?;
+    if material.smolfile != observation.prepared_path
+        || material.local_archive != image.local_path
+        || material.image_digest != image.image_digest
+    {
+        return Err(format!(
+            "prepared image for machine '{name}' no longer matches the material lock; run smolworld prepare again"
+        ));
+    }
+    machine
+        .seed_files
+        .iter()
+        .map(|seed| {
+            let source_relative_path =
+                normalize_relative_path(&seed.source, "configured seed source")?;
+            let source =
+                sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
+            validate_seed_destination(&seed.destination)?;
+            Ok(V2SeedObservation {
+                machine: name.to_string(),
+                source_relative_path,
+                destination: seed.destination.to_string_lossy().into_owned(),
+                mode: seed.mode,
+                digest: digest_file(&source)?,
+            })
+        })
+        .collect()
 }
 
 fn seed_identity(left: &V2SeedObservation, right: &V2SeedObservation) -> std::cmp::Ordering {
