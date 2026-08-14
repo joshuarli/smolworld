@@ -2,6 +2,11 @@
 //! concept. It owns an isolated Ethernet segment and delegates every VM
 //! lifecycle operation to the companion `smolvm` CLI.
 
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+compile_error!(
+    "smolworld supports only macOS on Apple Silicon (aarch64); Linux and Windows are unsupported"
+);
+
 mod cli;
 mod config;
 mod gateway;

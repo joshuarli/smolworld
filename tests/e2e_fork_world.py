@@ -95,6 +95,10 @@ def run(
         raise E2EError(f"command is unavailable: {command_text(arguments)}: {error}") from error
     except subprocess.TimeoutExpired as error:
         raise E2EError(f"command timed out after {timeout:.0f}s: {command_text(arguments)}") from error
+    if os.environ.get("SMOLWORLD_FORK_TRACE") == "1" and completed.stderr:
+        sys.stderr.write(
+            f"\n# {command_text(arguments)} stderr\n{completed.stderr}\n"
+        )
     if check and completed.returncode != 0:
         raise E2EError(
             f"command exited {completed.returncode}: {command_text(arguments)}\n"

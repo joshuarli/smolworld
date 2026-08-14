@@ -328,35 +328,27 @@ pub(crate) fn smolvm_binary_path(smolvm: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn require_hypervisor_entitlement(smolvm: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let binary = smolvm_binary_path(smolvm).ok_or_else(|| {
-            format!(
-                "resolve smolvm binary {} for Hypervisor Framework entitlement check",
-                smolvm.display()
-            )
-        })?;
-        let output = Command::new("codesign")
-            .args(["-d", "--entitlements", ":-"])
-            .arg(&binary)
-            .output()
-            .map_err(|error| format!("run codesign for {}: {error}", binary.display()))?;
-        let mut entitlements = output.stdout;
-        entitlements.extend_from_slice(&output.stderr);
-        if output.status.success() && has_hypervisor_entitlement(&entitlements) {
-            return Ok(());
-        }
-        Err(format!(
-            "{} lacks the macOS Hypervisor Framework entitlement; for a local debug build run `codesign --force --sign - --entitlements smolvm.entitlements {}` from the smolvm checkout",
-            binary.display(),
-            binary.display(),
-        ))
+    let binary = smolvm_binary_path(smolvm).ok_or_else(|| {
+        format!(
+            "resolve smolvm binary {} for Hypervisor Framework entitlement check",
+            smolvm.display()
+        )
+    })?;
+    let output = Command::new("codesign")
+        .args(["-d", "--entitlements", ":-"])
+        .arg(&binary)
+        .output()
+        .map_err(|error| format!("run codesign for {}: {error}", binary.display()))?;
+    let mut entitlements = output.stdout;
+    entitlements.extend_from_slice(&output.stderr);
+    if output.status.success() && has_hypervisor_entitlement(&entitlements) {
+        return Ok(());
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = smolvm;
-        Ok(())
-    }
+    Err(format!(
+        "{} lacks the macOS Hypervisor Framework entitlement; for a local debug build run `codesign --force --sign - --entitlements smolvm.entitlements {}` from the smolvm checkout",
+        binary.display(),
+        binary.display(),
+    ))
 }
 
 pub(crate) fn has_hypervisor_entitlement(entitlements: &[u8]) -> bool {
@@ -395,11 +387,7 @@ pub(crate) fn require_agent_rootfs(smolvm: &Path) -> Result<()> {
 }
 
 pub(crate) fn require_libkrun_pair(smolvm: &Path) -> Result<()> {
-    let names = if cfg!(target_os = "macos") {
-        ["libkrun.dylib", "libkrunfw.5.dylib"]
-    } else {
-        ["libkrun.so", "libkrunfw.so"]
-    };
+    let names = ["libkrun.dylib", "libkrunfw.5.dylib"];
     let explicit = env::var_os("SMOLVM_LIB_DIR").map(PathBuf::from);
     let mut candidates = explicit.clone().into_iter().collect::<Vec<_>>();
     if explicit.is_none() {

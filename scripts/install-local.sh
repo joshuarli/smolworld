@@ -234,17 +234,21 @@ if ! nm -gU "$LIBKRUN" 2>/dev/null | grep -q 'krun_add_net_unixstream'; then
 fi
 
 SMOLVM_BINARY="$SMOLVM_SOURCE_DIR/target/release/smolvm"
+SMOLVM_BOOT_BINARY="$SMOLVM_SOURCE_DIR/target/release/smolvm-boot"
 info "building patched smolvm"
 (
     cd "$SMOLVM_SOURCE_DIR"
-    LIBKRUN_BUNDLE="$SMOLVM_LIB_DIR" cargo build --release --bin smolvm
+    LIBKRUN_BUNDLE="$SMOLVM_LIB_DIR" cargo build --release --bin smolvm --bin smolvm-boot
 )
 [[ -x "$SMOLVM_BINARY" ]] || fail "smolvm build did not produce $SMOLVM_BINARY"
+[[ -x "$SMOLVM_BOOT_BINARY" ]] || fail "smolvm build did not produce $SMOLVM_BOOT_BINARY"
 
-info "signing smolvm with identity '$CODESIGN_IDENTITY'"
+info "signing smolvm launch binaries with identity '$CODESIGN_IDENTITY'"
 codesign --force --sign "$CODESIGN_IDENTITY" \
-    --entitlements "$SMOLVM_SOURCE_DIR/smolvm.entitlements" "$SMOLVM_BINARY"
+    --entitlements "$SMOLVM_SOURCE_DIR/smolvm.entitlements" \
+    "$SMOLVM_BINARY" "$SMOLVM_BOOT_BINARY"
 codesign --verify --strict "$SMOLVM_BINARY"
+codesign --verify --strict "$SMOLVM_BOOT_BINARY"
 
 SMOLWORLD_BINARY="$PROJECT_ROOT/target/release/smolworld"
 info "building smolworld"
@@ -273,6 +277,7 @@ mkdir -p "$STAGE_DIR/bin" "$STAGE_RUNTIME/lib" "$STAGE_RUNTIME/agent-rootfs"
 
 install -m 0755 "$SMOLWORLD_BINARY" "$STAGE_RUNTIME/smolworld-bin"
 install -m 0755 "$SMOLVM_BINARY" "$STAGE_RUNTIME/smolvm-bin"
+install -m 0755 "$SMOLVM_BOOT_BINARY" "$STAGE_RUNTIME/smolvm-boot"
 install -m 0755 "$SMOLVM_SOURCE_DIR/scripts/smolvm-wrapper.sh" "$STAGE_RUNTIME/smolvm"
 install -m 0755 "$PROJECT_ROOT/scripts/smolworld-wrapper.sh" "$STAGE_DIR/bin/smolworld"
 cp -a "$SMOLVM_LIB_DIR"/. "$STAGE_RUNTIME/lib/"
@@ -281,6 +286,7 @@ printf 'smolworld-local-install-v1\nsource=%s\n' "$SMOLVM_SOURCE_DIR" > "$STAGE_
 
 "$STAGE_RUNTIME/smolvm" --version >/dev/null
 codesign --verify --strict "$STAGE_RUNTIME/smolvm-bin"
+codesign --verify --strict "$STAGE_RUNTIME/smolvm-boot"
 
 if [[ -n "$CHECK_CONFIG" ]]; then
     info "running installed smolworld check before commit"

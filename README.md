@@ -10,6 +10,13 @@ not a container orchestrator: it has no Compose compatibility, host networking,
 port publishing, NAT, TAP/vmnet, DHCP, IPv6, guest Internet egress, health
 checks, or restart policies.
 
+## Platform support
+
+smolworld supports only macOS on Apple Silicon (`Darwin`/`aarch64`). Linux and
+Windows are unsupported build and runtime targets; this repository does not
+build, test, or release them. Any Linux or Windows artifacts in a companion
+smolvm checkout are external inputs and remain intentionally untouched.
+
 ## Requirements
 
 The supported local build runs on macOS Apple Silicon and needs Rust/Cargo,
@@ -21,9 +28,14 @@ brew install e2fsprogs
 export PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH"
 ```
 
-The runtime requires a patched, signed smolvm checkout, a matching
-`libkrun.dylib`/`libkrunfw.5.dylib` bundle, and a prepared agent rootfs
-containing `usr/local/bin/smolvm-agent`. The local source workflow is:
+The runtime requires a patched, signed smolvm checkout, its signed
+`smolvm-boot` launch helper, a matching `libkrun.dylib`/`libkrunfw.5.dylib`
+bundle, and a prepared agent rootfs containing `usr/local/bin/smolvm-agent`.
+The local installer builds and signs both launch binaries. When the helper is
+next to `smolvm`, smolvm selects it automatically for fresh VM subprocesses;
+otherwise it falls back to the full binary.
+
+The local source workflow is:
 
 ```text
 ~/d/smolworld
@@ -259,6 +271,17 @@ Its TSV reports fork wall time and two storage-sharing proxies. Allocated file
 blocks deliberately double-count APFS clonefile sharing; volume-used bytes see
 physical CoW sharing but include unrelated host writes. It does not establish a
 durable world checkpoint or measure proportional guest-RAM sharing.
+
+The first performance target was the fork transition itself: the recorded
+109.852 ms transition was roughly 71% of the 154.302 ms measured path to a
+clone with private DNS/Redis traffic, while the physical APFS delta was only
+90,112 bytes. Stage tracing identified fresh clone-process startup as the
+largest controllable slice. The minimal signed `smolvm-boot` helper reduced
+clone agent readiness from about 53 ms to 27 ms in the real-VM gate; the next
+performance seam is now the guest identity/release handshakes and the outer
+fork-command launch. For the durable checkpoint design, coordinated
+multi-machine capture remains the next correctness gate even after this
+single-machine path is optimized.
 
 ## Transition substrate benchmark
 

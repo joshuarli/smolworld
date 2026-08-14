@@ -14,6 +14,11 @@ The migration does not turn smolworld into a workflow engine. It must not grow w
 
 No new Rust dependency is in scope without explicit approval.
 
+The execution target is macOS on Apple Silicon (`Darwin`/`aarch64`) only.
+Linux and Windows are unsupported build and runtime targets. Niceforge does
+not require or modify Linux/Windows bundled artifacts that may exist in a
+companion smolvm checkout.
+
 ## Target world format
 
 Smolfiles are the single source of truth for one machine's image, command, environment, working directory, and resources. The .smolworld file is only the cross-machine topology and private-network contract.
@@ -275,6 +280,18 @@ NIC connection while a frozen golden keeps its old stream open, and discard
 stale frames/detaches by per-attachment generation. Durable state still
 requires persisted/reopenable memory backing or an immutable RAM codec, plus an
 explicit multi-machine world-level cut.
+
+The immediate performance bottleneck is the fork transition, not APFS storage:
+109.852 ms of transition time is about 71% of the 154.302 ms measured fork-to-
+private-traffic path, while physical volume use increased by only 90,112 bytes.
+Stage tracing found fresh clone-process startup to be the largest controllable
+slice. smolvm now builds and signs the minimal `smolvm-boot` helper beside the
+main binary and selects it automatically, reducing clone agent readiness from
+about 53 ms to 27 ms in the real-VM gate. The next benchmark should focus on
+the guest identity/release handshakes and the outer fork-command launch. The
+durable-world priority remains a coordinated multi-machine capture barrier,
+because the single-machine fork does not yet provide an atomic `WorldState`
+cut.
 
 The first production shape therefore uses eager, immutable snapshot
 directories. Once correctness is proven, the same `WorldState` manifest can

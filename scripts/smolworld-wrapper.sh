@@ -20,6 +20,12 @@ resolve_symlink() {
 
 SCRIPT_PATH="$(resolve_symlink "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    echo "error: smolworld supports only macOS on Apple Silicon" >&2
+    exit 1
+fi
+
 RUNTIME_DIR="$(cd "$SCRIPT_DIR/../lib/smolworld" && pwd -P)"
 SMOLWORLD_BIN="$RUNTIME_DIR/smolworld-bin"
 
@@ -32,13 +38,6 @@ export SMOLWORLD_SMOLVM="${SMOLWORLD_SMOLVM:-$RUNTIME_DIR/smolvm-bin}"
 export SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$RUNTIME_DIR/agent-rootfs}"
 export SMOLVM_LIB_DIR="${SMOLVM_LIB_DIR:-$RUNTIME_DIR/lib}"
 
-case "$(uname -s)" in
-    Darwin)
-        export DYLD_LIBRARY_PATH="$SMOLVM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
-        ;;
-    Linux)
-        export LD_LIBRARY_PATH="$SMOLVM_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-        ;;
-esac
+export DYLD_LIBRARY_PATH="$SMOLVM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 
 exec "$SMOLWORLD_BIN" "$@"
