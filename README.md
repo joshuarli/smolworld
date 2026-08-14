@@ -319,10 +319,12 @@ SMOLVM_LIB_DIR="$HOME/d/smolvm/lib" \
 python3 tests/e2e_fork_world.py
 ```
 
-On 2026-08-14, the real two-machine run captured in 19,389.991 ms and the
-restored runner reached a private NIC in 73.187 ms. Receipt hashes account for
-the full logical RAM/disk contents and are sealed concurrently per machine;
-that integrity work is now the dominant capture cost.
+On 2026-08-14, the real two-machine run captured in 5,680.518 ms and the
+restored runner reached a private NIC in 98.493 ms. The hot-path receipt uses
+BLAKE3 for the small VMM control files and a versioned APFS file-identity,
+size, and modification-time receipt for immutable RAM/disk clonefiles. A deep
+full-content audit is deliberately deferred; it must not turn a checkpoint
+transition into a host-wide hash workload.
 
 ## Transition substrate benchmark
 

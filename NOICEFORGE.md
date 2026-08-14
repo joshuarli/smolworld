@@ -225,8 +225,8 @@ The real two-machine Redis/runner durable-world gate then verified the initial
 Gates 1--2 substrate on 2026-08-14:
 
 ~~~
-coordinated checkpoint wall              19,389.991 ms
-restored runner + private NIC ready          73.187 ms
+coordinated checkpoint wall               5,680.518 ms
+restored runner + private NIC ready          98.493 ms
 ~~~
 
 The run wrote a workspace marker and Redis key before capture, exited the
@@ -238,11 +238,14 @@ is a same-lineage Smolworld artifact.  Without Niceforge's transition intent,
 lease/fence, PostgreSQL transaction, and evidence publication, it must not be
 called `WorldState W1` or used to resume a workflow job.
 
-The remaining observed capture bottleneck is full logical RAM/disk integrity
-sealing.  Concurrent receipt hashing reduced the two-machine wall time from
-42.427 s to 19.390 s; future speed work must preserve that full-content
-integrity contract or replace it with an equivalently verifiable immutable
-codec.
+The first receipt implementation scanned every logical RAM/disk byte with
+BLAKE3 and took 19.390 s on the two-machine gate; six parallel Sentry sealers
+also saturated the host CPU, so it was rejected as a checkpoint hot path. The
+published receipt now content-hashes only small VMM control files and uses
+versioned APFS file identity, size, and modification-time receipts for the
+immutable clonefiles. It reduced the two-machine capture to 5.681 s. A deep
+full-content audit remains an explicit offline operation, not a transition
+precondition.
 
 ### Current gaps
 
@@ -578,9 +581,11 @@ test with fresh host handles, a reopen-after-process-exit test, canonical
 RAM/disk/device receipt vectors, and no unrelated VMM/device changes.
 
 Evidence recorded: libkrun publishes relocatable, APFS-cloned RAM files rather
-than staging-directory paths; SmolVM verifies RAM/disk receipts and restores
-after its source process has exited.  The two-machine gate below exercises the
-external Unix-stream NIC boundary with fresh host descriptors.
+than staging-directory paths; SmolVM verifies small control-file hashes plus
+RAM/disk clonefile identity receipts and restores after its source process has
+exited. A deep full-content verifier is deferred from the checkpoint hot path.
+The two-machine gate below exercises the external Unix-stream NIC boundary
+with fresh host descriptors.
 
 ### Gate 2: coordinated two-machine Smolworld checkpoint
 
