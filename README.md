@@ -7,8 +7,10 @@ each machine's Smolfile owns its image, command, environment, and resources.
 This is a hard switch to the Smolfile model. The old world-level `image`,
 `command`, and resource fields are not aliases and are rejected. smolworld is
 not a container orchestrator: it has no Compose compatibility, host networking,
-port publishing, NAT, TAP/vmnet, DHCP, IPv6, guest Internet egress, health
-checks, or restart policies.
+port publishing, host-side NAT implementation, TAP/vmnet, DHCP, or IPv6 on the
+private world NIC. Explicit `network.egress` delegates outbound Internet
+traffic to smolvm's existing NAT runtime; smolworld does not implement that
+data path itself. Health checks and restart policies also remain out of scope.
 
 ## Platform support
 
@@ -35,6 +37,18 @@ The local installer builds and signs both launch binaries. When the helper is
 next to `smolvm`, smolvm selects it automatically for fresh VM subprocesses;
 otherwise it falls back to the full binary.
 
+The host `smolvm` binary and guest agent rootfs are separate artifacts. After
+changing companion `smolvm-agent` networking code, rebuild the rootfs before a
+live run, for example:
+
+```bash
+cd ~/d/smolvm
+./scripts/build-agent-rootfs.sh --arch aarch64 ~/d/smolvm/target/agent-rootfs
+```
+
+`smolworld check` verifies that the configured rootfs exists, but cannot
+determine whether it contains the newest guest-agent build.
+
 The local source workflow is:
 
 ```text
@@ -55,9 +69,12 @@ git -C "$HOME/d/smolvm/libkrun" rev-parse HEAD
 
 The selected smolvm checkout must provide `krun_add_net_unixstream`. The
 external-world launch passes one complete static tuple—guest address, gateway,
-DNS address, and MAC—over one Unix-stream virtio NIC. smolworld owns the L2
-switch, gateway, DNS, socket lifecycle, and exact world cleanup; smolvm owns the
-individual VM and Smolfile interpretation.
+DNS address, and MAC—over the first Unix-stream virtio NIC. With
+`network.egress: true`, smolvm also attaches its existing host-side NAT runtime
+as a second virtio NIC: the private smolworld NIC remains `eth0`, while smolvm's
+NAT NIC is `eth1` and owns the default route. smolworld owns the private L2
+switch, local DNS, socket lifecycle, and exact world cleanup; smolvm owns the
+individual VM, guest NIC setup, NAT, and Smolfile interpretation.
 
 ## Local install
 
@@ -104,7 +121,8 @@ smolworld prepare [-f PATH]                Resolve and seal local material.
 smolworld check [-f PATH]                  Validate the prepared world read-only.
 smolworld up [-f PATH]                     Start the world in the foreground.
 smolworld ps [-f PATH] [--json]            Show machine lifecycle observations.
-smolworld exec [-f PATH] MACHINE -- CMD    Run CMD in a started machine.
+smolworld exec [-f PATH] MACHINE [--secret-env GUEST=HOST_ENV]... -- CMD
+                                            Run CMD in a started machine.
 smolworld checkpoint [-f PATH] --output DIR
                                             Capture this running world, retain
                                             its exact machine sources, and exit.
@@ -145,6 +163,10 @@ transaction that makes a captured world a workflow fact.
 `created`, `attached`, `running`, `capturing`, `captured`, and `absent`.
 `ps --json` emits the same rows as a JSON array.
 
+`exec --secret-env GUEST=HOST_ENV` resolves a caller-owned host environment
+variable for one delegated command. The value is passed to smolvm for that
+exec only; it is not stored in world state, the Smolfile, or the material lock.
+
 ## `.smolworld` format: version 2
 
 The world file is YAML and contains only topology, private-network settings,
@@ -160,6 +182,7 @@ world:
 network:
   subnet: 10.89.0.0/24
   domain: redis-foundation.test
+  egress: true
 
 machines:
   redis:
@@ -192,15 +215,43 @@ Supported world fields are:
 | `network.gateway` | Optional gateway address; defaults to `.1`. |
 | `network.dns` | Optional DNS address; must equal `gateway`. |
 | `network.domain` | Optional lowercase DNS suffix; defaults to the world name. |
+| `network.egress` | Optional; when true, adds smolvm's existing NAT as guest `eth1` and puts the default route there. |
 | `machines.NAME.smolfile` | Required path to that machine's Smolfile. |
 | `machines.NAME.depends_on` | Optional creation/start order only; not readiness. |
 | `machines.NAME.seed_files` | Optional sealed file copies into guest paths. |
 
+### Guest Internet egress
+
+`network.egress` is an explicit opt-in for outbound guest traffic. It changes
+the guest's two-NIC topology as follows:
+
+| Interface | Owner | Addressing | Route |
+| --- | --- | --- | --- |
+| `eth0` | smolworld | Static world address from the allocation state | Private world subnet and local DNS only |
+| `eth1` | smolvm | Existing smolvm host-side NAT runtime | Default route for Internet traffic |
+
+smolworld continues to own the private Ethernet switch and the gateway/DNS
+address on `eth0`; it does not perform NAT or publish ports. Known world names
+are answered locally. When egress is enabled, unknown DNS queries are forwarded
+by the smolworld host gateway to its configured upstream resolver, currently
+`1.1.1.1:53`, so the guest can resolve public names without bypassing local
+world discovery. With egress disabled, unknown names return `NXDOMAIN` and the
+guest has no Internet route.
+
+The guest's default route is deliberately moved to `eth1`; this keeps
+machine-to-machine traffic on the private `eth0` segment while allowing the
+existing smolvm NAT relay to handle outbound TCP/UDP traffic. The feature
+requires the companion smolvm external-world ABI that supports
+`--net-egress`; `smolworld check` validates that boundary before creating any
+world resources.
+
 Every machine receives a stable address and MAC from the world's persisted
 allocation state. Other machines resolve it by short name (`redis`) and by
 fully qualified name (`redis.redis-foundation.test`). The gateway and DNS
-service are synthetic and private to this world. Guests have no route to the
-host or Internet, and smolworld does not publish a guest port to the host.
+service are synthetic and private to this world. Without `network.egress`,
+guests have no route to the host or Internet. With it, only smolvm's second
+NIC provides outbound Internet access; the private world NIC remains isolated,
+and smolworld does not publish a guest port to the host.
 
 ## Smolfile profile
 
@@ -226,7 +277,8 @@ a Smolfile; use `.smolworld` for those.
 The external-world profile rejects `net`, `ports`, `volumes`, Docker socket or
 SSH-agent forwarding, egress policy, health checks, restart policy, and other
 host-capability or lifecycle settings. smolworld injects the complete external
-virtio-net tuple and does not merge a second NIC or guest networking policy.
+virtio-net tuple; with `network.egress`, smolvm adds its own second NAT NIC and
+guest-side routing policy.
 
 An authored Smolfile may name an immutable OCI `@sha256:` reference or a local
 archive. `prepare` resolves the former on the host into a verified local Docker

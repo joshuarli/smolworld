@@ -35,7 +35,11 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
     validate_label(&name).map_err(|reason| format!("world.name: {reason}"))?;
 
     let network = yaml_hash(required_key(root, "network", ".smolworld")?, "network")?;
-    reject_unknown(network, &["subnet", "gateway", "dns", "domain"], "network")?;
+    reject_unknown(
+        network,
+        &["subnet", "gateway", "dns", "domain", "egress"],
+        "network",
+    )?;
     let subnet_value = yaml_string(
         required_key(network, "subnet", "network")?,
         "network.subnet",
@@ -55,6 +59,10 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
         .transpose()?
         .unwrap_or_else(|| name.clone());
     validate_domain(&domain).map_err(|reason| format!("network.domain: {reason}"))?;
+    let egress = optional_key(network, "egress")
+        .map(|value| yaml_bool(value, "network.egress"))
+        .transpose()?
+        .unwrap_or(false);
 
     let machine_values = yaml_hash(required_key(root, "machines", ".smolworld")?, "machines")?;
     if machine_values.is_empty() {
@@ -111,6 +119,7 @@ pub(crate) fn parse_config(input: &str) -> Result<WorldConfig> {
             gateway,
             dns,
             domain,
+            egress,
         },
         machines,
     };
@@ -234,6 +243,12 @@ fn parse_seed_files(value: &Yaml, path: &str) -> Result<Vec<SeedFile>> {
         });
     }
     Ok(seed_files)
+}
+
+fn yaml_bool(value: &Yaml, path: &str) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{path} must be true or false"))
 }
 
 fn yaml_mode(value: &Yaml, path: &str) -> Result<u32> {
@@ -541,6 +556,15 @@ machines:
         )
         .unwrap_err()
         .contains("relative"));
+    }
+
+    #[test]
+    fn parses_explicit_network_egress() {
+        let config = parse_config(
+            "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\n  egress: true\nmachines:\n  a:\n    smolfile: ./a.Smolfile\n",
+        )
+        .unwrap();
+        assert!(config.network.egress);
     }
 
     #[test]

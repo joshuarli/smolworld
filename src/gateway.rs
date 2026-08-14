@@ -1,11 +1,15 @@
 use crate::model::{gateway_mac, WorldAllocationState, WorldConfig};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::Duration;
+
+const DEFAULT_UPSTREAM_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
 
 pub(crate) struct Gateway {
     pub(crate) ip: Ipv4Addr,
     pub(crate) mac: [u8; 6],
     records: HashMap<String, Ipv4Addr>,
+    upstream_dns: Option<Ipv4Addr>,
 }
 
 impl Gateway {
@@ -20,6 +24,7 @@ impl Gateway {
             ip: config.network.gateway,
             mac: gateway_mac(),
             records,
+            upstream_dns: config.network.egress.then_some(DEFAULT_UPSTREAM_DNS),
         }
     }
 
@@ -105,23 +110,31 @@ impl Gateway {
             None
         };
         let known_name = self.records.contains_key(&name);
-        let rcode = if known_name { 0 } else { 3 };
-        let mut response_dns = Vec::with_capacity(question_end + 16);
-        response_dns.extend_from_slice(&dns[..2]);
-        response_dns.extend_from_slice(&(0x8180_u16 | rcode).to_be_bytes());
-        response_dns.extend_from_slice(&1_u16.to_be_bytes());
-        response_dns.extend_from_slice(&(u16::from(answer_ip.is_some())).to_be_bytes());
-        response_dns.extend_from_slice(&0_u16.to_be_bytes());
-        response_dns.extend_from_slice(&0_u16.to_be_bytes());
-        response_dns.extend_from_slice(&dns[12..question_end]);
-        if let Some(ip) = answer_ip {
-            response_dns.extend_from_slice(&[0xc0, 0x0c]);
+        let response_dns = if !known_name {
+            match self.upstream_dns {
+                Some(upstream) => forward_dns_query(dns, upstream)
+                    .unwrap_or_else(|| synthetic_dns_error(dns, question_end, 2)),
+                None => synthetic_dns_error(dns, question_end, 3),
+            }
+        } else {
+            let mut response_dns = Vec::with_capacity(question_end + 16);
+            response_dns.extend_from_slice(&dns[..2]);
+            response_dns.extend_from_slice(&0x8180_u16.to_be_bytes());
             response_dns.extend_from_slice(&1_u16.to_be_bytes());
-            response_dns.extend_from_slice(&1_u16.to_be_bytes());
-            response_dns.extend_from_slice(&60_u32.to_be_bytes());
-            response_dns.extend_from_slice(&4_u16.to_be_bytes());
-            response_dns.extend_from_slice(&ip.octets());
-        }
+            response_dns.extend_from_slice(&(u16::from(answer_ip.is_some())).to_be_bytes());
+            response_dns.extend_from_slice(&0_u16.to_be_bytes());
+            response_dns.extend_from_slice(&0_u16.to_be_bytes());
+            response_dns.extend_from_slice(&dns[12..question_end]);
+            if let Some(ip) = answer_ip {
+                response_dns.extend_from_slice(&[0xc0, 0x0c]);
+                response_dns.extend_from_slice(&1_u16.to_be_bytes());
+                response_dns.extend_from_slice(&1_u16.to_be_bytes());
+                response_dns.extend_from_slice(&60_u32.to_be_bytes());
+                response_dns.extend_from_slice(&4_u16.to_be_bytes());
+                response_dns.extend_from_slice(&ip.octets());
+            }
+            response_dns
+        };
 
         let source_ip = [
             frame[ip_start + 12],
@@ -139,6 +152,33 @@ impl Gateway {
             &response_dns,
         )
     }
+}
+
+fn forward_dns_query(query: &[u8], upstream: Ipv4Addr) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    socket
+        .send_to(query, SocketAddr::from((upstream, 53)))
+        .ok()?;
+    let mut response = [0_u8; 4096];
+    let (size, _) = socket.recv_from(&mut response).ok()?;
+    let response = &response[..size];
+    if response.len() < 12 || response[..2] != query[..2] || response[2] & 0x80 == 0 {
+        return None;
+    }
+    Some(response.to_vec())
+}
+
+fn synthetic_dns_error(query: &[u8], question_end: usize, rcode: u16) -> Vec<u8> {
+    let mut response = Vec::with_capacity(question_end + 12);
+    response.extend_from_slice(&query[..2]);
+    response.extend_from_slice(&(0x8180_u16 | rcode).to_be_bytes());
+    response.extend_from_slice(&1_u16.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(&0_u16.to_be_bytes());
+    response.extend_from_slice(&query[12..question_end]);
+    response
 }
 
 pub(crate) fn parse_dns_question(dns: &[u8]) -> Option<(usize, String, u16, u16)> {

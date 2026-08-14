@@ -15,6 +15,8 @@ pub(crate) struct NetworkConfig {
     pub(crate) gateway: Ipv4Addr,
     pub(crate) dns: Ipv4Addr,
     pub(crate) domain: String,
+    /// Attach smolvm's existing host-side NAT as a second guest NIC.
+    pub(crate) egress: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

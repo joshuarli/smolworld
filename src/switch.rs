@@ -505,6 +505,7 @@ mod tests {
                 gateway: "10.89.0.1".parse().unwrap(),
                 dns: "10.89.0.1".parse().unwrap(),
                 domain: "test".to_string(),
+                egress: false,
             },
             machines: BTreeMap::new(),
         };

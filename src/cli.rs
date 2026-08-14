@@ -134,6 +134,7 @@ pub(crate) enum Cli {
     Exec {
         config: PathBuf,
         machine: String,
+        secret_env: Vec<String>,
         command: Vec<String>,
     },
     Cp {
@@ -203,19 +204,34 @@ pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
                 }
                 let Some(machine) = rest.first() else {
                     return Err(
-                        "usage: smolworld exec [-f PATH] MACHINE -- COMMAND [ARG ...]".into(),
+                        "usage: smolworld exec [-f PATH] MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]".into(),
                     );
                 };
-                if rest.get(1).map(String::as_str) != Some("--") {
-                    return Err("smolworld exec requires -- before COMMAND".into());
+                rest = &rest[1..];
+                let mut secret_env = Vec::new();
+                while rest.first().map(String::as_str) != Some("--") {
+                    if rest.first().map(String::as_str) != Some("--secret-env") {
+                        return Err(
+                            "smolworld exec accepts only --secret-env before -- COMMAND".into()
+                        );
+                    }
+                    let Some(value) = rest.get(1) else {
+                        return Err("smolworld exec --secret-env requires GUEST=HOST_ENV".into());
+                    };
+                    secret_env.push(value.clone());
+                    rest = &rest[2..];
+                    if rest.is_empty() {
+                        return Err("smolworld exec requires -- before COMMAND".into());
+                    }
                 }
-                let command = rest[2..].to_vec();
+                let command = rest[1..].to_vec();
                 if command.is_empty() {
                     return Err("smolworld exec requires a command".into());
                 }
                 return Ok(Cli::Exec {
                     config,
                     machine: machine.clone(),
+                    secret_env,
                     command,
                 });
             }
@@ -418,7 +434,7 @@ fn push_json_string(output: &mut String, value: &str) {
 }
 
 pub(crate) fn usage() -> &'static str {
-    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
+    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
 }
 
 #[cfg(test)]
@@ -450,6 +466,36 @@ mod tests {
         assert!(matches!(
             parse_cli(vec!["prepare".into()]).unwrap(),
             Cli::Prepare { config } if config == PathBuf::from(".smolworld")
+        ));
+    }
+
+    #[test]
+    fn parses_exec_secret_env_before_command_separator() {
+        assert!(matches!(
+            parse_cli(vec![
+                "exec".into(),
+                "agent".into(),
+                "--secret-env".into(),
+                "OPENROUTER_API_KEY=OPENROUTER_API_KEY".into(),
+                "--".into(),
+                "/usr/local/bin/runebench-pi-agent".into(),
+                "--model".into(),
+                "openrouter/example".into(),
+            ])
+            .unwrap(),
+            Cli::Exec {
+                config,
+                machine,
+                secret_env,
+                command,
+            } if config == PathBuf::from(".smolworld")
+                && machine == "agent"
+                && secret_env == vec!["OPENROUTER_API_KEY=OPENROUTER_API_KEY"]
+                && command == vec![
+                    "/usr/local/bin/runebench-pi-agent",
+                    "--model",
+                    "openrouter/example",
+                ]
         ));
     }
 

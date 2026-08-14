@@ -73,8 +73,9 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Cli::Exec {
             config,
             machine,
+            secret_env,
             command,
-        } => exec(&config, &machine, &command),
+        } => exec(&config, &machine, &secret_env, &command),
         Cli::Cp {
             config,
             source,
@@ -1057,7 +1058,12 @@ fn display_lifecycle_state(
     }
 }
 
-pub(crate) fn exec(config_path: &Path, machine: &str, command: &[String]) -> Result<()> {
+pub(crate) fn exec(
+    config_path: &Path,
+    machine: &str,
+    secret_env: &[String],
+    command: &[String],
+) -> Result<()> {
     let config = load_config(config_path)?;
     if !config.machines.contains_key(machine) {
         return Err(format!("unknown world machine '{machine}'"));
@@ -1069,11 +1075,16 @@ pub(crate) fn exec(config_path: &Path, machine: &str, command: &[String]) -> Res
         .assignments
         .get(machine)
         .ok_or_else(|| format!("machine '{machine}' has no allocation"))?;
-    let status = Command::new(smolvm_program())
+    let mut invocation = Command::new(smolvm_program());
+    invocation
         .arg("machine")
         .arg("exec")
         .arg("--name")
-        .arg(&assignment.smolvm_name)
+        .arg(&assignment.smolvm_name);
+    for value in secret_env {
+        invocation.arg("--secret-env").arg(value);
+    }
+    let status = invocation
         .arg("--")
         .args(command)
         .status()

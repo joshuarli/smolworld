@@ -31,7 +31,7 @@ pub(crate) struct PreparedExternalWorldSmolfile {
     pub(crate) source_digest: String,
 }
 
-const EXTERNAL_WORLD_TSV_ABI: &str = "external-world-v2";
+const EXTERNAL_WORLD_TSV_ABI: &str = "external-world-v3";
 const EXTERNAL_WORLD_PREPARE_TSV_ABI: &str = "external-world-prepare-v2";
 
 /// Invoke the only mutating Smolfile image boundary. smolvm owns registry
@@ -153,7 +153,8 @@ pub(crate) fn validate_external_world(
     network: &NetworkConfig,
 ) -> Result<ExternalWorldMaterial> {
     let address = format!("{}/24", assignment.ip);
-    let output = Command::new(smolvm)
+    let mut command = Command::new(smolvm);
+    command
         .args([
             "smolfile",
             "validate-external",
@@ -169,7 +170,11 @@ pub(crate) fn validate_external_world(
         .args(["--net-dns"])
         .arg(network.dns.to_string())
         .args(["--net-mac"])
-        .arg(format_mac(assignment.mac))
+        .arg(format_mac(assignment.mac));
+    if network.egress {
+        command.arg("--net-egress");
+    }
+    let output = command
         .output()
         .map_err(|error| format!("run smolvm external-world validation: {error}"))?;
     if !output.status.success() {
@@ -198,13 +203,13 @@ fn parse_external_world_tsv(
         return Err("smolvm external-world validation emitted more than one record".into());
     }
     let fields: Vec<_> = record.split('\t').collect();
-    if fields.len() != 10 {
+    if fields.len() != 11 {
         return Err(format!(
-            "smolvm external-world validation returned {} TSV fields, expected 10",
+            "smolvm external-world validation returned {} TSV fields, expected 11",
             fields.len()
         ));
     }
-    let [abi, smolfile, image_kind, image_locator, image_digest, socket, guest_cidr, gateway, dns, mac]: [&str; 10] =
+    let [abi, smolfile, image_kind, image_locator, image_digest, socket, guest_cidr, gateway, dns, mac, egress]: [&str; 11] =
         fields.try_into().expect("field count checked above");
     if abi != EXTERNAL_WORLD_TSV_ABI {
         return Err(format!("unsupported smolvm external-world ABI '{abi}'"));
@@ -222,6 +227,7 @@ fn parse_external_world_tsv(
         || gateway != network.gateway.to_string()
         || dns != network.dns.to_string()
         || mac != format_mac(assignment.mac)
+        || egress != if network.egress { "true" } else { "false" }
     {
         return Err(
             "smolvm external-world validation returned a mismatched static network tuple".into(),
@@ -475,6 +481,9 @@ fn build_machine_create_command(
         .arg(network.dns.to_string())
         .args(["--net-mac"])
         .arg(format_mac(launch.assignment.mac));
+    if network.egress {
+        invocation.arg("--net-egress");
+    }
     for seed in launch.seed_files {
         invocation.args(["--seed-file"]);
         invocation.arg(format!(
@@ -538,11 +547,10 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationStat
         return;
     };
     for assignment in state.assignments.values() {
-        let _ = Command::new(smolvm)
-            .args(["machine", "stop", "--name", &assignment.smolvm_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // `machine delete -f` owns the stop-then-remove sequence. Calling
+        // `machine stop` separately and ignoring its result can race the
+        // delete, leaving an orphaned _boot-vm process after the world lock
+        // has been released.
         let _ = Command::new(smolvm)
             .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
             .stdout(Stdio::null())
@@ -662,6 +670,7 @@ mod tests {
             gateway: "10.89.0.1".parse().unwrap(),
             dns: "10.89.0.1".parse().unwrap(),
             domain: "demo.test".into(),
+            egress: false,
         };
 
         let invocation = build_machine_create_command(Path::new("smolvm"), &launch, &network);
@@ -716,12 +725,13 @@ mod tests {
             gateway: "10.89.0.1".parse().unwrap(),
             dns: "10.89.0.1".parse().unwrap(),
             domain: "demo.test".into(),
+            egress: false,
         };
         let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
         let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
         let canonical_archive = fs::canonicalize(&archive).unwrap();
         let output = format!(
-            "external-world-v2\t{}\tlocal-archive\t{}\tblake3:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            "external-world-v3\t{}\tlocal-archive\t{}\tblake3:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
             canonical_smolfile.display(),
             canonical_archive.display(),
             "a".repeat(64),
@@ -752,10 +762,11 @@ mod tests {
             gateway: "10.89.0.1".parse().unwrap(),
             dns: "10.89.0.1".parse().unwrap(),
             domain: "demo.test".into(),
+            egress: false,
         };
         let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
         let output = format!(
-            "external-world-v2\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\t/tmp/smw-v2-demo-machine.sock\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            "external-world-v3\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\t/tmp/smw-v2-demo-machine.sock\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
             canonical_smolfile.display(),
             "a".repeat(64),
             "a".repeat(64),
@@ -791,10 +802,11 @@ mod tests {
             gateway: "10.89.0.1".parse().unwrap(),
             dns: "10.89.0.1".parse().unwrap(),
             domain: "demo.test".into(),
+            egress: false,
         };
         let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
         let output = format!(
-            "external-world-v2\t{}\tlocal-archive\t{}\tsha256:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\n",
+            "external-world-v3\t{}\tlocal-archive\t{}\tsha256:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
             fs::canonicalize(&smolfile).unwrap().display(),
             fs::canonicalize(&archive).unwrap().display(),
             "a".repeat(64),

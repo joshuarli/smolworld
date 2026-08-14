@@ -9,8 +9,9 @@ file and runs on a private userspace Ethernet segment.
 It is deliberately not a container orchestrator or general virtual network.
 Keep these exclusions unless the user explicitly expands the product contract:
 
-* no host networking, port publishing, NAT, TAP/vmnet, DHCP, IPv6, or guest
-  Internet egress;
+* no host networking, port publishing, smolworld-owned NAT, TAP/vmnet, DHCP,
+  or IPv6 on the private world NIC; explicit guest Internet egress is delegated
+  to smolvm's existing host-side NAT runtime;
 * no service health checks, restart policies, log aggregation, or Compose
   compatibility;
 * no registry image pulls from guests—images are host-prepared local archives
@@ -33,7 +34,7 @@ smolworld
     ▼
 patched smolvm
   persistent machine/image lifecycle + guest agent static IPv4 provisioning
-  one virtio-net NIC attached to smolworld's Unix listener
+  eth0 attached to smolworld's Unix listener + optional eth1 NAT egress NIC
     │
     ▼
 libkrun
@@ -41,15 +42,20 @@ libkrun
 ```
 
 smolworld owns cross-machine identity, Ethernet forwarding, authoritative
-local DNS, socket lifecycle, and group cleanup. smolvm owns each VM, its guest
-agent, OCI image handling, and libkrun invocation. Do not move L2/DNS/world
-logic into smolvm, and do not reimplement VMM or virtio behavior here.
+local DNS (and upstream forwarding when egress is enabled), socket lifecycle,
+and group cleanup. smolvm owns each VM, its guest agent, OCI image handling,
+the optional NAT egress relay, and libkrun invocation. The current upstream DNS
+forwarder is `1.1.1.1:53`; it is host-side forwarding, not guest access to a
+second DNS service. Do not move L2/DNS/world logic into smolvm, and do not
+reimplement VMM or virtio behavior here.
 
 The companion smolvm contract is an external virtio-net attachment with a Unix
 stream path and a complete static IPv4 tuple: guest address, gateway, DNS, and
-MAC. It is incompatible with smolvm's built-in gateway/TSI, port mappings,
-egress policy, DNS filtering, IPv6, and a second NIC. libkrun needs no source
-patch while it provides `krun_add_net_unixstream`.
+MAC. It remains the first guest NIC (`eth0`). When world egress is enabled,
+smolvm adds its existing host-side NAT runtime as a second virtio-net NIC
+(`eth1`) and owns the default route there; libkrun explicitly supports multiple
+`krun_add_net_unixstream` devices. smolworld still owns the private switch and
+local DNS, while smolvm owns the egress relay and policy.
 
 ## Module map
 
@@ -73,8 +79,10 @@ contract; update its users and tests deliberately when changing it.
 * A world has exactly one IPv4 `/24` subnet. Every guest gets a stable static
   IPv4/MAC assignment persisted under `~/.smolworld`.
 * The configured DNS address equals the configured gateway; this process
-  implements the authoritative service. It answers configured short names and
-  `<machine>.<domain>` names only.
+  implements the authoritative local service. It answers configured short names
+  and `<machine>.<domain>` names, and forwards unknown names upstream only when
+  egress is enabled. Upstream forwarding uses `1.1.1.1:53` and a bounded
+  request timeout; failures return synthetic `SERVFAIL`.
 * The gateway address and MAC are reserved: allocation must never give either
   to a machine.
 * The host/virtio wire protocol is one big-endian 4-byte Ethernet-frame length

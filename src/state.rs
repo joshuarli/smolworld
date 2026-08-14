@@ -1790,6 +1790,7 @@ mod tests {
                 gateway: "10.89.0.9".parse().unwrap(),
                 dns: "10.89.0.9".parse().unwrap(),
                 domain: "demo.test".to_string(),
+                egress: false,
             },
             machines: BTreeMap::from([
                 (
