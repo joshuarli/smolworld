@@ -237,6 +237,29 @@ that preparation/check create no world runtime state, and verifies cleanup is
 limited to the recorded machines and sockets. It requires no guest Internet
 access and no container/VM orchestrator beyond the selected smolvm checkout.
 
+### External-NIC fork reconnect E2E
+
+[`tests/e2e_fork_world.py`](tests/e2e_fork_world.py) extends that fixture with
+the current live SmolVM fork substrate. It verifies ordinary private DNS/Redis
+traffic, restarts the runner as a forkable golden, then proves that its restored
+clone reconnects both the agent and the same Unix-stream NIC while the frozen
+golden still holds its old connection. The clone must resolve and reach Redis
+through Smolworld's switch before the test passes.
+
+```bash
+PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH" \
+SMOLWORLD_FORK_E2E=1 \
+SMOLWORLD_SMOLVM="$HOME/d/smolvm/target/debug/smolvm" \
+SMOLVM_AGENT_ROOTFS="$HOME/d/smolvm/target/agent-rootfs" \
+SMOLVM_LIB_DIR="$HOME/d/smolvm/lib" \
+python3 tests/e2e_fork_world.py
+```
+
+Its TSV reports fork wall time and two storage-sharing proxies. Allocated file
+blocks deliberately double-count APFS clonefile sharing; volume-used bytes see
+physical CoW sharing but include unrelated host writes. It does not establish a
+durable world checkpoint or measure proportional guest-RAM sharing.
+
 ## Transition substrate benchmark
 
 [`tests/benchmark_world_transitions.py`](tests/benchmark_world_transitions.py)

@@ -219,6 +219,63 @@ lazy clonefile/MAP_SHARED restores, dirty-page tracking, immutable diff
 chains, and fan-out; it is not a drop-in smolvm replacement because its
 network/device and process contracts are different.
 
+#### PR #762 measurement spike — 2026-08-14
+
+The isolated Apple-Silicon spike checked out [PR #762 commit
+`3bc09677584a2d6fba175be26b4cdf23d01ab6a4`](https://github.com/libkrun/libkrun/pull/762)
+under `/tmp`; it did not change the canonical `smolvm/libkrun` submodule. Its
+upstream `snapshot-resume` test passed: the restored guest emitted the tail
+of its heartbeat sequence (`17` through `79`) without restarting at `0`.
+
+At Smolworld's default shape (one vCPU, 256 MiB RAM, console and virtio-fs,
+five samples), capture took 57.5 ms median after the snapshot request was
+accepted (52.6–73.1 ms). The snapshot consisted of about 127.5 KiB of
+`vmstate` plus a fully allocated 256 MiB `memory.img`; it is not a
+dirty-page delta. Restore-to-resumed-guest-output took 66.2 ms median
+(55.3–69.1 ms), versus 125.2 ms (121.2–135.5 ms) to first guest output from
+the equivalent cold VM. The restore metric includes fresh-process launch,
+VM configuration, complete RAM hydration, and at most 20 ms until the next
+guest output. This establishes that the VMM primitive works and is measurable
+in isolation, but its gain for this minimal image is only about 1.9x.
+
+The required-device gate failed exactly as the source contract predicts. A
+steady-state snapshot with an explicit virtio-vsock device failed with
+`vsock: device vsock does not support snapshot quiesce`; one with an external
+Unix-stream virtio-net NIC failed with `eth0: device net does not support
+snapshot quiesce`. Neither emitted snapshot files. Those are the two devices
+on which Smolworld and SmolVM currently depend, so this *upstream PR* must
+not be merged into the canonical submodule or enabled for world transitions.
+
+This result does **not** mean that the pinned SmolVM libkrun fork lacks the
+primitive. The canonical submodule now pins Joshua's
+`7ed188285e777e181536f346d4f9205650897636` fork commit (`blockdev fix on
+macos`), which descends from the separate checkpoint/fork implementation. It
+is enabled on macOS aarch64, quiesces/rearms virtio-net workers, saves their
+queues, and uses an explicit vsock reset-and-reconnect model. SmolVM's launcher
+already provides the persisted external Unix-stream NIC tuple to a forked clone
+and calls that fork restore API; this did not require reimplementing net/vsock
+support from upstream PR #762.
+
+The existing fork is a useful live 1-to-N acceleration primitive, not yet a
+durable world-state artifact: clones map the frozen golden's RAM copy-on-write,
+so the golden process and backing RAM must remain alive. Vsock drops live
+host-backed connections and requires the agent to reconnect, while a
+Smolworld fork also needs new network identity before another world can run
+concurrently.
+
+The external-world conformance spike is now implemented by
+`tests/e2e_fork_world.py`. On 2026-08-14, the Redis fixture forked an active
+Smolworld runner in 109.852 ms and then reached a clone agent plus private
+DNS/Redis traffic in 44.450 ms. The isolated SmolVM runtime root grew by
+250,454,016 accounted file-block bytes, but APFS volume use grew by only
+90,112 bytes. The first metric deliberately double-counts clonefile-backed
+blocks; the latter captures physical CoW sharing but is host-noisy. The gate
+also exposed and fixed two Smolworld switch requirements: accept a replacement
+NIC connection while a frozen golden keeps its old stream open, and discard
+stale frames/detaches by per-attachment generation. Durable state still
+requires persisted/reopenable memory backing or an immutable RAM codec, plus an
+explicit multi-machine world-level cut.
+
 The first production shape therefore uses eager, immutable snapshot
 directories. Once correctness is proven, the same `WorldState` manifest can
 refer to a parent plus dirty-memory/disk deltas, with a bounded chain-depth
