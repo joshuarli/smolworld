@@ -236,3 +236,36 @@ The gate executes `prepare -> check -> up -> DNS/Redis checks -> down`, proves
 that preparation/check create no world runtime state, and verifies cleanup is
 limited to the recorded machines and sockets. It requires no guest Internet
 access and no container/VM orchestrator beyond the selected smolvm checkout.
+
+## Transition substrate benchmark
+
+[`tests/benchmark_world_transitions.py`](tests/benchmark_world_transitions.py)
+measures the currently available single-machine SmolVM fork substrate against
+a cold local-archive machine. It is an opt-in Apple-Silicon integration
+measurement, not a smolworld checkpoint or a durable `WorldState` benchmark:
+the golden stays frozen, each child is non-forkable, and no private L2,
+multi-machine cut, state manifest, or restore-after-host-exit contract is
+involved.
+
+It uses one vCPU, 256 MiB of configured RAM, a prepared local archive, and a
+4 MiB fsynced guest mutation. It creates an isolated, short
+`SMOLVM_RUNTIME_ROOT` under `/tmp` and removes only the exact machines and root
+it created.
+
+```bash
+SMOLWORLD_TRANSITION_BENCH=1 \
+SMOLVM_BIN="$HOME/d/smolvm/target/debug/smolvm" \
+SMOLVM_AGENT_ROOTFS="$HOME/d/smolvm/target/agent-rootfs" \
+SMOLWORLD_TRANSITION_ARCHIVE=/absolute/path/to/prepared/archive.tar \
+SMOLVM_LIB_DIR="$HOME/d/smolvm/lib" \
+DYLD_LIBRARY_PATH="$HOME/d/smolvm/lib" \
+python3 tests/benchmark_world_transitions.py
+```
+
+The TSV reports wall time, `accounted_file_blocks_delta_bytes`, and
+`volume_used_delta_bytes`. The first counts blocks addressed by each benchmark
+file, so APFS clonefile makes it deliberately double-count shared disk blocks.
+The latter observes physical space on the enclosing volume and captures CoW
+sharing, but sees unrelated host activity; use it as a noisy range rather than
+a quota. Neither metric measures guest-RAM sharing, because macOS RSS would
+double-count CoW pages and has no stable proportional-set-size interface.
