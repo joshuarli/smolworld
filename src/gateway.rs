@@ -1,4 +1,4 @@
-use crate::model::{gateway_mac, WorldConfig, WorldState};
+use crate::model::{gateway_mac, WorldAllocationState, WorldConfig};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -9,7 +9,7 @@ pub(crate) struct Gateway {
 }
 
 impl Gateway {
-    pub(crate) fn new(config: &WorldConfig, state: &WorldState) -> Self {
+    pub(crate) fn new(config: &WorldConfig, state: &WorldAllocationState) -> Self {
         let mut records = HashMap::new();
         for name in config.machines.keys() {
             let ip = state.assignments.get(name).expect("allocated machine").ip;
@@ -220,7 +220,7 @@ pub(crate) fn ipv4_checksum(header: &[u8]) -> u16 {
 mod tests {
     use super::*;
     use crate::config::parse_config;
-    use crate::model::{Assignment, WorldState};
+    use crate::model::{Assignment, WorldAllocationState};
     use std::collections::BTreeMap;
 
     #[test]
@@ -240,7 +240,7 @@ machines:
 "#,
         )
         .unwrap();
-        let state = WorldState {
+        let state = WorldAllocationState {
             seed: 7,
             assignments: BTreeMap::from([
                 (
@@ -297,7 +297,7 @@ machines:
 "#,
         )
         .unwrap();
-        let state = WorldState {
+        let state = WorldAllocationState {
             seed: 7,
             assignments: BTreeMap::from([(
                 "redis".to_string(),

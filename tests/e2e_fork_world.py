@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Exercise one Smolworld external-NIC live fork and report its direct cost.
+"""Exercise Smolworld external-NIC fork and durable checkpoint contracts.
 
-This is an opt-in macOS/Apple-Silicon integration gate. It does not benchmark a
-durable world checkpoint: SmolVM freezes one forkable runner as a live CoW base
-and boots one non-forkable child from its in-memory checkpoint. The test proves
-the two reconnections that matter for that substrate:
+This is an opt-in macOS/Apple-Silicon integration gate with two mutually
+exclusive modes. The live-fork mode does not benchmark a durable world
+checkpoint: SmolVM freezes one forkable runner as a live CoW base and boots one
+non-forkable child from its in-memory checkpoint. It proves the two
+reconnections that matter for that substrate:
 
 * the runner reconnects to Smolworld's Unix-stream NIC after being restarted as
   forkable; and
 * the restored child reconnects both its agent (vsock) and that same external
   NIC, then resolves and reaches Redis through Smolworld's private switch.
 
-It prints the fork transition wall time plus two filesystem sharing proxies:
+The default fork gate prints the live transition wall time plus two filesystem sharing proxies:
 allocated blocks addressed under its private SMOLVM_RUNTIME_ROOT and the used
 bytes on that volume. The former double-counts APFS clonefile sharing; the
 latter sees physical CoW sharing but also unrelated host writes. Neither
@@ -25,6 +26,12 @@ Required environment:
 
 Optional environment:
     SMOLWORLD_REDIS_ARCHIVE=/absolute/path/to/prepared/redis.tar
+
+Set ``SMOLWORLD_DURABLE_E2E=1`` instead of ``SMOLWORLD_FORK_E2E=1``
+to prove the coordinated two-machine checkpoint path. It writes runner
+workspace and Redis state, captures both machines through the world supervisor,
+waits for that supervisor to exit, restores under fresh listeners, then checks
+the state and performs exact release.
 """
 
 from __future__ import annotations
@@ -194,6 +201,8 @@ class ForkWorld:
         self.state_file: Path | None = None
         self.machine_names: dict[str, str] = {}
         self.clone_name: str | None = None
+        self.checkpoint_root: Path | None = None
+        self.checkpoint_released = False
         self.environment = dict(os.environ)
         self.environment.update(
             {
@@ -229,10 +238,15 @@ class ForkWorld:
         if (self.home / ".smolworld").exists():
             raise E2EError("smolworld check unexpectedly allocated world runtime state")
 
-    def up(self) -> None:
+    def start_supervisor(self, arguments: Sequence[str], ready_message: str) -> None:
+        if self.up_process is not None:
+            raise E2EError("world supervisor is already running")
+        if self.up_log is not None:
+            self.up_log.close()  # type: ignore[union-attr]
+            self.up_log = None
         self.up_log = self.up_log_path.open("w", encoding="utf-8")
         self.up_process = subprocess.Popen(
-            self.smolworld_command(["up"]),
+            self.smolworld_command(arguments),
             env=self.environment,
             stdin=subprocess.DEVNULL,
             stdout=self.up_log,
@@ -241,7 +255,7 @@ class ForkWorld:
         )
         deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline:
-            if "world is up" in self.up_log_path.read_text(encoding="utf-8"):
+            if ready_message in self.up_log_path.read_text(encoding="utf-8"):
                 self.state_file = world_state_file(self.home)
                 self.machine_names = state_machine_names(self.state_file)
                 return
@@ -254,6 +268,17 @@ class ForkWorld:
         raise E2EError(
             "timed out waiting for smolworld up:\n"
             + self.up_log_path.read_text(encoding="utf-8")
+        )
+
+    def up(self) -> None:
+        self.start_supervisor(["up"], "world is up; press Ctrl-C")
+
+    def restore(self) -> None:
+        if self.checkpoint_root is None:
+            raise E2EError("cannot restore without a durable checkpoint root")
+        self.start_supervisor(
+            ["restore", "--checkpoint", str(self.checkpoint_root)],
+            "restored world is up; press Ctrl-C",
         )
 
     def stop_up(self) -> None:
@@ -274,6 +299,68 @@ class ForkWorld:
                 f"smolworld up stopped with {status}:\n"
                 + self.up_log_path.read_text(encoding="utf-8")
             )
+
+    def checkpoint(self) -> float:
+        if self.up_process is None:
+            raise E2EError("cannot checkpoint without a running world supervisor")
+        self.checkpoint_root = self.temporary / "checkpoint"
+        started = time.monotonic_ns()
+        run(
+            self.smolworld_command(
+                ["checkpoint", "--output", str(self.checkpoint_root)]
+            ),
+            self.environment,
+            timeout=180.0,
+        )
+        elapsed = (time.monotonic_ns() - started) / 1_000_000
+        try:
+            status = self.up_process.wait(timeout=30.0)
+        except subprocess.TimeoutExpired as error:
+            raise E2EError(
+                "world supervisor did not exit after a successful checkpoint"
+            ) from error
+        self.up_process = None
+        if status != 0:
+            raise E2EError(
+                f"world supervisor stopped with {status} after checkpoint:\n"
+                + self.up_log_path.read_text(encoding="utf-8")
+            )
+        if not self.checkpoint_root.is_dir():
+            raise E2EError(f"checkpoint root was not published: {self.checkpoint_root}")
+        receipt = self.checkpoint_root / "smolworld-checkpoint"
+        receipt_text = receipt.read_text(encoding="utf-8")
+        required = ["switch-epoch\t", "switch-queue\t0", "machine\trunner\t", "machine\tredis\t"]
+        if any(marker not in receipt_text for marker in required):
+            raise E2EError(f"checkpoint receipt is missing expected world cut: {receipt_text!r}")
+        return elapsed
+
+    def release_checkpoint(self) -> None:
+        if self.checkpoint_root is None or self.checkpoint_released:
+            return
+        supervisor_error: E2EError | None = None
+        try:
+            self.stop_up()
+        except E2EError as error:
+            # A restore may have already exited after a failed launch. Its
+            # supervisor result is evidence, but it must not prevent exact
+            # release of the known source records and checkpoint root.
+            supervisor_error = error
+        if os.environ.get("SMOLWORLD_E2E_KEEP") == "1":
+            if supervisor_error is not None:
+                raise supervisor_error
+            return
+        run(
+            self.smolworld_command(
+                ["release", "--checkpoint", str(self.checkpoint_root)]
+            ),
+            self.environment,
+            timeout=60.0,
+        )
+        if self.checkpoint_root.exists():
+            raise E2EError(f"release retained checkpoint root: {self.checkpoint_root}")
+        self.checkpoint_released = True
+        if supervisor_error is not None:
+            raise supervisor_error
 
     def guest_via_world(self, machine: str, command: Sequence[str]) -> str:
         completed = run(
@@ -390,11 +477,17 @@ class ForkWorld:
             )
             if completed.returncode != 0:
                 failures.append(f"delete clone: {output_text(completed).strip()}")
-        try:
-            self.stop_up()
-        except E2EError as error:
-            failures.append(str(error))
-        if self.world_file.exists():
+        if self.checkpoint_root is not None:
+            try:
+                self.release_checkpoint()
+            except E2EError as error:
+                failures.append(str(error))
+        else:
+            try:
+                self.stop_up()
+            except E2EError as error:
+                failures.append(str(error))
+        if self.world_file.exists() and self.checkpoint_root is None:
             completed = run(
                 self.smolworld_command(["down"]),
                 self.environment,
@@ -424,21 +517,31 @@ class ForkWorld:
         if self.up_log is not None:
             self.up_log.close()  # type: ignore[union-attr]
             self.up_log = None
-        shutil.rmtree(self.runtime_root, ignore_errors=True)
-        shutil.rmtree(self.temporary, ignore_errors=True)
+        if failures and os.environ.get("SMOLWORLD_E2E_KEEP") == "1":
+            failures.append(
+                f"preserved diagnostic roots {self.temporary} and {self.runtime_root}"
+            )
+        else:
+            shutil.rmtree(self.runtime_root, ignore_errors=True)
+            shutil.rmtree(self.temporary, ignore_errors=True)
         if failures:
             raise E2EError("; ".join(failures))
 
 
 def main() -> int:
-    if os.environ.get("SMOLWORLD_FORK_E2E") != "1":
-        emit("SKIP: set SMOLWORLD_FORK_E2E=1 to run the Smolworld fork E2E")
+    fork_gate = os.environ.get("SMOLWORLD_FORK_E2E") == "1"
+    durable_gate = os.environ.get("SMOLWORLD_DURABLE_E2E") == "1"
+    if fork_gate == durable_gate:
+        emit(
+            "SKIP: set exactly one of SMOLWORLD_FORK_E2E=1 or "
+            "SMOLWORLD_DURABLE_E2E=1"
+        )
         return 0
     if platform.system() != "Darwin" or platform.machine() != "arm64":
-        raise E2EError("Smolworld fork E2E requires macOS on Apple Silicon")
+        raise E2EError("Smolworld E2E requires macOS on Apple Silicon")
     for forbidden in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_SOCKET", "ORBCTL_HOST"):
         if os.environ.get(forbidden):
-            raise E2EError(f"fork E2E must run without {forbidden}")
+            raise E2EError(f"Smolworld E2E must run without {forbidden}")
 
     project = Path(__file__).resolve().parent.parent
     smolvm = required_file("SMOLWORLD_SMOLVM")
@@ -472,30 +575,69 @@ def main() -> int:
             "initial runner private DNS and Redis traffic",
             lambda: world.assert_private_redis_via_world("runner"),
         )
-        world.make_runner_forkable(runner)
-        retry(
-            "forkable runner private NIC reconnect",
-            lambda: world.assert_private_redis_via_world("runner"),
-        )
-        world.reach_forkpoint(runner)
-        transition_ms, accounted_delta, volume_delta = world.fork(runner)
-        assert world.clone_name is not None
-        reconnect_started = time.monotonic_ns()
-        retry(
-            "restored clone agent and private NIC reconnect",
-            lambda: world.assert_private_redis_via_smolvm(world.clone_name or ""),
-        )
-        reconnect_ms = (time.monotonic_ns() - reconnect_started) / 1_000_000
+        if fork_gate:
+            world.make_runner_forkable(runner)
+            retry(
+                "forkable runner private NIC reconnect",
+                lambda: world.assert_private_redis_via_world("runner"),
+            )
+            world.reach_forkpoint(runner)
+            transition_ms, accounted_delta, volume_delta = world.fork(runner)
+            assert world.clone_name is not None
+            reconnect_started = time.monotonic_ns()
+            retry(
+                "restored clone agent and private NIC reconnect",
+                lambda: world.assert_private_redis_via_smolvm(world.clone_name or ""),
+            )
+            reconnect_ms = (time.monotonic_ns() - reconnect_started) / 1_000_000
 
-        emit("# smolworld external-NIC fork E2E")
-        emit(f"# smolvm={smolvm}")
-        emit(f"# archive={archive.resolve()}")
-        emit("metric\tvalue\tunit")
-        emit(f"fork_transition_wall\t{transition_ms:.3f}\tms")
-        emit(f"clone_agent_and_private_nic_ready\t{reconnect_ms:.3f}\tms")
-        emit(f"fork_accounted_file_blocks_delta\t{accounted_delta}\tbytes")
-        emit(f"fork_volume_used_delta\t{volume_delta}\tbytes")
-        emit("PASS: private NIC traffic, agent reconnect, and fork sharing measurement")
+            emit("# smolworld external-NIC fork E2E")
+            emit(f"# smolvm={smolvm}")
+            emit(f"# archive={archive.resolve()}")
+            emit("metric\tvalue\tunit")
+            emit(f"fork_transition_wall\t{transition_ms:.3f}\tms")
+            emit(f"clone_agent_and_private_nic_ready\t{reconnect_ms:.3f}\tms")
+            emit(f"fork_accounted_file_blocks_delta\t{accounted_delta}\tbytes")
+            emit(f"fork_volume_used_delta\t{volume_delta}\tbytes")
+            emit("PASS: private NIC traffic, agent reconnect, and fork sharing measurement")
+        else:
+            world.guest_via_world(
+                "runner",
+                [
+                    "/bin/sh",
+                    "-ceu",
+                    "printf durable > /workspace/smolworld-durable-marker\n"
+                    "redis-cli -h redis set smolworld-durable-key durable",
+                ],
+            )
+            capture_ms = world.checkpoint()
+            world.restore()
+            reconnect_started = time.monotonic_ns()
+            retry(
+                "restored runner private DNS and Redis traffic",
+                lambda: world.assert_private_redis_via_world("runner"),
+            )
+            reconnect_ms = (time.monotonic_ns() - reconnect_started) / 1_000_000
+            restored = world.guest_via_world(
+                "runner",
+                [
+                    "/bin/sh",
+                    "-ceu",
+                    "test \"$(cat /workspace/smolworld-durable-marker)\" = durable\n"
+                    "test \"$(redis-cli -h redis get smolworld-durable-key)\" = durable",
+                ],
+            )
+            if restored.strip():
+                raise E2EError(f"unexpected durable-state verification output: {restored!r}")
+            world.release_checkpoint()
+
+            emit("# smolworld coordinated durable-world E2E")
+            emit(f"# smolvm={smolvm}")
+            emit(f"# archive={archive.resolve()}")
+            emit("metric\tvalue\tunit")
+            emit(f"world_checkpoint_wall\t{capture_ms:.3f}\tms")
+            emit(f"restored_runner_private_nic_ready\t{reconnect_ms:.3f}\tms")
+            emit("PASS: durable workspace/Redis state, fresh agent/NIC handles, and exact release")
     except (Exception, KeyboardInterrupt) as error:
         # Ctrl-C is common for an opt-in hardware integration gate. It must
         # still remove only the exact machines and temporary roots this run

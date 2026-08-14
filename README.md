@@ -105,6 +105,13 @@ smolworld check [-f PATH]                  Validate the prepared world read-only
 smolworld up [-f PATH]                     Start the world in the foreground.
 smolworld ps [-f PATH] [--json]            Show machine lifecycle observations.
 smolworld exec [-f PATH] MACHINE -- CMD    Run CMD in a started machine.
+smolworld checkpoint [-f PATH] --output DIR
+                                            Capture this running world, retain
+                                            its exact machine sources, and exit.
+smolworld restore [-f PATH] --checkpoint DIR
+                                            Restore a retained same-lineage world.
+smolworld release [-f PATH] --checkpoint DIR
+                                            Delete exactly a retained world.
 smolworld down [-f PATH]                   Stop and delete this world's machines.
 ```
 
@@ -124,9 +131,19 @@ lock. Press `Ctrl-C` in `up` to stop and delete this world's machines. `down`
 is safe to use after an interrupted foreground process and acts only on
 machine identities recorded for this world.
 
+`checkpoint` asks the foreground supervisor to close its switch at a new epoch,
+capture every machine concurrently, seal a world receipt, publish it by rename,
+then retain exactly those machine sources.  `restore` accepts only a receipt
+whose sealed configuration, material lock, allocation, and topology match the
+selected world; it always creates fresh agent and Unix-stream NIC handles.
+`release` is the only normal deletion path for a retained checkpoint.  These
+commands implement a durable same-lineage world artifact, not a Niceforge
+workflow `WorldState`: Niceforge has not yet supplied the lease-fenced lineage
+transaction that makes a captured world a workflow fact.
+
 `ps` reports host lifecycle observations, not service health or readiness:
-`created`, `attached`, `running`, and `absent`. `ps --json` emits the same
-rows as a JSON array.
+`created`, `attached`, `running`, `capturing`, `captured`, and `absent`.
+`ps --json` emits the same rows as a JSON array.
 
 ## `.smolworld` format: version 2
 
@@ -279,9 +296,33 @@ clone with private DNS/Redis traffic, while the physical APFS delta was only
 largest controllable slice. The minimal signed `smolvm-boot` helper reduced
 clone agent readiness from about 53 ms to 27 ms in the real-VM gate; the next
 performance seam is now the guest identity/release handshakes and the outer
-fork-command launch. For the durable checkpoint design, coordinated
-multi-machine capture remains the next correctness gate even after this
-single-machine path is optimized.
+fork-command launch.  Coordinated durable capture is now available as a
+separate, slower correctness path; its integrity sealing remains the next
+performance seam.
+
+### Coordinated durable-world E2E
+
+The same fixture also exercises a real two-machine durable checkpoint.  It
+writes a workspace marker and a Redis key, checkpoints the active world,
+waits for the original supervisor to exit, restores from the published receipt,
+then proves private DNS, Redis, the workspace, fresh agent/NIC attachment, and
+exact release.  The artifact retains an APFS-backed RAM/disk copy and validates
+its receipt before restore; it does not create a concurrent child or reseed
+guest identity.
+
+```bash
+PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH" \
+SMOLWORLD_DURABLE_E2E=1 \
+SMOLWORLD_SMOLVM="$HOME/d/smolvm/target/debug/smolvm" \
+SMOLVM_AGENT_ROOTFS="$HOME/d/smolvm/target/agent-rootfs" \
+SMOLVM_LIB_DIR="$HOME/d/smolvm/lib" \
+python3 tests/e2e_fork_world.py
+```
+
+On 2026-08-14, the real two-machine run captured in 19,389.991 ms and the
+restored runner reached a private NIC in 73.187 ms. Receipt hashes account for
+the full logical RAM/disk contents and are sealed concurrently per machine;
+that integrity work is now the dominant capture cost.
 
 ## Transition substrate benchmark
 

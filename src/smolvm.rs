@@ -1,4 +1,6 @@
-use crate::model::{format_mac, Assignment, MachineLaunch, NetworkConfig, WorldConfig, WorldState};
+use crate::model::{
+    format_mac, Assignment, MachineLaunch, NetworkConfig, WorldAllocationState, WorldConfig,
+};
 use crate::Result;
 use std::env;
 use std::fs;
@@ -485,13 +487,41 @@ fn build_machine_create_command(
     invocation
 }
 
+/// Start every Smolworld machine as a forkable base. The external-network
+/// declaration already provides the stable identity; enabling the fork control
+/// socket up front makes the supervisor's later durable checkpoint barrier a
+/// capture operation rather than a cold restart of the machine.
 pub(crate) fn start_machine(smolvm: &Path, name: &str) -> Result<()> {
     status_result(
         &format!("start machine {name}"),
         Command::new(smolvm)
-            .args(["machine", "start", "--name", name])
+            .args(["machine", "start", "--name", name, "--forkable"])
             .status()
             .map_err(|error| format!("run smolvm machine start: {error}"))?,
+    )
+}
+
+/// Capture one forkable world machine into a checkpoint-owned subdirectory.
+pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Result<()> {
+    status_result(
+        &format!("checkpoint machine {name}"),
+        Command::new(smolvm)
+            .args(["machine", "checkpoint", "--name", name, "--output"])
+            .arg(output)
+            .status()
+            .map_err(|error| format!("run smolvm machine checkpoint: {error}"))?,
+    )
+}
+
+/// Restore one stopped world machine from its receipt with fresh host handles.
+pub(crate) fn restore_machine(smolvm: &Path, name: &str, checkpoint: &Path) -> Result<()> {
+    status_result(
+        &format!("restore machine {name}"),
+        Command::new(smolvm)
+            .args(["machine", "restore", "--name", name, "--checkpoint"])
+            .arg(checkpoint)
+            .status()
+            .map_err(|error| format!("run smolvm machine restore: {error}"))?,
     )
 }
 
@@ -503,7 +533,7 @@ pub(crate) fn status_result(action: &str, status: ExitStatus) -> Result<()> {
     }
 }
 
-pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldState>) {
+pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationState>) {
     let Some(state) = state else {
         return;
     };
@@ -519,6 +549,52 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldState>) {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Stop exactly the recorded world machines while retaining their names and
+/// disks for a durable checkpoint restore. Unlike [`cleanup_machines`], this
+/// never deletes any smolvm configuration or another world's machine.
+pub(crate) fn stop_machines(smolvm: &Path, state: &WorldAllocationState) {
+    for assignment in state.assignments.values() {
+        let _ = Command::new(smolvm)
+            .args(["machine", "stop", "--name", &assignment.smolvm_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Release only the exact machine records named by a retained world receipt.
+/// Unlike best-effort signal cleanup, this is an explicit user-facing durable
+/// state transition and therefore returns the first subprocess failure instead
+/// of silently broadening or abandoning the requested cleanup.
+pub(crate) fn release_machines(smolvm: &Path, state: &WorldAllocationState) -> Result<()> {
+    for assignment in state.assignments.values() {
+        let stop = Command::new(smolvm)
+            .args(["machine", "stop", "--name", &assignment.smolvm_name])
+            .status()
+            .map_err(|error| {
+                format!(
+                    "run smolvm machine stop {}: {error}",
+                    assignment.smolvm_name
+                )
+            })?;
+        status_result(&format!("stop machine {}", assignment.smolvm_name), stop)?;
+        let delete = Command::new(smolvm)
+            .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
+            .status()
+            .map_err(|error| {
+                format!(
+                    "run smolvm machine delete {}: {error}",
+                    assignment.smolvm_name
+                )
+            })?;
+        status_result(
+            &format!("delete machine {}", assignment.smolvm_name),
+            delete,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn local_smolfile_path(

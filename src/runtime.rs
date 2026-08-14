@@ -3,33 +3,40 @@ use crate::cli::{
 };
 use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
-use crate::model::{format_mac, Assignment, LifecycleState, MachineLaunch, SeedFile, WorldConfig};
+use crate::model::{
+    format_mac, Assignment, LifecycleState, MachineLaunch, SeedFile, WorldCheckpointReceipt,
+    WorldConfig,
+};
 use crate::smolvm::{
-    cleanup_machines, create_machine, materialize_external_world, preflight, smolvm_program,
-    start_machine, status_result, validate_external_world,
+    checkpoint_machine, cleanup_machines, create_machine, materialize_external_world, preflight,
+    release_machines, restore_machine, smolvm_program, start_machine, status_result, stop_machines,
+    validate_external_world,
 };
 use crate::state::{
-    allocate_v2_state, digest_file, inspect_v2_recovery, load_v2_lifecycle, load_v2_material_lock,
-    load_v2_state, mark_v2_absent, mark_v2_attached, mark_v2_created, mark_v2_running,
-    mark_v2_starting, material_lock_resolver_abi, normalize_relative_path, prepare_v2_runtime_dir,
-    remove_v2_runtime_dir, remove_v2_stale_temporary_files, v2_world_paths, write_v2_material_lock,
-    write_v2_state, V2ImageMaterial, V2MaterialLock, V2SeedObservation, V2SmolfileObservation,
-    V2WorldPaths, WorldLock,
+    allocate_v2_allocation_state, digest_file, inspect_v2_recovery, load_v2_allocation_state,
+    load_v2_lifecycle, load_v2_material_lock, load_world_checkpoint_receipt, mark_v2_absent,
+    mark_v2_attached, mark_v2_capture_rolled_back, mark_v2_captured, mark_v2_capturing,
+    mark_v2_created, mark_v2_running, mark_v2_starting, material_lock_resolver_abi,
+    normalize_relative_path, prepare_v2_runtime_dir, remove_v2_runtime_dir,
+    remove_v2_stale_temporary_files, v2_world_paths, write_v2_allocation_state,
+    write_v2_material_lock, write_world_checkpoint_receipt, V2ImageMaterial, V2MaterialLock,
+    V2SeedObservation, V2SmolfileObservation, V2WorldPaths, WorldLock,
 };
 use crate::switch::{
     port_socket_path, print_allocations, run_switch, spawn_port_acceptor, wait_for_attachments,
-    SwitchEvent,
+    wait_for_expected_attachments, SwitchEvent,
 };
 use crate::Result;
-use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::net::UnixListener;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -54,6 +61,9 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Cli::Up { config } => up(&config),
         Cli::Check { config } => check(&config),
         Cli::Prepare { config } => prepare(&config),
+        Cli::Checkpoint { config, output } => checkpoint(&config, &output),
+        Cli::Restore { config, checkpoint } => restore(&config, &checkpoint),
+        Cli::Release { config, checkpoint } => release(&config, &checkpoint),
         Cli::Down { config } => down(&config),
         Cli::Ps { config, format } => ps(&config, format),
         Cli::Help => {
@@ -96,6 +106,336 @@ pub(crate) fn prepare(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ask the current supervisor, rather than a second CLI process, to close the
+/// switch epoch and capture its live machines. The runtime directory socket is
+/// private to this exact v2 world and vanishes when the supervisor exits.
+pub(crate) fn checkpoint(config_path: &Path, output: &Path) -> Result<()> {
+    if !output.is_absolute() {
+        return Err("checkpoint --output must be an absolute directory".into());
+    }
+    let paths = v2_world_paths(config_path)?;
+    let socket = runtime_control_socket_path(&paths);
+    let mut stream = UnixStream::connect(&socket)
+        .map_err(|error| format!("connect world supervisor {}: {error}", socket.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30 * 60)))
+        .map_err(|error| format!("set checkpoint reply timeout: {error}"))?;
+    stream
+        .write_all(format!("checkpoint\t{}\n", output.display()).as_bytes())
+        .map_err(|error| format!("write checkpoint request: {error}"))?;
+    let reply = read_runtime_control_line(&mut stream)?;
+    if reply == "OK captured" {
+        println!("smolworld: captured checkpoint at {}", output.display());
+        Ok(())
+    } else if let Some(error) = reply.strip_prefix("ERR ") {
+        Err(format!("world checkpoint failed: {error}"))
+    } else {
+        Err("world supervisor returned a malformed checkpoint reply".into())
+    }
+}
+
+/// Reopen a captured world under the same recorded machine identities. The
+/// checkpoint receipt owns RAM/device/disk state; the still-present allocation
+/// state owns the static IP/MAC tuple and namespaced SmolVM records. This
+/// supervisor recreates only ephemeral listeners and then asks each machine to
+/// restore with fresh host vsock/NIC descriptors.
+pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    if !checkpoint.is_absolute() {
+        return Err("restore --checkpoint must be an absolute directory".into());
+    }
+    let config = load_config(config_path)?;
+    topological_waves(&config)?;
+    let paths = v2_world_paths(config_path)?;
+    let smolvm = smolvm_program();
+    let _world_lock = WorldLock::acquire_v2(&paths)?;
+    verify_prepared_world(&config, &paths, &smolvm)?;
+    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if !matches!(
+        lifecycle.state,
+        LifecycleState::Captured | LifecycleState::Capturing
+    ) {
+        return Err(format!(
+            "world '{}' is not a retained checkpoint (current lifecycle: {})",
+            config.name,
+            lifecycle.state.as_str()
+        ));
+    }
+    let state = load_v2_allocation_state(&paths.state_file)?
+        .ok_or_else(|| "captured world has no allocation state".to_string())?;
+    let receipt = load_world_checkpoint_receipt(checkpoint)?;
+    verify_world_checkpoint_receipt(&config, &paths, &state, &receipt)?;
+    remove_v2_stale_temporary_files(&paths)?;
+    remove_v2_runtime_dir(&paths)?;
+    mark_v2_starting(&paths)?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (switch_tx, switch_rx) = mpsc::channel();
+    let (attached_tx, attached_rx) = mpsc::channel();
+    let gateway = Gateway::new(&config, &state);
+    let mut port_handles = Vec::new();
+    let mut switch_handle = None;
+    let retain_checkpoint_sources = true;
+    let result = (|| {
+        prepare_v2_runtime_dir(&paths)?;
+        let control_listener = bind_runtime_control_listener(&paths)?;
+        let switch_shutdown = shutdown.clone();
+        switch_handle = Some(
+            thread::Builder::new()
+                .name("smolworld-switch".into())
+                .spawn(move || run_switch(switch_rx, gateway, switch_shutdown))
+                .map_err(|error| format!("start switch: {error}"))?,
+        );
+        for name in config.machines.keys() {
+            let socket_path = port_socket_path(&paths.runtime_dir, name);
+            let listener = UnixListener::bind(&socket_path)
+                .map_err(|error| format!("bind {}: {error}", socket_path.display()))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|error| format!("set {} nonblocking: {error}", socket_path.display()))?;
+            port_handles.push(spawn_port_acceptor(
+                name.clone(),
+                listener,
+                switch_tx.clone(),
+                attached_tx.clone(),
+                shutdown.clone(),
+            )?);
+        }
+        drop(attached_tx);
+
+        let names: Vec<_> = config.machines.keys().cloned().collect();
+        parallel_machine_operations(&names, "restore", |name| {
+            let assignment = state.assignments.get(name).expect("captured allocation");
+            restore_machine(
+                &smolvm,
+                &assignment.smolvm_name,
+                &checkpoint.join("machines").join(name),
+            )
+        })?;
+        wait_for_attachments(&attached_rx, &config)?;
+        mark_v2_attached(&paths)?;
+        mark_v2_running(&paths)?;
+        install_signal_handlers();
+        eprintln!("smolworld: restored world is up; press Ctrl-C to stop it");
+        while !STOP_REQUESTED.load(Ordering::SeqCst) {
+            match control_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let command = match read_runtime_control_command(&mut stream) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            let _ =
+                                write_runtime_control_reply(&mut stream, &format!("ERR {error}\n"));
+                            continue;
+                        }
+                    };
+                    match command {
+                        RuntimeControlCommand::Checkpoint { output } => {
+                            match checkpoint_running_world(
+                                &config,
+                                &state,
+                                &paths,
+                                &smolvm,
+                                &switch_tx,
+                                &attached_rx,
+                                &output,
+                            ) {
+                                Ok(()) => {
+                                    STOP_REQUESTED.store(true, Ordering::SeqCst);
+                                    let _ =
+                                        write_runtime_control_reply(&mut stream, "OK captured\n");
+                                }
+                                Err(error) => {
+                                    let _ = write_runtime_control_reply(
+                                        &mut stream,
+                                        &format!("ERR {error}\n"),
+                                    );
+                                    if output.exists() {
+                                        STOP_REQUESTED.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(format!("accept supervisor control: {error}")),
+            }
+        }
+        Ok(())
+    })();
+
+    // Restore may fail after one VM has launched. Stop only the recorded world
+    // machines and retain their records/disks; the immutable checkpoint remains
+    // the recovery source and ordinary `up` cannot delete it accidentally.
+    stop_machines(&smolvm, &state);
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = switch_tx.send(SwitchEvent::Shutdown);
+    for handle in port_handles {
+        let _ = handle.join();
+    }
+    if let Some(handle) = switch_handle {
+        let _ = handle.join();
+    }
+    let _ = remove_v2_runtime_dir(&paths);
+    if retain_checkpoint_sources {
+        let _ = mark_v2_captured(&paths);
+    }
+    result
+}
+
+fn verify_world_checkpoint_receipt(
+    config: &WorldConfig,
+    paths: &V2WorldPaths,
+    state: &crate::model::WorldAllocationState,
+    receipt: &WorldCheckpointReceipt,
+) -> Result<()> {
+    if receipt.world_name != config.name {
+        return Err(format!(
+            "checkpoint belongs to world '{}' rather than '{}",
+            receipt.world_name, config.name
+        ));
+    }
+    if receipt.config_digest != digest_file(&paths.canonical_config)? {
+        return Err("checkpoint world declaration no longer matches this configuration".into());
+    }
+    if receipt.material_lock_digest != digest_file(&paths.material_lock_path())? {
+        return Err("checkpoint prepared material no longer matches this world".into());
+    }
+    if receipt.allocation != *state {
+        return Err("checkpoint allocation does not match the retained world identity".into());
+    }
+    if receipt
+        .allocation
+        .assignments
+        .keys()
+        .ne(config.machines.keys())
+    {
+        return Err("checkpoint machine set does not match the configured world".into());
+    }
+    Ok(())
+}
+
+/// Permanently release one retained state. This is the only durable-world path
+/// that deletes source VM records or the checkpoint artifact, and it validates
+/// that both still belong to the requested world before touching either.
+pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
+    if !checkpoint.is_absolute() {
+        return Err("release --checkpoint must be an absolute directory".into());
+    }
+    let config = load_config(config_path)?;
+    let paths = v2_world_paths(config_path)?;
+    let _world_lock = WorldLock::acquire_v2(&paths)?;
+    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if !matches!(
+        lifecycle.state,
+        LifecycleState::Captured | LifecycleState::Capturing
+    ) {
+        return Err(format!(
+            "world '{}' is not a stopped retained checkpoint (current lifecycle: {})",
+            config.name,
+            lifecycle.state.as_str()
+        ));
+    }
+    let state = load_v2_allocation_state(&paths.state_file)?
+        .ok_or_else(|| "captured world has no allocation state".to_string())?;
+    let receipt = load_world_checkpoint_receipt(checkpoint)?;
+    verify_world_checkpoint_receipt(&config, &paths, &state, &receipt)?;
+    let metadata = fs::symlink_metadata(checkpoint)
+        .map_err(|error| format!("inspect checkpoint root {}: {error}", checkpoint.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "checkpoint root is not a real directory: {}",
+            checkpoint.display()
+        ));
+    }
+    release_machines(&smolvm_program(), &state)?;
+    fs::remove_dir_all(checkpoint).map_err(|error| {
+        format!(
+            "remove released checkpoint {}: {error}",
+            checkpoint.display()
+        )
+    })?;
+    mark_v2_absent(&paths)?;
+    println!("smolworld: released checkpoint {}", checkpoint.display());
+    Ok(())
+}
+
+/// Control messages accepted only by the process that owns the switch and its
+/// recorded world lock. Keep this deliberately small and typed; Niceforge will
+/// invoke the same operation through its local world adapter rather than by
+/// reconstructing lifecycle state itself.
+enum RuntimeControlCommand {
+    Checkpoint { output: PathBuf },
+}
+
+fn runtime_control_socket_path(paths: &V2WorldPaths) -> PathBuf {
+    paths.runtime_dir.join("control.sock")
+}
+
+fn bind_runtime_control_listener(paths: &V2WorldPaths) -> Result<UnixListener> {
+    let path = runtime_control_socket_path(paths);
+    let listener = UnixListener::bind(&path)
+        .map_err(|error| format!("bind supervisor control {}: {error}", path.display()))?;
+    listener.set_nonblocking(true).map_err(|error| {
+        format!(
+            "set supervisor control {} nonblocking: {error}",
+            path.display()
+        )
+    })?;
+    Ok(listener)
+}
+
+fn read_runtime_control_command(stream: &mut UnixStream) -> Result<RuntimeControlCommand> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("set supervisor request timeout: {error}"))?;
+    let line = read_runtime_control_line(stream)?;
+    let (verb, argument) = line
+        .split_once('\t')
+        .ok_or_else(|| "supervisor request is malformed".to_string())?;
+    if verb != "checkpoint" || argument.is_empty() || argument.contains(['\t', '\r', '\n']) {
+        return Err("supervisor request is malformed".into());
+    }
+    Ok(RuntimeControlCommand::Checkpoint {
+        output: PathBuf::from(argument),
+    })
+}
+
+fn read_runtime_control_line(stream: &mut UnixStream) -> Result<String> {
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    while bytes.len() < 4096 {
+        let read = stream
+            .read(&mut byte)
+            .map_err(|error| format!("read supervisor control: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    if bytes.len() == 4096 {
+        return Err("supervisor control message is too long".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "supervisor control message is not UTF-8".into())
+}
+
+fn write_runtime_control_reply(stream: &mut UnixStream, reply: &str) -> Result<()> {
+    if !reply.ends_with('\n') || reply.contains('\r') || reply.len() > 4096 {
+        return Err("internal supervisor control reply is invalid".into());
+    }
+    stream
+        .write_all(reply.as_bytes())
+        .map_err(|error| format!("write supervisor control reply: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("flush supervisor control reply: {error}"))
+}
+
 pub(crate) fn up(config_path: &Path) -> Result<()> {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     let config = load_config(config_path)?;
@@ -106,6 +446,12 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     let material = verify_prepared_world(&config, &paths, &smolvm)?;
 
     let recovery = inspect_v2_recovery(&paths)?;
+    if recovery.lifecycle.state.retains_checkpoint_sources() {
+        return Err(format!(
+            "world '{}' has a retained or in-progress durable capture; run `smolworld restore --checkpoint DIR` or explicitly release that checkpoint before a fresh up",
+            config.name
+        ));
+    }
     if recovery.is_recorded_but_absent() {
         eprintln!(
             "smolworld: found recorded allocations for {} but no running machines",
@@ -118,13 +464,13 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
             config.name
         );
     }
-    let previous = load_v2_state(&paths.state_file)?;
+    let previous = load_v2_allocation_state(&paths.state_file)?;
     cleanup_machines(&smolvm, previous.as_ref());
     remove_v2_stale_temporary_files(&paths)?;
     remove_v2_runtime_dir(&paths)?;
 
-    let state = allocate_v2_state(previous, &config, &paths)?;
-    write_v2_state(&paths, &state)?;
+    let state = allocate_v2_allocation_state(previous, &config, &paths)?;
+    write_v2_allocation_state(&paths, &state)?;
     mark_v2_starting(&paths)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let (switch_tx, switch_rx) = mpsc::channel();
@@ -133,8 +479,10 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     let mut port_handles = Vec::new();
     let mut socket_paths = BTreeMap::new();
     let mut switch_handle = None;
+    let mut retain_checkpoint_sources = false;
     let result = (|| {
         prepare_v2_runtime_dir(&paths)?;
+        let control_listener = bind_runtime_control_listener(&paths)?;
         let switch_shutdown = shutdown.clone();
         switch_handle = Some(
             thread::Builder::new()
@@ -202,12 +550,75 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
         install_signal_handlers();
         eprintln!("smolworld: world is up; press Ctrl-C to stop it");
         while !STOP_REQUESTED.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(200));
+            match control_listener.accept() {
+                Ok((mut stream, _)) => {
+                    let command = match read_runtime_control_command(&mut stream) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            let _ =
+                                write_runtime_control_reply(&mut stream, &format!("ERR {error}\n"));
+                            continue;
+                        }
+                    };
+                    match command {
+                        RuntimeControlCommand::Checkpoint { output } => {
+                            match checkpoint_running_world(
+                                &config,
+                                &state,
+                                &paths,
+                                &smolvm,
+                                &switch_tx,
+                                &attached_rx,
+                                &output,
+                            ) {
+                                Ok(()) => {
+                                    retain_checkpoint_sources = true;
+                                    STOP_REQUESTED.store(true, Ordering::SeqCst);
+                                    let _ =
+                                        write_runtime_control_reply(&mut stream, "OK captured\n");
+                                }
+                                Err(error) => {
+                                    // A receipt may already have been published when the
+                                    // final lifecycle write reports a host I/O error. Its
+                                    // stopped machine sources must be retained for explicit
+                                    // recovery; deleting them here would turn a surfaced
+                                    // commit failure into silent data loss.
+                                    let retained_lifecycle =
+                                        match load_v2_lifecycle(&paths.lifecycle_path()) {
+                                            Ok(Some(lifecycle)) => {
+                                                lifecycle.state.retains_checkpoint_sources()
+                                            }
+                                            Ok(None) => false,
+                                            // A corrupt or unreadable lifecycle after a
+                                            // checkpoint error is not evidence that the
+                                            // stopped source records are disposable.
+                                            Err(_) => true,
+                                        };
+                                    if output.exists() || retained_lifecycle {
+                                        retain_checkpoint_sources = true;
+                                        STOP_REQUESTED.store(true, Ordering::SeqCst);
+                                    }
+                                    let _ = write_runtime_control_reply(
+                                        &mut stream,
+                                        &format!("ERR {error}\n"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(format!("accept supervisor control: {error}")),
+            }
         }
         Ok(())
     })();
 
-    cleanup_machines(&smolvm, Some(&state));
+    if !retain_checkpoint_sources {
+        cleanup_machines(&smolvm, Some(&state));
+    }
     shutdown.store(true, Ordering::SeqCst);
     let _ = switch_tx.send(SwitchEvent::Shutdown);
     for handle in port_handles {
@@ -217,7 +628,9 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
         let _ = handle.join();
     }
     let _ = remove_v2_runtime_dir(&paths);
-    let _ = mark_v2_absent(&paths);
+    if !retain_checkpoint_sources {
+        let _ = mark_v2_absent(&paths);
+    }
     result
 }
 
@@ -262,10 +675,311 @@ where
     })
 }
 
+/// Freeze every machine behind one closed switch epoch, publish the per-machine
+/// durable receipts beneath `output`, then publish the world receipt last.
+/// Independent machine capture remains parallel; the output is all-or-nothing
+/// from the caller's point of view because any pre-publication failure restores
+/// every machine that did finish capture before forwarding resumes.
+fn checkpoint_running_world(
+    config: &WorldConfig,
+    state: &crate::model::WorldAllocationState,
+    paths: &V2WorldPaths,
+    smolvm: &Path,
+    switch_tx: &mpsc::Sender<SwitchEvent>,
+    attached_rx: &mpsc::Receiver<String>,
+    output: &Path,
+) -> Result<()> {
+    let (parent, staging) = create_world_checkpoint_staging(output)?;
+    if let Err(error) = mark_v2_capturing(paths) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let machines_root = staging.join("machines");
+    if let Err(error) = fs::create_dir(&machines_root).map_err(|error| {
+        format!(
+            "create checkpoint machine root {}: {error}",
+            machines_root.display()
+        )
+    }) {
+        return abandon_unstarted_world_checkpoint(paths, &staging, error);
+    }
+    let switch = match quiesce_switch(switch_tx) {
+        Ok(receipt) => receipt,
+        Err(error) => return abandon_unstarted_world_checkpoint(paths, &staging, error),
+    };
+    let rollback = CheckpointRollback {
+        paths,
+        smolvm,
+        state,
+        staging: &staging,
+        switch_tx,
+        attached_rx,
+    };
+
+    let names: Vec<_> = config.machines.keys().cloned().collect();
+    if switch.queued_frames != 0 || switch.active_ports.keys().ne(config.machines.keys()) {
+        return rollback_world_checkpoint(
+            &rollback,
+            &[],
+            "switch checkpoint cut does not match the running world ports".to_string(),
+        );
+    }
+    let captures = parallel_checkpoint_machines(&names, smolvm, state, &machines_root);
+    let completed: Vec<_> = captures
+        .iter()
+        .filter_map(|(name, result)| result.is_ok().then_some(name.clone()))
+        .collect();
+    if let Some((name, error)) = captures.iter().find_map(|(name, result)| {
+        result
+            .as_ref()
+            .err()
+            .map(|error| (name.as_str(), error.as_str()))
+    }) {
+        return rollback_world_checkpoint(
+            &rollback,
+            &completed,
+            format!("checkpoint machine '{name}': {error}"),
+        );
+    }
+
+    let receipt = WorldCheckpointReceipt {
+        world_name: config.name.clone(),
+        config_digest: digest_file(&paths.canonical_config)?,
+        material_lock_digest: digest_file(&paths.material_lock_path())?,
+        allocation: state.clone(),
+        switch,
+    };
+    if let Err(error) = write_world_checkpoint_receipt(&staging, &receipt) {
+        return rollback_world_checkpoint(&rollback, &completed, error);
+    }
+    if let Err(error) = fs::rename(&staging, output) {
+        return rollback_world_checkpoint(
+            &rollback,
+            &completed,
+            format!("publish checkpoint {}: {error}", output.display()),
+        );
+    }
+    if let Err(error) = File::open(&parent).and_then(|directory| directory.sync_all()) {
+        return Err(format!(
+            "checkpoint is published at {} but parent directory sync failed: {error}",
+            output.display()
+        ));
+    }
+    // The artifact is already visible if this final state write fails. Leave
+    // the earlier `Capturing` intent in place so `up` cannot clean its stopped
+    // sources; `restore`/`release` accept that recoverable state after receipt
+    // verification.
+    mark_v2_captured(paths)?;
+    Ok(())
+}
+
+fn abandon_unstarted_world_checkpoint(
+    paths: &V2WorldPaths,
+    staging: &Path,
+    original_error: String,
+) -> Result<()> {
+    let remove = fs::remove_dir_all(staging).map_err(|error| {
+        format!(
+            "remove unstarted checkpoint staging {}: {error}",
+            staging.display()
+        )
+    });
+    let lifecycle = mark_v2_capture_rolled_back(paths);
+    match (remove, lifecycle) {
+        (Ok(()), Ok(_)) => Err(original_error),
+        (remove, lifecycle) => Err(format!(
+            "{original_error}; checkpoint capture intent retained: staging cleanup: {}; lifecycle rollback: {}",
+            remove
+                .err()
+                .unwrap_or_else(|| "ok".to_string()),
+            lifecycle
+                .err()
+                .unwrap_or_else(|| "ok".to_string()),
+        )),
+    }
+}
+
+fn create_world_checkpoint_staging(output: &Path) -> Result<(PathBuf, PathBuf)> {
+    if !output.is_absolute() {
+        return Err("checkpoint --output must be an absolute directory".into());
+    }
+    match fs::symlink_metadata(output) {
+        Ok(_) => {
+            return Err(format!(
+                "refusing to overwrite checkpoint output {}",
+                output.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "inspect checkpoint output {}: {error}",
+                output.display()
+            ))
+        }
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| "checkpoint output has no parent directory".to_string())?
+        .to_path_buf();
+    let metadata = fs::symlink_metadata(&parent).map_err(|error| {
+        format!(
+            "inspect checkpoint output parent {}: {error}",
+            parent.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "checkpoint output parent is not a directory: {}",
+            parent.display()
+        ));
+    }
+    let stem = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "checkpoint output name is not valid UTF-8".to_string())?;
+    for attempt in 0..128_u64 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let staging = parent.join(format!(
+            ".{stem}.smolworld-capture-{:x}-{:x}-{:x}.partial",
+            std::process::id(),
+            nonce,
+            attempt
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok((parent, staging)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "create checkpoint staging {}: {error}",
+                    staging.display()
+                ))
+            }
+        }
+    }
+    Err("could not allocate a unique checkpoint staging directory".into())
+}
+
+fn quiesce_switch(
+    switch_tx: &mpsc::Sender<SwitchEvent>,
+) -> Result<crate::model::SwitchCheckpointReceipt> {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    switch_tx
+        .send(SwitchEvent::Quiesce {
+            acknowledged: ack_tx,
+        })
+        .map_err(|error| format!("request switch quiescence: {error}"))?;
+    ack_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "timed out waiting for switch quiescence".to_string())
+}
+
+fn resume_switch(switch_tx: &mpsc::Sender<SwitchEvent>) {
+    let _ = switch_tx.send(SwitchEvent::Resume);
+}
+
+fn parallel_checkpoint_machines(
+    names: &[String],
+    smolvm: &Path,
+    state: &crate::model::WorldAllocationState,
+    machines_root: &Path,
+) -> Vec<(String, Result<()>)> {
+    thread::scope(|scope| {
+        let handles: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let assignment = state.assignments.get(name).expect("allocated machine");
+                let checkpoint = machines_root.join(name);
+                scope
+                    .spawn(move || checkpoint_machine(smolvm, &assignment.smolvm_name, &checkpoint))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(names)
+            .map(|(handle, name)| {
+                let result = handle
+                    .join()
+                    .map_err(|_| format!("checkpoint machine '{name}' worker panicked"))
+                    .and_then(|result| result);
+                (name.clone(), result)
+            })
+            .collect()
+    })
+}
+
+/// All state needed to return a pre-publish capture failure to the same live
+/// world. Keeping the rollback boundary explicit makes it harder to resume
+/// forwarding before every successfully frozen machine has fresh attachments.
+struct CheckpointRollback<'a> {
+    paths: &'a V2WorldPaths,
+    smolvm: &'a Path,
+    state: &'a crate::model::WorldAllocationState,
+    staging: &'a Path,
+    switch_tx: &'a mpsc::Sender<SwitchEvent>,
+    attached_rx: &'a mpsc::Receiver<String>,
+}
+
+fn rollback_world_checkpoint(
+    rollback: &CheckpointRollback<'_>,
+    completed: &[String],
+    original_error: String,
+) -> Result<()> {
+    let restore = parallel_machine_operations(completed, "rollback checkpoint", |name| {
+        let assignment = rollback
+            .state
+            .assignments
+            .get(name)
+            .expect("allocated machine");
+        restore_machine(
+            rollback.smolvm,
+            &assignment.smolvm_name,
+            &rollback.staging.join("machines").join(name),
+        )
+    });
+    let attached = restore.and_then(|()| {
+        wait_for_expected_attachments(
+            rollback.attached_rx,
+            completed.iter().cloned().collect::<HashSet<_>>(),
+        )
+    });
+    resume_switch(rollback.switch_tx);
+    match attached {
+        Ok(()) => {
+            if let Err(error) = mark_v2_capture_rolled_back(rollback.paths) {
+                return Err(format!(
+                    "{original_error}; checkpoint rollback restored the world but could not clear its capture intent: {error}"
+                ));
+            }
+            fs::remove_dir_all(rollback.staging).map_err(|error| {
+                format!(
+                    "{original_error}; remove rolled-back checkpoint staging {}: {error}",
+                    rollback.staging.display()
+                )
+            })?;
+            Err(original_error)
+        }
+        Err(rollback_error) => Err(format!(
+            "{original_error}; checkpoint rollback failed: {rollback_error}; staging preserved at {}",
+            rollback.staging.display()
+        )),
+    }
+}
+
 pub(crate) fn down(config_path: &Path) -> Result<()> {
     let paths = v2_world_paths(config_path)?;
     let _world_lock = WorldLock::acquire_v2(&paths)?;
-    let state = load_v2_state(&paths.state_file)?;
+    let state = load_v2_allocation_state(&paths.state_file)?;
+    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if lifecycle.state.retains_checkpoint_sources() {
+        return Err(
+            "world has a retained durable checkpoint; use `smolworld release --checkpoint DIR` to delete its exact source machines and artifact"
+                .into(),
+        );
+    }
     if let Some(state) = &state {
         cleanup_machines(&smolvm_program(), Some(state));
     }
@@ -281,7 +995,7 @@ pub(crate) fn down(config_path: &Path) -> Result<()> {
 pub(crate) fn ps(config_path: &Path, format: PsFormat) -> Result<()> {
     let config = load_config(config_path)?;
     let paths = v2_world_paths(config_path)?;
-    let state = load_v2_state(&paths.state_file)?;
+    let state = load_v2_allocation_state(&paths.state_file)?;
     let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     let smolvm = smolvm_program();
     let mut machines = Vec::new();
@@ -328,6 +1042,11 @@ fn display_lifecycle_state(
     let Some(smolvm_state) = smolvm_state else {
         return DisplayLifecycleState::Absent;
     };
+    match lifecycle {
+        LifecycleState::Capturing => return DisplayLifecycleState::Capturing,
+        LifecycleState::Captured => return DisplayLifecycleState::Captured,
+        _ => {}
+    }
     if smolvm_state != "running" {
         return DisplayLifecycleState::Created;
     }
@@ -344,7 +1063,7 @@ pub(crate) fn exec(config_path: &Path, machine: &str, command: &[String]) -> Res
         return Err(format!("unknown world machine '{machine}'"));
     }
     let paths = v2_world_paths(config_path)?;
-    let state = load_v2_state(&paths.state_file)?
+    let state = load_v2_allocation_state(&paths.state_file)?
         .ok_or_else(|| "world has no state; run `smolworld up` first".to_string())?;
     let assignment = state
         .assignments
@@ -369,7 +1088,7 @@ pub(crate) fn exec(config_path: &Path, machine: &str, command: &[String]) -> Res
 pub(crate) fn copy(config_path: &Path, source: &str, destination: &str) -> Result<()> {
     let config = load_config(config_path)?;
     let paths = v2_world_paths(config_path)?;
-    let state = load_v2_state(&paths.state_file)?
+    let state = load_v2_allocation_state(&paths.state_file)?
         .ok_or_else(|| "world has no state; run `smolworld up` first".to_string())?;
     let source_remote = parse_copy_remote_endpoint(source)?;
     let destination_remote = parse_copy_remote_endpoint(destination)?;

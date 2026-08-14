@@ -12,6 +12,8 @@ pub(crate) enum LifecycleState {
     Created,
     Attached,
     Running,
+    Capturing,
+    Captured,
     Absent,
 }
 
@@ -21,6 +23,8 @@ impl LifecycleState {
             Self::Created => "created",
             Self::Attached => "attached",
             Self::Running => "running",
+            Self::Capturing => "capturing",
+            Self::Captured => "captured",
             Self::Absent => "absent",
         }
     }
@@ -40,6 +44,8 @@ impl FromStr for LifecycleState {
             "created" => Ok(Self::Created),
             "attached" => Ok(Self::Attached),
             "running" => Ok(Self::Running),
+            "capturing" => Ok(Self::Capturing),
+            "captured" => Ok(Self::Captured),
             "absent" => Ok(Self::Absent),
             other => Err(format!("unknown lifecycle state '{other}'")),
         }
@@ -101,6 +107,23 @@ pub(crate) enum Cli {
     Prepare {
         config: PathBuf,
     },
+    /// Ask the running supervisor to capture every world machine into one
+    /// checkpoint root. This command never guesses at a switch/runtime from a
+    /// second process; it talks to the owner through its private control socket.
+    Checkpoint {
+        config: PathBuf,
+        output: PathBuf,
+    },
+    /// Start a new supervisor around a previously captured world receipt.
+    Restore {
+        config: PathBuf,
+        checkpoint: PathBuf,
+    },
+    /// Irreversibly release one retained checkpoint and its exact source VMs.
+    Release {
+        config: PathBuf,
+        checkpoint: PathBuf,
+    },
     Down {
         config: PathBuf,
     },
@@ -143,6 +166,18 @@ pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
             "prepare" => {
                 return command_config("prepare", config, &args[index + 1..])
                     .map(|config| Cli::Prepare { config })
+            }
+            "checkpoint" => {
+                let (config, output) = parse_checkpoint_options(config, &args[index + 1..])?;
+                return Ok(Cli::Checkpoint { config, output });
+            }
+            "restore" => {
+                let (config, checkpoint) = parse_restore_options(config, &args[index + 1..])?;
+                return Ok(Cli::Restore { config, checkpoint });
+            }
+            "release" => {
+                let (config, checkpoint) = parse_release_options(config, &args[index + 1..])?;
+                return Ok(Cli::Release { config, checkpoint });
             }
             "down" => {
                 return command_config("down", config, &args[index + 1..])
@@ -210,6 +245,60 @@ fn parse_cp_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, String
         [source, destination] => Ok((config, source.clone(), destination.clone())),
         _ => Err("usage: smolworld cp [-f PATH] SRC DST".into()),
     }
+}
+
+fn parse_checkpoint_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
+    parse_world_path_option("checkpoint", config, rest, "--output")
+}
+
+fn parse_restore_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
+    parse_world_path_option("restore", config, rest, "--checkpoint")
+}
+
+fn parse_release_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
+    parse_world_path_option("release", config, rest, "--checkpoint")
+}
+
+fn parse_world_path_option(
+    command: &str,
+    mut config: PathBuf,
+    rest: &[String],
+    path_flag: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let mut path = None;
+    let mut file_seen = false;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "-f" | "--file" if !file_seen => {
+                let Some(value) = rest.get(index + 1) else {
+                    return Err(format!("{command} -f/--file requires a path"));
+                };
+                config = PathBuf::from(value);
+                file_seen = true;
+                index += 2;
+            }
+            flag if flag == path_flag && path.is_none() => {
+                let Some(value) = rest.get(index + 1) else {
+                    return Err(format!("{command} {path_flag} requires a directory"));
+                };
+                path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown {command} option '{other}'\n{}",
+                    world_path_usage(command, path_flag)
+                ));
+            }
+        }
+    }
+    path.map(|path| (config, path))
+        .ok_or_else(|| world_path_usage(command, path_flag))
+}
+
+fn world_path_usage(command: &str, path_flag: &str) -> String {
+    format!("usage: smolworld {command} [-f PATH] {path_flag} DIR")
 }
 
 pub(crate) fn command_config(command: &str, config: PathBuf, rest: &[String]) -> Result<PathBuf> {
@@ -329,7 +418,7 @@ fn push_json_string(output: &mut String, value: &str) {
 }
 
 pub(crate) fn usage() -> &'static str {
-    "usage: smolworld [-f .smolworld] <check|prepare|up|down|ps>\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
+    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
 }
 
 #[cfg(test)]
@@ -362,6 +451,49 @@ mod tests {
             parse_cli(vec!["prepare".into()]).unwrap(),
             Cli::Prepare { config } if config == PathBuf::from(".smolworld")
         ));
+    }
+
+    #[test]
+    fn parses_checkpoint_and_restore_with_explicit_artifact_paths() {
+        assert!(matches!(
+            parse_cli(vec![
+                "checkpoint".into(),
+                "--output".into(),
+                "/private/tmp/w1".into(),
+                "--file".into(),
+                "world.smolworld".into(),
+            ])
+            .unwrap(),
+            Cli::Checkpoint { config, output }
+                if config == PathBuf::from("world.smolworld")
+                    && output == PathBuf::from("/private/tmp/w1")
+        ));
+        assert!(matches!(
+            parse_cli(vec![
+                "-f".into(),
+                "world.smolworld".into(),
+                "restore".into(),
+                "--checkpoint".into(),
+                "/private/tmp/w1".into(),
+            ])
+            .unwrap(),
+            Cli::Restore { config, checkpoint }
+                if config == PathBuf::from("world.smolworld")
+                    && checkpoint == PathBuf::from("/private/tmp/w1")
+        ));
+        assert!(matches!(
+            parse_cli(vec![
+                "release".into(),
+                "--checkpoint".into(),
+                "/private/tmp/w1".into(),
+            ])
+            .unwrap(),
+            Cli::Release { config, checkpoint }
+                if config == PathBuf::from(".smolworld")
+                    && checkpoint == PathBuf::from("/private/tmp/w1")
+        ));
+        assert!(parse_cli(vec!["checkpoint".into(), "--output".into()]).is_err());
+        assert!(parse_cli(vec!["restore".into(), "--checkpoint".into()]).is_err());
     }
 
     #[test]
@@ -457,10 +589,22 @@ mod tests {
             LifecycleState::Created,
             LifecycleState::Attached,
             LifecycleState::Running,
+            LifecycleState::Capturing,
+            LifecycleState::Captured,
             LifecycleState::Absent,
         ];
         let labels: Vec<_> = states.iter().map(|state| state.as_str()).collect();
-        assert_eq!(labels, ["created", "attached", "running", "absent"]);
+        assert_eq!(
+            labels,
+            [
+                "created",
+                "attached",
+                "running",
+                "capturing",
+                "captured",
+                "absent"
+            ]
+        );
         for state in states {
             assert_eq!(state.as_str().parse::<LifecycleState>().unwrap(), state);
         }

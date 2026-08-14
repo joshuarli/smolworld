@@ -1,5 +1,5 @@
 use crate::gateway::Gateway;
-use crate::model::{format_mac, WorldConfig, WorldState};
+use crate::model::{format_mac, SwitchCheckpointReceipt, WorldAllocationState, WorldConfig};
 use crate::state::fnv1a;
 use crate::Result;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -29,6 +29,16 @@ pub(crate) enum SwitchEvent {
         port: String,
         connection: u64,
     },
+    /// Close the forwarding epoch before a coordinated VM capture. Readers
+    /// continue draining their Unix streams so virtio writers cannot block, but
+    /// frames are deliberately not forwarded or answered until `Resume`.
+    /// The acknowledgement is sent only after every event already dequeued by
+    /// the switch has been applied to the FDB/port table.
+    Quiesce {
+        acknowledged: mpsc::Sender<SwitchCheckpointReceipt>,
+    },
+    /// Resume ordinary forwarding after an aborted capture rollback.
+    Resume,
     Shutdown,
 }
 
@@ -156,7 +166,17 @@ pub(crate) fn wait_for_attachments(
     receiver: &mpsc::Receiver<String>,
     config: &WorldConfig,
 ) -> Result<()> {
-    let mut expected: HashSet<_> = config.machines.keys().cloned().collect();
+    let expected: HashSet<_> = config.machines.keys().cloned().collect();
+    wait_for_expected_attachments(receiver, expected)
+}
+
+/// Wait for exactly the newly attached ports named by one supervisor action.
+/// Restore rollback uses this narrower form so it does not need to replay the
+/// world bootstrap attachment barrier for machines that never stopped.
+pub(crate) fn wait_for_expected_attachments(
+    receiver: &mpsc::Receiver<String>,
+    mut expected: HashSet<String>,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + ATTACH_TIMEOUT;
     while !expected.is_empty() {
         let remaining = deadline
@@ -180,7 +200,7 @@ pub(crate) fn wait_for_attachments(
     Ok(())
 }
 
-pub(crate) fn print_allocations(config: &WorldConfig, state: &WorldState) {
+pub(crate) fn print_allocations(config: &WorldConfig, state: &WorldAllocationState) {
     println!("WORLD\t{}", config.name);
     println!("MACHINE\tIP\tMAC");
     for name in config.machines.keys() {
@@ -197,6 +217,8 @@ pub(crate) fn run_switch(
     let mut ports: BTreeMap<String, Arc<Mutex<UnixStream>>> = BTreeMap::new();
     let mut active_connections: BTreeMap<String, u64> = BTreeMap::new();
     let mut fdb: HashMap<[u8; 6], String> = HashMap::new();
+    let mut quiesced = false;
+    let mut epoch = 0_u64;
     while !shutdown.load(Ordering::SeqCst) {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(SwitchEvent::Attached {
@@ -222,7 +244,10 @@ pub(crate) fn run_switch(
                 connection,
                 frame,
             }) => {
-                if active_connections.get(&port) != Some(&connection) || frame.len() < 14 {
+                if quiesced
+                    || active_connections.get(&port) != Some(&connection)
+                    || frame.len() < 14
+                {
                     continue;
                 }
                 let mut destination = [0; 6];
@@ -250,6 +275,28 @@ pub(crate) fn run_switch(
                     }
                 }
             }
+            Ok(SwitchEvent::Quiesce { acknowledged }) => {
+                quiesced = true;
+                epoch = epoch.wrapping_add(1);
+                if epoch == 0 {
+                    epoch = 1;
+                }
+                // The switch intentionally has no replay queue. Events before
+                // this barrier have been applied; reader events that arrive
+                // after it are drained and dropped until the VMs are paused or
+                // rollback resumes forwarding.
+                let learned_macs = fdb
+                    .iter()
+                    .map(|(mac, port)| (format_mac(*mac), port.clone()))
+                    .collect();
+                let _ = acknowledged.send(SwitchCheckpointReceipt {
+                    epoch,
+                    queued_frames: 0,
+                    active_ports: active_connections.clone(),
+                    learned_macs,
+                });
+            }
+            Ok(SwitchEvent::Resume) => quiesced = false,
             Ok(SwitchEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -447,5 +494,89 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
         handle.join().unwrap();
         std::fs::remove_file(socket).unwrap();
+    }
+
+    #[test]
+    fn quiesced_switch_drops_frames_until_rollback_resume() {
+        let config = WorldConfig {
+            name: "test".to_string(),
+            network: crate::model::NetworkConfig {
+                subnet: [10, 89, 0, 0],
+                gateway: "10.89.0.1".parse().unwrap(),
+                dns: "10.89.0.1".parse().unwrap(),
+                domain: "test".to_string(),
+            },
+            machines: BTreeMap::new(),
+        };
+        let state = WorldAllocationState {
+            seed: 1,
+            assignments: BTreeMap::new(),
+        };
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let switch_shutdown = shutdown.clone();
+        let handle =
+            thread::spawn(move || run_switch(rx, Gateway::new(&config, &state), switch_shutdown));
+        let (a_writer, _a_peer) = UnixStream::pair().unwrap();
+        let (b_writer, mut b_peer) = UnixStream::pair().unwrap();
+        tx.send(SwitchEvent::Attached {
+            port: "a".to_string(),
+            connection: 1,
+            writer: Arc::new(Mutex::new(a_writer)),
+        })
+        .unwrap();
+        tx.send(SwitchEvent::Attached {
+            port: "b".to_string(),
+            connection: 1,
+            writer: Arc::new(Mutex::new(b_writer)),
+        })
+        .unwrap();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        tx.send(SwitchEvent::Quiesce {
+            acknowledged: ack_tx,
+        })
+        .unwrap();
+        let receipt = ack_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(receipt.epoch, 1);
+        assert_eq!(receipt.queued_frames, 0);
+        assert_eq!(
+            receipt.active_ports,
+            BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 1)])
+        );
+        assert!(receipt.learned_macs.is_empty());
+        let frame = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00,
+        ];
+        tx.send(SwitchEvent::Frame {
+            port: "a".to_string(),
+            connection: 1,
+            frame: frame.clone(),
+        })
+        .unwrap();
+        b_peer
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut header = [0; 4];
+        assert!(b_peer.read_exact(&mut header).is_err());
+
+        tx.send(SwitchEvent::Resume).unwrap();
+        tx.send(SwitchEvent::Frame {
+            port: "a".to_string(),
+            connection: 1,
+            frame: frame.clone(),
+        })
+        .unwrap();
+        b_peer
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        b_peer.read_exact(&mut header).unwrap();
+        assert_eq!(u32::from_be_bytes(header), frame.len() as u32);
+        let mut forwarded = vec![0; frame.len()];
+        b_peer.read_exact(&mut forwarded).unwrap();
+        assert_eq!(forwarded, frame);
+
+        shutdown.store(true, Ordering::SeqCst);
+        tx.send(SwitchEvent::Shutdown).unwrap();
+        handle.join().unwrap();
     }
 }

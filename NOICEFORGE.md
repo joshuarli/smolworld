@@ -190,8 +190,10 @@ Keep these constraints in every phase:
 
 The current Smolworld implementation has completed the external-world
 materialization boundary, macOS-only cutover, private network behavior, and a
-real Sentry workload gate. The current code is not yet the durable world
-control plane described here.
+real Sentry workload gate.  Gates 1--2 now have a local durable checkpoint
+substrate, but Niceforge has not yet made those artifacts durable workflow
+facts.  In particular, this is not yet the lease-fenced `WorldState` control
+plane described here.
 
 ### Proven today
 
@@ -219,12 +221,36 @@ This is an APFS sharing observation, not a durable checkpoint format. The
 fork remains a live 1-to-N acceleration primitive: its frozen golden and
 backing RAM must remain alive. It is not a durable 'WorldState'.
 
+The real two-machine Redis/runner durable-world gate then verified the initial
+Gates 1--2 substrate on 2026-08-14:
+
+~~~
+coordinated checkpoint wall              19,389.991 ms
+restored runner + private NIC ready          73.187 ms
+~~~
+
+The run wrote a workspace marker and Redis key before capture, exited the
+original supervisor, restored with fresh external-NIC and agent handles, read
+both values over private DNS/Redis, and used exact `release` cleanup.  The
+published receipt seals the material lock/configuration digest, allocation,
+machine receipts, switch epoch, active-port generations, and learned FDB.  It
+is a same-lineage Smolworld artifact.  Without Niceforge's transition intent,
+lease/fence, PostgreSQL transaction, and evidence publication, it must not be
+called `WorldState W1` or used to resume a workflow job.
+
+The remaining observed capture bottleneck is full logical RAM/disk integrity
+sealing.  Concurrent receipt hashing reduced the two-machine wall time from
+42.427 s to 19.390 s; future speed work must preserve that full-content
+integrity contract or replace it with an equivalently verifiable immutable
+codec.
+
 ### Current gaps
 
 - Niceforge 'snapshot_id' identifies sealed workflow/source material, not VM
   RAM, writable disk, workspace, switch, or world state.
-- 'SmolworldExecutor' starts one world and later tears it down. It has no
-  capture, retention, restore, world-state lineage, or shell operation.
+- 'SmolworldExecutor' starts one world and later tears it down. It does not
+  invoke Smolworld's checkpoint/restore/release substrate, attach workflow
+  lineage, or provide a shell operation.
 - Niceforge's executor transport is whole-job and terminal-result oriented.
   It does not stream durable step transitions or checkpoint after each step.
 - 'Version2JobRuntime' keeps completed step context in process memory.
@@ -551,6 +577,11 @@ Acceptance artifacts: focused capture/restore tests, an external-NIC real-VM
 test with fresh host handles, a reopen-after-process-exit test, canonical
 RAM/disk/device receipt vectors, and no unrelated VMM/device changes.
 
+Evidence recorded: libkrun publishes relocatable, APFS-cloned RAM files rather
+than staging-directory paths; SmolVM verifies RAM/disk receipts and restores
+after its source process has exited.  The two-machine gate below exercises the
+external Unix-stream NIC boundary with fresh host descriptors.
+
 ### Gate 2: coordinated two-machine Smolworld checkpoint
 
 Owner: smolworld.
@@ -570,6 +601,14 @@ rules, exact failure cleanup, and exact recorded-world ownership.
 
 Acceptance: a real two-machine world restores from one state and the runner
 observes the same service/process/filesystem state without cold bootstrap.
+
+Evidence recorded: `smolworld checkpoint`, `restore`, and `release` provide a
+supervisor-controlled switch quiesce receipt, concurrent machine capture,
+atomic artifact publication, retained-source lifecycle states, receipt
+validation, fresh listener attachment, rollback before publication, and exact
+release.  `SMOLWORLD_DURABLE_E2E=1` proves Redis, workspace, private DNS, and
+fresh NIC/agent reconnect after the original supervisor exits.  It remains a
+Smolworld substrate until Gate 4 records the required Niceforge transaction.
 
 ### Gate 3: Sentry world checkpoint and scaling
 
@@ -824,6 +863,17 @@ Run the opt-in fork gate when changing the external NIC boundary:
 
 ~~~bash
 SMOLWORLD_FORK_E2E=1 \
+SMOLWORLD_SMOLVM=/path/to/smolvm \
+SMOLVM_AGENT_ROOTFS=/path/to/agent-rootfs \
+SMOLVM_LIB_DIR=/path/to/smolvm/lib \
+python3 tests/e2e_fork_world.py
+~~~
+
+Run the coordinated durable-world gate when changing capture, receipt, or
+supervisor lifecycle behavior:
+
+~~~bash
+SMOLWORLD_DURABLE_E2E=1 \
 SMOLWORLD_SMOLVM=/path/to/smolvm \
 SMOLVM_AGENT_ROOTFS=/path/to/agent-rootfs \
 SMOLVM_LIB_DIR=/path/to/smolvm/lib \

@@ -1,7 +1,8 @@
 use crate::config::validate_label;
 use crate::model::{
     format_mac, gateway_mac, ArtifactState, Assignment, LifecycleMetadata, LifecycleState,
-    RecoveryStatus, WorldConfig, WorldState,
+    RecoveryStatus, SwitchCheckpointReceipt, WorldAllocationState, WorldCheckpointReceipt,
+    WorldConfig,
 };
 use crate::Result;
 use std::collections::{BTreeMap, HashSet};
@@ -17,6 +18,8 @@ const V2_STATE_VERSION: u8 = 2;
 const V2_LIFECYCLE_VERSION: u8 = 2;
 const MATERIAL_LOCK_VERSION: u8 = 5;
 const MATERIAL_LOCK_RESOLVER_ABI: &str = "smolvm-external-world/v3";
+const WORLD_CHECKPOINT_RECEIPT_VERSION: u8 = 1;
+const WORLD_CHECKPOINT_RECEIPT_NAME: &str = "smolworld-checkpoint";
 
 /// Paths owned by the v2 materializer.  The explicit `v2` component is an
 /// ownership boundary: v2 never reads, adopts, or removes the pre-switch
@@ -838,7 +841,16 @@ pub(crate) fn mark_v2_attached(paths: &V2WorldPaths) -> Result<LifecycleMetadata
     transition_v2_lifecycle(
         paths,
         LifecycleState::Attached,
-        &[LifecycleState::Created, LifecycleState::Attached],
+        // A fresh `up` reaches attachment after machine creation. A durable
+        // restore rebinds existing stopped records directly from `Starting`,
+        // so treating restore as a synthetic create would blur its ownership
+        // boundary and made a valid fresh-handle restore fail after every NIC
+        // had already attached.
+        &[
+            LifecycleState::Starting,
+            LifecycleState::Created,
+            LifecycleState::Attached,
+        ],
     )
 }
 
@@ -848,6 +860,50 @@ pub(crate) fn mark_v2_running(paths: &V2WorldPaths) -> Result<LifecycleMetadata>
         LifecycleState::Running,
         &[LifecycleState::Attached, LifecycleState::Running],
     )
+}
+
+/// Record a durable capture intent before the supervisor asks any VM to freeze.
+/// A process death in this state is not ordinary stale startup: the operator
+/// must explicitly restore or release the exact retained source records.
+pub(crate) fn mark_v2_capturing(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
+    transition_v2_lifecycle(
+        paths,
+        LifecycleState::Capturing,
+        &[LifecycleState::Running, LifecycleState::Attached],
+    )
+}
+
+/// Return a fully rolled-back capture attempt to its live-supervisor state.
+/// If this write fails, callers deliberately leave `Capturing` in place so a
+/// future ordinary `up` cannot erase uncertain source machines.
+pub(crate) fn mark_v2_capture_rolled_back(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
+    transition_v2_lifecycle(paths, LifecycleState::Running, &[LifecycleState::Capturing])
+}
+
+/// Publish a committed durable checkpoint after the supervisor has stopped
+/// every source VM. Captured state has no live owner process: the allocation
+/// and stopped smolvm records are intentionally retained for a later restore.
+pub(crate) fn mark_v2_captured(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if !matches!(
+        previous.state,
+        LifecycleState::Starting
+            | LifecycleState::Running
+            | LifecycleState::Attached
+            | LifecycleState::Capturing
+    ) {
+        return Err(format!(
+            "cannot transition v2 lifecycle from {} to captured",
+            previous.state.as_str()
+        ));
+    }
+    let lifecycle = LifecycleMetadata::new(
+        LifecycleState::Captured,
+        None,
+        previous.generation.wrapping_add(1),
+    )?;
+    write_v2_lifecycle(paths, lifecycle)?;
+    Ok(lifecycle)
 }
 
 pub(crate) fn mark_v2_absent(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
@@ -922,7 +978,7 @@ fn artifact_state(path: &Path) -> Result<ArtifactState> {
     }
 }
 
-pub(crate) fn load_v2_state(path: &Path) -> Result<Option<WorldState>> {
+pub(crate) fn load_v2_allocation_state(path: &Path) -> Result<Option<WorldAllocationState>> {
     load_state_version(path, V2_STATE_VERSION, "v2 state")
 }
 
@@ -930,7 +986,7 @@ fn load_state_version(
     path: &Path,
     expected_version: u8,
     label: &str,
-) -> Result<Option<WorldState>> {
+) -> Result<Option<WorldAllocationState>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -982,13 +1038,16 @@ fn load_state_version(
     if version != Some(expected_version) {
         return Err(format!("{label} format is not version {expected_version}"));
     }
-    Ok(Some(WorldState {
+    Ok(Some(WorldAllocationState {
         seed: seed.ok_or_else(|| format!("{label} is missing seed"))?,
         assignments,
     }))
 }
 
-pub(crate) fn write_v2_state(paths: &V2WorldPaths, state: &WorldState) -> Result<()> {
+pub(crate) fn write_v2_allocation_state(
+    paths: &V2WorldPaths,
+    state: &WorldAllocationState,
+) -> Result<()> {
     write_state_at(
         &paths.state_dir,
         paths.state_file.clone(),
@@ -1001,7 +1060,7 @@ pub(crate) fn write_v2_state(paths: &V2WorldPaths, state: &WorldState) -> Result
 fn write_state_at(
     state_dir: &Path,
     state_file: PathBuf,
-    state: &WorldState,
+    state: &WorldAllocationState,
     version: u8,
     label: &str,
 ) -> Result<()> {
@@ -1032,6 +1091,295 @@ fn write_state_at(
     Ok(())
 }
 
+/// Receipt filename inside a published world checkpoint directory.
+pub(crate) fn world_checkpoint_receipt_path(root: &Path) -> PathBuf {
+    root.join(WORLD_CHECKPOINT_RECEIPT_NAME)
+}
+
+/// Atomically publish the world-level receipt after every per-machine
+/// checkpoint directory is complete. The receipt intentionally records the
+/// stable allocation separately from the guest checkpoint files; it is a
+/// verifier and ownership record, never a substitute for RAM/device state.
+pub(crate) fn write_world_checkpoint_receipt(
+    root: &Path,
+    receipt: &WorldCheckpointReceipt,
+) -> Result<()> {
+    validate_world_checkpoint_receipt(receipt)?;
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("inspect checkpoint root {}: {error}", root.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "checkpoint root is not a real directory: {}",
+            root.display()
+        ));
+    }
+    let destination = world_checkpoint_receipt_path(root);
+    let temporary = root.join(format!(
+        ".{WORLD_CHECKPOINT_RECEIPT_NAME}.{}.tmp",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("chmod {}: {error}", temporary.display()))?;
+    file.write_all(serialize_world_checkpoint_receipt(receipt).as_bytes())
+        .map_err(|error| format!("write world checkpoint receipt: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("sync world checkpoint receipt: {error}"))?;
+    fs::rename(&temporary, &destination)
+        .map_err(|error| format!("rename {}: {error}", destination.display()))?;
+    File::open(root)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync checkpoint root {}: {error}", root.display()))?;
+    Ok(())
+}
+
+/// Read and validate one immutable world checkpoint receipt. Callers still
+/// verify every referenced per-machine SmolVM receipt before restoring it.
+pub(crate) fn load_world_checkpoint_receipt(root: &Path) -> Result<WorldCheckpointReceipt> {
+    let path = world_checkpoint_receipt_path(root);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "inspect world checkpoint receipt {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "world checkpoint receipt is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("read world checkpoint receipt {}: {error}", path.display()))?;
+    parse_world_checkpoint_receipt(&content)
+}
+
+fn validate_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Result<()> {
+    validate_label(&receipt.world_name).map_err(|reason| {
+        format!(
+            "world checkpoint receipt world '{}': {reason}",
+            receipt.world_name
+        )
+    })?;
+    validate_blake3_digest(&receipt.config_digest, "world checkpoint config digest")?;
+    validate_blake3_digest(
+        &receipt.material_lock_digest,
+        "world checkpoint material lock digest",
+    )?;
+    if receipt.allocation.assignments.is_empty() {
+        return Err("world checkpoint receipt has no machine allocations".into());
+    }
+    let mut ips = HashSet::new();
+    let mut macs = HashSet::new();
+    for (machine, assignment) in &receipt.allocation.assignments {
+        validate_label(machine)
+            .map_err(|reason| format!("world checkpoint machine '{machine}': {reason}"))?;
+        if assignment.smolvm_name.is_empty()
+            || assignment.smolvm_name.contains(['\t', '\r', '\n'])
+            || !ips.insert(assignment.ip)
+            || !macs.insert(assignment.mac)
+        {
+            return Err(format!(
+                "world checkpoint receipt has invalid or repeated allocation for '{machine}'"
+            ));
+        }
+    }
+    if receipt.switch.queued_frames != 0 {
+        return Err("world checkpoint receipt cannot retain switch packet queues".into());
+    }
+    for (port, connection) in &receipt.switch.active_ports {
+        validate_label(port)
+            .map_err(|reason| format!("world checkpoint switch port '{port}': {reason}"))?;
+        if *connection == 0 {
+            return Err(format!(
+                "world checkpoint switch port '{port}' has invalid connection"
+            ));
+        }
+    }
+    for (mac, port) in &receipt.switch.learned_macs {
+        parse_mac(mac)
+            .map_err(|reason| format!("world checkpoint switch FDB MAC '{mac}': {reason}"))?;
+        validate_label(port)
+            .map_err(|reason| format!("world checkpoint switch FDB port '{port}': {reason}"))?;
+        if !receipt.switch.active_ports.contains_key(port) {
+            return Err(format!(
+                "world checkpoint switch FDB references inactive port '{port}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn serialize_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("version\t{WORLD_CHECKPOINT_RECEIPT_VERSION}\n"));
+    output.push_str(&format!("world\t{}\n", receipt.world_name));
+    output.push_str(&format!("config\t{}\n", receipt.config_digest));
+    output.push_str(&format!("material\t{}\n", receipt.material_lock_digest));
+    output.push_str(&format!("seed\t{:016x}\n", receipt.allocation.seed));
+    output.push_str(&format!("switch-epoch\t{}\n", receipt.switch.epoch));
+    output.push_str(&format!("switch-queue\t{}\n", receipt.switch.queued_frames));
+    for (port, connection) in &receipt.switch.active_ports {
+        output.push_str(&format!("switch-port\t{port}\t{connection}\n"));
+    }
+    for (mac, port) in &receipt.switch.learned_macs {
+        output.push_str(&format!("switch-fdb\t{mac}\t{port}\n"));
+    }
+    for (machine, assignment) in &receipt.allocation.assignments {
+        output.push_str(&format!(
+            "machine\t{machine}\t{}\t{}\t{}\n",
+            assignment.ip,
+            format_mac(assignment.mac),
+            assignment.smolvm_name
+        ));
+    }
+    output
+}
+
+fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceipt> {
+    let mut version = None;
+    let mut world_name = None;
+    let mut config_digest = None;
+    let mut material_lock_digest = None;
+    let mut seed = None;
+    let mut switch_epoch = None;
+    let mut switch_queue = None;
+    let mut active_ports = BTreeMap::new();
+    let mut learned_macs = BTreeMap::new();
+    let mut assignments = BTreeMap::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        match fields.as_slice() {
+            ["version", value] if version.is_none() => {
+                version = Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|_| "world checkpoint receipt has invalid version".to_string())?,
+                );
+            }
+            ["world", value] if world_name.is_none() => world_name = Some((*value).to_string()),
+            ["config", value] if config_digest.is_none() => {
+                config_digest = Some((*value).to_string())
+            }
+            ["material", value] if material_lock_digest.is_none() => {
+                material_lock_digest = Some((*value).to_string())
+            }
+            ["seed", value] if seed.is_none() => {
+                seed = Some(
+                    u64::from_str_radix(value, 16)
+                        .map_err(|_| "world checkpoint receipt has invalid seed".to_string())?,
+                );
+            }
+            ["switch-epoch", value] if switch_epoch.is_none() => {
+                switch_epoch = Some(value.parse::<u64>().map_err(|_| {
+                    "world checkpoint receipt has invalid switch epoch".to_string()
+                })?);
+            }
+            ["switch-queue", value] if switch_queue.is_none() => {
+                switch_queue = Some(value.parse::<u64>().map_err(|_| {
+                    "world checkpoint receipt has invalid switch queue count".to_string()
+                })?);
+            }
+            ["switch-port", port, connection] => {
+                validate_label(port)
+                    .map_err(|reason| format!("world checkpoint switch port '{port}': {reason}"))?;
+                let connection = connection.parse::<u64>().map_err(|_| {
+                    format!("world checkpoint switch port '{port}' has invalid connection")
+                })?;
+                if connection == 0
+                    || active_ports
+                        .insert((*port).to_string(), connection)
+                        .is_some()
+                {
+                    return Err(format!(
+                        "world checkpoint receipt repeats or invalidates switch port '{port}'"
+                    ));
+                }
+            }
+            ["switch-fdb", mac, port] => {
+                parse_mac(mac).map_err(|reason| {
+                    format!("world checkpoint switch FDB MAC '{mac}': {reason}")
+                })?;
+                validate_label(port).map_err(|reason| {
+                    format!("world checkpoint switch FDB port '{port}': {reason}")
+                })?;
+                if learned_macs
+                    .insert((*mac).to_string(), (*port).to_string())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "world checkpoint receipt repeats switch FDB MAC '{mac}'"
+                    ));
+                }
+            }
+            ["machine", machine, ip, mac, smolvm_name] => {
+                validate_label(machine).map_err(|reason| {
+                    format!("world checkpoint receipt machine '{machine}': {reason}")
+                })?;
+                if assignments
+                    .insert(
+                        (*machine).to_string(),
+                        Assignment {
+                            ip: ip.parse().map_err(|_| {
+                                format!(
+                                    "world checkpoint receipt machine '{machine}' has invalid IP"
+                                )
+                            })?,
+                            mac: parse_mac(mac).map_err(|reason| {
+                                format!("world checkpoint receipt machine '{machine}': {reason}")
+                            })?,
+                            smolvm_name: (*smolvm_name).to_string(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!(
+                        "world checkpoint receipt repeats machine '{machine}'"
+                    ));
+                }
+            }
+            _ => {
+                return Err("world checkpoint receipt contains an unknown or malformed line".into())
+            }
+        }
+    }
+    if version != Some(WORLD_CHECKPOINT_RECEIPT_VERSION) {
+        return Err(format!(
+            "world checkpoint receipt format is not version {WORLD_CHECKPOINT_RECEIPT_VERSION}"
+        ));
+    }
+    let receipt = WorldCheckpointReceipt {
+        world_name: world_name
+            .ok_or_else(|| "world checkpoint receipt is missing world".to_string())?,
+        config_digest: config_digest
+            .ok_or_else(|| "world checkpoint receipt is missing config digest".to_string())?,
+        material_lock_digest: material_lock_digest
+            .ok_or_else(|| "world checkpoint receipt is missing material digest".to_string())?,
+        allocation: WorldAllocationState {
+            seed: seed.ok_or_else(|| "world checkpoint receipt is missing seed".to_string())?,
+            assignments,
+        },
+        switch: SwitchCheckpointReceipt {
+            epoch: switch_epoch
+                .ok_or_else(|| "world checkpoint receipt is missing switch epoch".to_string())?,
+            queued_frames: switch_queue.ok_or_else(|| {
+                "world checkpoint receipt is missing switch queue count".to_string()
+            })?,
+            active_ports,
+            learned_macs,
+        },
+    };
+    validate_world_checkpoint_receipt(&receipt)?;
+    Ok(receipt)
+}
+
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| format!("create {}: {error}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -1041,12 +1389,12 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
 /// Allocate v2 identities only from the v2 record and paths.  This mirrors
 /// the stable address/MAC invariants of v1 while deliberately avoiding every
 /// v1 load/write/allocation entry point.
-pub(crate) fn allocate_v2_state(
-    previous: Option<WorldState>,
+pub(crate) fn allocate_v2_allocation_state(
+    previous: Option<WorldAllocationState>,
     config: &WorldConfig,
     paths: &V2WorldPaths,
-) -> Result<WorldState> {
-    let previous = previous.unwrap_or_else(|| WorldState {
+) -> Result<WorldAllocationState> {
+    let previous = previous.unwrap_or_else(|| WorldAllocationState {
         seed: new_v2_seed(paths),
         assignments: BTreeMap::new(),
     });
@@ -1086,7 +1434,7 @@ pub(crate) fn allocate_v2_state(
         assigned_macs.insert(assignment.mac);
         assignments.insert(name.clone(), assignment);
     }
-    Ok(WorldState {
+    Ok(WorldAllocationState {
         seed: previous.seed,
         assignments,
     })
@@ -1337,6 +1685,44 @@ mod tests {
     }
 
     #[test]
+    fn world_checkpoint_receipt_round_trips_stable_world_identity() {
+        let world = TemporaryWorld::new();
+        let checkpoint = world.root.join("checkpoint");
+        fs::create_dir(&checkpoint).unwrap();
+        let receipt = WorldCheckpointReceipt {
+            world_name: "sentry".to_string(),
+            config_digest: digest_bytes(b"world config"),
+            material_lock_digest: digest_bytes(b"prepared material"),
+            allocation: WorldAllocationState {
+                seed: 0x1234,
+                assignments: BTreeMap::from([(
+                    "runner".to_string(),
+                    Assignment {
+                        ip: "10.89.0.2".parse().unwrap(),
+                        mac: [0x02, 0, 0, 0, 0, 2],
+                        smolvm_name: "smw-v2-00000000002a-runner".to_string(),
+                    },
+                )]),
+            },
+            switch: SwitchCheckpointReceipt {
+                epoch: 7,
+                queued_frames: 0,
+                active_ports: BTreeMap::from([("runner".to_string(), 3)]),
+                learned_macs: BTreeMap::from([(
+                    "02:00:00:00:00:02".to_string(),
+                    "runner".to_string(),
+                )]),
+            },
+        };
+
+        write_world_checkpoint_receipt(&checkpoint, &receipt).unwrap();
+
+        assert_eq!(load_world_checkpoint_receipt(&checkpoint).unwrap(), receipt);
+        let serialized = fs::read_to_string(world_checkpoint_receipt_path(&checkpoint)).unwrap();
+        assert!(serialized.starts_with("version\t1\nworld\tsentry\n"));
+    }
+
+    #[test]
     fn v2_paths_are_separate_and_do_not_adopt_v1_state() {
         let world = TemporaryWorld::new();
         fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
@@ -1367,7 +1753,7 @@ mod tests {
     fn v2_state_round_trips_with_an_explicit_v2_version() {
         let world = TemporaryWorld::new();
         let paths = v2_paths_for(&world);
-        let state = WorldState {
+        let state = WorldAllocationState {
             seed: 0xfeed,
             assignments: BTreeMap::from([(
                 "redis".to_string(),
@@ -1379,9 +1765,9 @@ mod tests {
             )]),
         };
 
-        write_v2_state(&paths, &state).unwrap();
+        write_v2_allocation_state(&paths, &state).unwrap();
         assert_eq!(
-            load_v2_state(&paths.state_file).unwrap(),
+            load_v2_allocation_state(&paths.state_file).unwrap(),
             Some(state.clone())
         );
         assert_eq!(
@@ -1424,8 +1810,8 @@ mod tests {
                 ),
             ]),
         };
-        let first = allocate_v2_state(
-            Some(WorldState {
+        let first = allocate_v2_allocation_state(
+            Some(WorldAllocationState {
                 seed: 7,
                 assignments: BTreeMap::new(),
             }),
@@ -1433,7 +1819,7 @@ mod tests {
             &paths,
         )
         .unwrap();
-        let second = allocate_v2_state(Some(first.clone()), &config, &paths).unwrap();
+        let second = allocate_v2_allocation_state(Some(first.clone()), &config, &paths).unwrap();
 
         assert_eq!(first, second);
         assert!(first
@@ -1466,7 +1852,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(load_v2_state(&paths.state_file).unwrap(), None);
+        assert_eq!(load_v2_allocation_state(&paths.state_file).unwrap(), None);
         assert_eq!(load_v2_lifecycle(&paths.lifecycle_path()).unwrap(), None);
         let absent = inspect_v2_recovery(&paths).unwrap();
         assert_eq!(absent.state_file, ArtifactState::Missing);
@@ -1483,21 +1869,63 @@ mod tests {
                 .next(),
             Some("version\t2")
         );
-        write_v2_state(
+        write_v2_allocation_state(
             &paths,
-            &WorldState {
+            &WorldAllocationState {
                 seed: 12,
                 assignments: BTreeMap::new(),
             },
         )
         .unwrap();
-        assert_eq!(load_v2_state(&paths.state_file).unwrap().unwrap().seed, 12);
+        assert_eq!(
+            load_v2_allocation_state(&paths.state_file)
+                .unwrap()
+                .unwrap()
+                .seed,
+            12
+        );
         assert!(inspect_v2_recovery(&paths).unwrap().needs_recovery());
 
         mark_v2_absent(&paths).unwrap();
         assert!(!inspect_v2_recovery(&paths).unwrap().needs_recovery());
         assert!(world.v1_state_file().exists());
         assert!(world.v1_lifecycle_file().exists());
+    }
+
+    #[test]
+    fn capture_intent_prevents_stale_world_cleanup_until_rollback_or_commit() {
+        let world = TemporaryWorld::new();
+        let paths = v2_paths_for(&world);
+
+        mark_v2_starting(&paths).unwrap();
+        mark_v2_created(&paths).unwrap();
+        mark_v2_attached(&paths).unwrap();
+        mark_v2_running(&paths).unwrap();
+        let capturing = mark_v2_capturing(&paths).unwrap();
+        assert_eq!(capturing.state, LifecycleState::Capturing);
+        assert!(capturing.state.retains_checkpoint_sources());
+        assert!(!capturing.state.needs_recovery());
+
+        let rolled_back = mark_v2_capture_rolled_back(&paths).unwrap();
+        assert_eq!(rolled_back.state, LifecycleState::Running);
+        mark_v2_capturing(&paths).unwrap();
+        let captured = mark_v2_captured(&paths).unwrap();
+        assert_eq!(captured.state, LifecycleState::Captured);
+        assert!(captured.state.retains_checkpoint_sources());
+    }
+
+    #[test]
+    fn restored_world_can_attach_without_a_synthetic_create_transition() {
+        let world = TemporaryWorld::new();
+        let paths = v2_paths_for(&world);
+
+        mark_v2_starting(&paths).unwrap();
+        let attached = mark_v2_attached(&paths).unwrap();
+        assert_eq!(attached.state, LifecycleState::Attached);
+        assert_eq!(
+            mark_v2_running(&paths).unwrap().state,
+            LifecycleState::Running
+        );
     }
 
     #[test]

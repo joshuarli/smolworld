@@ -57,15 +57,48 @@ pub(crate) struct Assignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorldState {
+/// Stable address/MAC allocation for one configured world. This intentionally
+/// does not describe a checkpointable workload state: a future `WorldState`
+/// will be an immutable cross-machine state manifest.
+pub(crate) struct WorldAllocationState {
     pub(crate) seed: u64,
     pub(crate) assignments: BTreeMap<String, Assignment>,
 }
 
-/// Durable lifecycle is kept separate from [`WorldState`] for compatibility
-/// with the original allocation record. `WorldState` is constructed directly
-/// by the gateway and switch tests, while lifecycle transitions are owned by
-/// the runtime supervisor through the state APIs.
+/// Immutable receipt for one coordinated world checkpoint. It records the
+/// world declaration/material identities separately from the stable allocation
+/// tuple so restore can reject a checkpoint whose source configuration drifted
+/// without mistaking allocation state for the guest workload state itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorldCheckpointReceipt {
+    pub(crate) world_name: String,
+    pub(crate) config_digest: String,
+    pub(crate) material_lock_digest: String,
+    pub(crate) allocation: WorldAllocationState,
+    /// The forwarding cut that preceded the concurrent VM captures. The
+    /// switch has no durable packet queue: everything before this epoch was
+    /// applied, and frames arriving after it were deliberately dropped while
+    /// guest writers were paused. The receipt preserves that fact rather than
+    /// pretending host Unix-stream handles can be restored.
+    pub(crate) switch: SwitchCheckpointReceipt,
+}
+
+/// A canonical description of the ephemeral L2 state at one checkpoint cut.
+/// `active_ports` and `learned_macs` are diagnostic/rebind evidence only; a
+/// restore always creates fresh listeners and lets the FDB relearn from fresh
+/// guest NIC connections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SwitchCheckpointReceipt {
+    pub(crate) epoch: u64,
+    pub(crate) queued_frames: u64,
+    pub(crate) active_ports: BTreeMap<String, u64>,
+    pub(crate) learned_macs: BTreeMap<String, String>,
+}
+
+/// Durable lifecycle is kept separate from [`WorldAllocationState`] for
+/// compatibility with the original allocation record. Allocation state is
+/// constructed directly by the gateway and switch tests, while lifecycle
+/// transitions are owned by the runtime supervisor through the state APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleState {
     /// No machine records or runtime sockets are expected to be present.
@@ -81,6 +114,15 @@ pub(crate) enum LifecycleState {
     Attached,
     /// Startup completed and the supervisor owns the world lifecycle.
     Running,
+    /// A supervisor has durably declared a checkpoint attempt before freezing
+    /// any machine. A crash here is intentionally retained rather than being
+    /// treated as stale startup state: the source may be stopped with a
+    /// recoverable candidate on disk.
+    Capturing,
+    /// Every configured machine has a committed durable checkpoint receipt.
+    /// The source machine records/disks remain retained for same-lineage
+    /// restore, but no switch runtime is expected to be live.
+    Captured,
 }
 
 impl LifecycleState {
@@ -91,6 +133,8 @@ impl LifecycleState {
             Self::Created => "created",
             Self::Attached => "attached",
             Self::Running => "running",
+            Self::Capturing => "capturing",
+            Self::Captured => "captured",
         }
     }
 
@@ -101,6 +145,8 @@ impl LifecycleState {
             "created" => Some(Self::Created),
             "attached" => Some(Self::Attached),
             "running" => Some(Self::Running),
+            "capturing" => Some(Self::Capturing),
+            "captured" => Some(Self::Captured),
             _ => None,
         }
     }
@@ -109,7 +155,14 @@ impl LifecycleState {
     /// After the per-world lock is acquired, these states therefore require
     /// recovery before a new start can safely proceed.
     pub(crate) fn needs_recovery(self) -> bool {
-        !matches!(self, Self::Absent)
+        !matches!(self, Self::Absent | Self::Capturing | Self::Captured)
+    }
+
+    /// A captured state intentionally retains its stopped machine records and
+    /// allocation receipt. Treating it as stale startup state would destroy the
+    /// only same-lineage restore source for the durable checkpoint.
+    pub(crate) fn retains_checkpoint_sources(self) -> bool {
+        matches!(self, Self::Capturing | Self::Captured)
     }
 }
 
