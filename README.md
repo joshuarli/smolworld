@@ -154,10 +154,13 @@ capture every machine concurrently, seal a world receipt, publish it by rename,
 then retain exactly those machine sources.  `restore` accepts only a receipt
 whose sealed configuration, material lock, allocation, and topology match the
 selected world; it always creates fresh agent and Unix-stream NIC handles.
-`release` is the only normal deletion path for a retained checkpoint.  These
-commands implement a durable same-lineage world artifact, not a Niceforge
-workflow `WorldState`: Niceforge has not yet supplied the lease-fenced lineage
-transaction that makes a captured world a workflow fact.
+`release` is the only normal deletion path for a retained checkpoint. These
+commands implement a durable same-lineage world artifact. Niceforge now
+supplies the separate lease-fenced lineage transaction that makes a captured
+world a workflow fact: its executor gateway records the exact Smolworld
+receipt as a PostgreSQL `WorldState`, and releases that database fact only
+after the host releases the checkpoint. smolworld remains independent of
+those workflow semantics and owns only the local receipt and VM lifecycle.
 
 `ps` reports host lifecycle observations, not service health or readiness:
 `created`, `attached`, `running`, `capturing`, `captured`, and `absent`.
