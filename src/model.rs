@@ -2,6 +2,11 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
+/// On-disk schema for the published world checkpoint receipt. A version bump
+/// is an intentional compatibility boundary: restore and release reject
+/// receipts whose integrity contract they cannot prove.
+pub(crate) const WORLD_CHECKPOINT_RECEIPT_VERSION: u8 = 2;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldConfig {
     pub(crate) name: String,
@@ -73,16 +78,36 @@ pub(crate) struct WorldAllocationState {
 /// without mistaking allocation state for the guest workload state itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldCheckpointReceipt {
+    /// Receipt schema. The version changes when the world-to-machine
+    /// integrity contract changes; older receipts are intentionally not
+    /// accepted by restore or release.
+    pub(crate) schema_version: u8,
     pub(crate) world_name: String,
     pub(crate) config_digest: String,
     pub(crate) material_lock_digest: String,
     pub(crate) allocation: WorldAllocationState,
+    /// One BLAKE3 digest for each opaque smolvm machine receipt. Smolworld
+    /// does not duplicate smolvm's RAM/disk verifier; it binds the exact
+    /// machine receipt that smolvm will verify during restore.
+    pub(crate) machine_receipts: BTreeMap<String, MachineCheckpointReceipt>,
     /// The forwarding cut that preceded the concurrent VM captures. The
     /// switch has no durable packet queue: everything before this epoch was
     /// applied, and frames arriving after it were deliberately dropped while
     /// guest writers were paused. The receipt preserves that fact rather than
     /// pretending host Unix-stream handles can be restored.
     pub(crate) switch: SwitchCheckpointReceipt,
+}
+
+/// Bounded integrity evidence for one smolvm durable machine checkpoint.
+///
+/// The referenced `smolvm-checkpoint.json` is intentionally opaque to
+/// smolworld. Its digest is the narrow ownership bridge: smolworld proves
+/// that the published world still contains the same machine receipt, while
+/// smolvm remains responsible for interpreting and verifying the receipt's
+/// control files, RAM, and disks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MachineCheckpointReceipt {
+    pub(crate) digest: String,
 }
 
 /// A canonical description of the ephemeral L2 state at one checkpoint cut.

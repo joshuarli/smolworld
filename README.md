@@ -361,9 +361,29 @@ The same fixture also exercises a real two-machine durable checkpoint.  It
 writes a workspace marker and a Redis key, checkpoints the active world,
 waits for the original supervisor to exit, restores from the published receipt,
 then proves private DNS, Redis, the workspace, fresh agent/NIC attachment, and
-exact release.  The artifact retains an APFS-backed RAM/disk copy and validates
+exact release. The artifact retains an APFS-backed RAM/disk copy and validates
 its receipt before restore; it does not create a concurrent child or reseed
 guest identity.
+
+The published `smolworld-checkpoint` is receipt schema version 2. In addition
+to the existing world/configuration/material/allocation/switch evidence, it
+contains one BLAKE3 digest for each opaque
+`machines/<name>/smolvm-checkpoint.json` receipt. `restore` and `release`
+recompute those bounded, small receipt digests before launching or deleting
+anything. This closes the smolworld-to-smolvm integrity handoff without
+duplicating smolvm's machine receipt parser: smolvm remains responsible for
+the receipt's control-file hashes and RAM/disk file-identity checks.
+
+This is an integrity anchor, not a host-wide content audit. It does not hash
+large RAM or disk clonefiles, does not prove APFS immutability against a
+privileged host or filesystem rollback, and does not make guest state
+cryptographically trustworthy. A changed or truncated machine receipt is
+rejected; a malicious same-user host with authority to replace both the
+artifact and its world receipt remains inside the local host trust boundary.
+Existing version-1 checkpoint directories are intentionally incompatible with
+this contract and must be recaptured. Niceforge's WorldState receipt shape
+does not change: it continues to retain the checkpoint path and digest as an
+opaque smolworld artifact.
 
 ```bash
 PATH="/opt/homebrew/opt/e2fsprogs/sbin:/opt/homebrew/opt/e2fsprogs/bin:$PATH" \

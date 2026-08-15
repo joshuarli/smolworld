@@ -332,6 +332,70 @@ class ForkWorld:
         required = ["switch-epoch\t", "switch-queue\t0", "machine\trunner\t", "machine\tredis\t"]
         if any(marker not in receipt_text for marker in required):
             raise E2EError(f"checkpoint receipt is missing expected world cut: {receipt_text!r}")
+        machine_receipts = {}
+        for line in receipt_text.splitlines():
+            fields = line.split("\t")
+            if len(fields) == 3 and fields[0] == "machine-receipt":
+                machine_receipts[fields[1]] = fields[2]
+        if set(machine_receipts) != {"runner", "redis"} or any(
+            not digest.startswith("blake3:") or len(digest) != len("blake3:") + 64
+            for digest in machine_receipts.values()
+        ):
+            raise E2EError(
+                "checkpoint receipt does not contain bounded digests for both machine receipts"
+            )
+        for machine in ("runner", "redis"):
+            machine_receipt = (
+                self.checkpoint_root
+                / "machines"
+                / machine
+                / "smolvm-checkpoint.json"
+            )
+            if not machine_receipt.is_file():
+                raise E2EError(f"machine checkpoint receipt is missing: {machine_receipt}")
+
+        # Exercise the recovery guard before any VM is relaunched: changing an
+        # opaque machine receipt must be rejected, while restoring the exact
+        # original bytes must remain possible from the retained source records.
+        runner_machine_receipt = (
+            self.checkpoint_root
+            / "machines"
+            / "runner"
+            / "smolvm-checkpoint.json"
+        )
+        original_machine_receipt = runner_machine_receipt.read_bytes()
+        runner_machine_receipt.write_bytes(original_machine_receipt + b"\n")
+        try:
+            rejected = run(
+                self.smolworld_command(
+                    ["restore", "--checkpoint", str(self.checkpoint_root)]
+                ),
+                self.environment,
+                timeout=60.0,
+                check=False,
+            )
+            if rejected.returncode == 0 or "receipt digest" not in output_text(rejected):
+                raise E2EError(
+                    "restore accepted a tampered world receipt:\n"
+                    + output_text(rejected).strip()
+                )
+            release_rejected = run(
+                self.smolworld_command(
+                    ["release", "--checkpoint", str(self.checkpoint_root)]
+                ),
+                self.environment,
+                timeout=60.0,
+                check=False,
+            )
+            if release_rejected.returncode == 0 or "receipt digest" not in output_text(
+                release_rejected
+            ):
+                raise E2EError(
+                    "release accepted a tampered world receipt:\n"
+                    + output_text(release_rejected).strip()
+                )
+        finally:
+            runner_machine_receipt.write_bytes(original_machine_receipt)
         return elapsed
 
     def release_checkpoint(self) -> None:

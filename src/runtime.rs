@@ -4,8 +4,8 @@ use crate::cli::{
 use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
 use crate::model::{
-    format_mac, Assignment, LifecycleState, MachineLaunch, SeedFile, WorldCheckpointReceipt,
-    WorldConfig,
+    format_mac, Assignment, LifecycleState, MachineCheckpointReceipt, MachineLaunch, SeedFile,
+    WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
     checkpoint_machine, cleanup_machines, create_machine, materialize_external_world, preflight,
@@ -13,14 +13,15 @@ use crate::smolvm::{
     validate_external_world,
 };
 use crate::state::{
-    allocate_v2_allocation_state, digest_file, inspect_v2_recovery, load_v2_allocation_state,
-    load_v2_lifecycle, load_v2_material_lock, load_world_checkpoint_receipt, mark_v2_absent,
-    mark_v2_attached, mark_v2_capture_rolled_back, mark_v2_captured, mark_v2_capturing,
-    mark_v2_created, mark_v2_running, mark_v2_starting, material_lock_resolver_abi,
-    normalize_relative_path, prepare_v2_runtime_dir, remove_v2_runtime_dir,
-    remove_v2_stale_temporary_files, v2_world_paths, write_v2_allocation_state,
-    write_v2_material_lock, write_world_checkpoint_receipt, V2ImageMaterial, V2MaterialLock,
-    V2SeedObservation, V2SmolfileObservation, V2WorldPaths, WorldLock,
+    allocate_v2_allocation_state, digest_file, digest_machine_checkpoint_receipt,
+    inspect_v2_recovery, load_v2_allocation_state, load_v2_lifecycle, load_v2_material_lock,
+    load_world_checkpoint_receipt, mark_v2_absent, mark_v2_attached, mark_v2_capture_rolled_back,
+    mark_v2_captured, mark_v2_capturing, mark_v2_created, mark_v2_running, mark_v2_starting,
+    material_lock_resolver_abi, normalize_relative_path, prepare_v2_runtime_dir,
+    remove_v2_runtime_dir, remove_v2_stale_temporary_files, v2_world_paths,
+    write_v2_allocation_state, write_v2_material_lock, write_world_checkpoint_receipt,
+    V2ImageMaterial, V2MaterialLock, V2SeedObservation, V2SmolfileObservation, V2WorldPaths,
+    WorldLock, MACHINE_CHECKPOINT_RECEIPT_NAME,
 };
 use crate::switch::{
     port_socket_path, print_allocations, run_switch, spawn_port_acceptor, wait_for_attachments,
@@ -165,7 +166,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     let state = load_v2_allocation_state(&paths.state_file)?
         .ok_or_else(|| "captured world has no allocation state".to_string())?;
     let receipt = load_world_checkpoint_receipt(checkpoint)?;
-    verify_world_checkpoint_receipt(&config, &paths, &state, &receipt)?;
+    verify_world_checkpoint_receipt(&config, &paths, &state, checkpoint, &receipt)?;
     remove_v2_stale_temporary_files(&paths)?;
     remove_v2_runtime_dir(&paths)?;
     mark_v2_starting(&paths)?;
@@ -290,6 +291,7 @@ fn verify_world_checkpoint_receipt(
     config: &WorldConfig,
     paths: &V2WorldPaths,
     state: &crate::model::WorldAllocationState,
+    checkpoint: &Path,
     receipt: &WorldCheckpointReceipt,
 ) -> Result<()> {
     if receipt.world_name != config.name {
@@ -314,6 +316,27 @@ fn verify_world_checkpoint_receipt(
         .ne(config.machines.keys())
     {
         return Err("checkpoint machine set does not match the configured world".into());
+    }
+    if receipt.machine_receipts.keys().ne(config.machines.keys()) {
+        return Err("checkpoint machine receipt set does not match the configured world".into());
+    }
+    for name in config.machines.keys() {
+        let receipt_path = checkpoint
+            .join("machines")
+            .join(name)
+            .join(MACHINE_CHECKPOINT_RECEIPT_NAME);
+        let actual = digest_machine_checkpoint_receipt(&receipt_path)
+            .map_err(|error| format!("checkpoint machine '{name}' receipt: {error}"))?;
+        let expected = &receipt
+            .machine_receipts
+            .get(name)
+            .expect("validated machine receipt set")
+            .digest;
+        if actual != *expected {
+            return Err(format!(
+                "checkpoint machine '{name}' receipt digest does not match the world receipt"
+            ));
+        }
     }
     Ok(())
 }
@@ -342,7 +365,7 @@ pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
     let state = load_v2_allocation_state(&paths.state_file)?
         .ok_or_else(|| "captured world has no allocation state".to_string())?;
     let receipt = load_world_checkpoint_receipt(checkpoint)?;
-    verify_world_checkpoint_receipt(&config, &paths, &state, &receipt)?;
+    verify_world_checkpoint_receipt(&config, &paths, &state, checkpoint, &receipt)?;
     let metadata = fs::symlink_metadata(checkpoint)
         .map_err(|error| format!("inspect checkpoint root {}: {error}", checkpoint.display()))?;
     if !metadata.file_type().is_dir() {
@@ -743,11 +766,34 @@ fn checkpoint_running_world(
         );
     }
 
+    let machine_receipts = match names
+        .iter()
+        .map(|name| {
+            let path = machines_root
+                .join(name)
+                .join(MACHINE_CHECKPOINT_RECEIPT_NAME);
+            digest_machine_checkpoint_receipt(&path)
+                .map(|digest| (name.clone(), MachineCheckpointReceipt { digest }))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()
+    {
+        Ok(receipts) => receipts,
+        Err(error) => {
+            return rollback_world_checkpoint(
+                &rollback,
+                &completed,
+                format!("inspect captured machine receipts: {error}"),
+            )
+        }
+    };
+
     let receipt = WorldCheckpointReceipt {
+        schema_version: WORLD_CHECKPOINT_RECEIPT_VERSION,
         world_name: config.name.clone(),
         config_digest: digest_file(&paths.canonical_config)?,
         material_lock_digest: digest_file(&paths.material_lock_path())?,
         allocation: state.clone(),
+        machine_receipts,
         switch,
     };
     if let Err(error) = write_world_checkpoint_receipt(&staging, &receipt) {

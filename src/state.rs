@@ -1,14 +1,14 @@
 use crate::config::validate_label;
 use crate::model::{
     format_mac, gateway_mac, ArtifactState, Assignment, LifecycleMetadata, LifecycleState,
-    RecoveryStatus, SwitchCheckpointReceipt, WorldAllocationState, WorldCheckpointReceipt,
-    WorldConfig,
+    MachineCheckpointReceipt, RecoveryStatus, SwitchCheckpointReceipt, WorldAllocationState,
+    WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::Result;
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,9 @@ const V2_STATE_VERSION: u8 = 2;
 const V2_LIFECYCLE_VERSION: u8 = 2;
 const MATERIAL_LOCK_VERSION: u8 = 5;
 const MATERIAL_LOCK_RESOLVER_ABI: &str = "smolvm-external-world/v3";
-const WORLD_CHECKPOINT_RECEIPT_VERSION: u8 = 1;
 const WORLD_CHECKPOINT_RECEIPT_NAME: &str = "smolworld-checkpoint";
+pub(crate) const MACHINE_CHECKPOINT_RECEIPT_NAME: &str = "smolvm-checkpoint.json";
+const MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 /// Paths owned by the v2 materializer.  The explicit `v2` component is an
 /// ownership boundary: v2 never reads, adopts, or removes the pre-switch
@@ -270,6 +271,56 @@ pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
 
 pub(crate) fn digest_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(digest_bytes(&bytes))
+}
+
+/// Hash the small receipt that smolvm publishes beside each durable machine
+/// checkpoint. This is deliberately bounded: the world receipt anchors the
+/// opaque machine receipt, while smolvm owns the potentially large RAM/disk
+/// file integrity checks described by that receipt.
+pub(crate) fn digest_machine_checkpoint_receipt(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect machine checkpoint receipt {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "machine checkpoint receipt is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() > MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES {
+        return Err(format!(
+            "machine checkpoint receipt is larger than {} bytes: {}",
+            MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES,
+            path.display()
+        ));
+    }
+    let mut file = File::open(path).map_err(|error| {
+        format!(
+            "open machine checkpoint receipt {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            format!(
+                "read machine checkpoint receipt {}: {error}",
+                path.display()
+            )
+        })?;
+    if bytes.len() as u64 > MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES {
+        return Err(format!(
+            "machine checkpoint receipt grew beyond {} bytes: {}",
+            MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES,
+            path.display()
+        ));
+    }
     Ok(digest_bytes(&bytes))
 }
 
@@ -1159,6 +1210,12 @@ pub(crate) fn load_world_checkpoint_receipt(root: &Path) -> Result<WorldCheckpoi
 }
 
 fn validate_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Result<()> {
+    if receipt.schema_version != WORLD_CHECKPOINT_RECEIPT_VERSION {
+        return Err(format!(
+            "world checkpoint receipt schema {} is not supported; expected {}",
+            receipt.schema_version, WORLD_CHECKPOINT_RECEIPT_VERSION
+        ));
+    }
     validate_label(&receipt.world_name).map_err(|reason| {
         format!(
             "world checkpoint receipt world '{}': {reason}",
@@ -1187,6 +1244,23 @@ fn validate_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Result
                 "world checkpoint receipt has invalid or repeated allocation for '{machine}'"
             ));
         }
+    }
+    if receipt
+        .machine_receipts
+        .keys()
+        .ne(receipt.allocation.assignments.keys())
+    {
+        return Err(
+            "world checkpoint receipt machine receipt set does not match allocations".into(),
+        );
+    }
+    for (machine, machine_receipt) in &receipt.machine_receipts {
+        validate_label(machine)
+            .map_err(|reason| format!("world checkpoint machine receipt '{machine}': {reason}"))?;
+        validate_blake3_digest(
+            &machine_receipt.digest,
+            &format!("world checkpoint machine receipt '{machine}' digest"),
+        )?;
     }
     if receipt.switch.queued_frames != 0 {
         return Err("world checkpoint receipt cannot retain switch packet queues".into());
@@ -1237,6 +1311,12 @@ fn serialize_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Strin
             assignment.smolvm_name
         ));
     }
+    for (machine, machine_receipt) in &receipt.machine_receipts {
+        output.push_str(&format!(
+            "machine-receipt\t{machine}\t{}\n",
+            machine_receipt.digest
+        ));
+    }
     output
 }
 
@@ -1251,6 +1331,7 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
     let mut active_ports = BTreeMap::new();
     let mut learned_macs = BTreeMap::new();
     let mut assignments = BTreeMap::new();
+    let mut machine_receipts = BTreeMap::new();
     for line in content.lines() {
         if line.is_empty() {
             continue;
@@ -1345,6 +1426,24 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
                     ));
                 }
             }
+            ["machine-receipt", machine, digest] => {
+                validate_label(machine).map_err(|reason| {
+                    format!("world checkpoint receipt machine '{machine}': {reason}")
+                })?;
+                if machine_receipts
+                    .insert(
+                        (*machine).to_string(),
+                        MachineCheckpointReceipt {
+                            digest: (*digest).to_string(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(format!(
+                        "world checkpoint receipt repeats machine receipt '{machine}'"
+                    ));
+                }
+            }
             _ => {
                 return Err("world checkpoint receipt contains an unknown or malformed line".into())
             }
@@ -1356,6 +1455,7 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
         ));
     }
     let receipt = WorldCheckpointReceipt {
+        schema_version: WORLD_CHECKPOINT_RECEIPT_VERSION,
         world_name: world_name
             .ok_or_else(|| "world checkpoint receipt is missing world".to_string())?,
         config_digest: config_digest
@@ -1366,6 +1466,7 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
             seed: seed.ok_or_else(|| "world checkpoint receipt is missing seed".to_string())?,
             assignments,
         },
+        machine_receipts,
         switch: SwitchCheckpointReceipt {
             epoch: switch_epoch
                 .ok_or_else(|| "world checkpoint receipt is missing switch epoch".to_string())?,
@@ -1690,6 +1791,7 @@ mod tests {
         let checkpoint = world.root.join("checkpoint");
         fs::create_dir(&checkpoint).unwrap();
         let receipt = WorldCheckpointReceipt {
+            schema_version: WORLD_CHECKPOINT_RECEIPT_VERSION,
             world_name: "sentry".to_string(),
             config_digest: digest_bytes(b"world config"),
             material_lock_digest: digest_bytes(b"prepared material"),
@@ -1704,6 +1806,12 @@ mod tests {
                     },
                 )]),
             },
+            machine_receipts: BTreeMap::from([(
+                "runner".to_string(),
+                MachineCheckpointReceipt {
+                    digest: digest_bytes(b"smolvm machine receipt"),
+                },
+            )]),
             switch: SwitchCheckpointReceipt {
                 epoch: 7,
                 queued_frames: 0,
@@ -1719,7 +1827,43 @@ mod tests {
 
         assert_eq!(load_world_checkpoint_receipt(&checkpoint).unwrap(), receipt);
         let serialized = fs::read_to_string(world_checkpoint_receipt_path(&checkpoint)).unwrap();
-        assert!(serialized.starts_with("version\t1\nworld\tsentry\n"));
+        assert!(serialized.starts_with("version\t2\nworld\tsentry\n"));
+        assert!(serialized.contains("machine-receipt\trunner\tblake3:"));
+
+        fs::write(
+            world_checkpoint_receipt_path(&checkpoint),
+            serialized.replacen("version\t2", "version\t1", 1),
+        )
+        .unwrap();
+        assert!(load_world_checkpoint_receipt(&checkpoint)
+            .unwrap_err()
+            .contains("not version 2"));
+    }
+
+    #[test]
+    fn machine_checkpoint_receipt_digest_is_bounded_and_rejects_symlinks() {
+        let world = TemporaryWorld::new();
+        let receipt = world.root.join(MACHINE_CHECKPOINT_RECEIPT_NAME);
+        fs::write(&receipt, b"{}\n").unwrap();
+        assert_eq!(
+            digest_machine_checkpoint_receipt(&receipt).unwrap(),
+            digest_bytes(b"{}\n")
+        );
+
+        let link = world.root.join("receipt-link");
+        std::os::unix::fs::symlink(&receipt, &link).unwrap();
+        assert!(digest_machine_checkpoint_receipt(&link)
+            .unwrap_err()
+            .contains("not a regular file"));
+
+        fs::write(
+            &receipt,
+            vec![0_u8; (MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(digest_machine_checkpoint_receipt(&receipt)
+            .unwrap_err()
+            .contains("larger than"));
     }
 
     #[test]
