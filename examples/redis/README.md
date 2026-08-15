@@ -18,7 +18,7 @@ not created by the test and the foundation gate never invokes `docker`,
 `docker compose`, `orbctl`, or a Docker socket. Supply an already prepared
 archive at this path, or set `SMOLWORLD_REDIS_ARCHIVE` when running the opt-in
 integration harness. Image preparation is the separate `smolworld prepare`
-boundary described in `NOICEFORGE.md`.
+boundary described in the repository's `AGENTS.md` contract.
 
 The expected lifecycle is:
 
