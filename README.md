@@ -121,6 +121,7 @@ smolworld prepare [-f PATH]                Resolve and seal local material.
 smolworld check [-f PATH]                  Validate the prepared world read-only.
 smolworld up [-f PATH]                     Start the world in the foreground.
 smolworld ps [-f PATH] [--json]            Show machine lifecycle observations.
+smolworld metrics [-f PATH] --json         Show host-side machine metrics.
 smolworld exec [-f PATH] MACHINE [--secret-env GUEST=HOST_ENV]... -- CMD
                                             Run CMD in a started machine.
 smolworld checkpoint [-f PATH] --output DIR
@@ -132,6 +133,40 @@ smolworld release [-f PATH] --checkpoint DIR
                                             Delete exactly a retained world.
 smolworld down [-f PATH]                   Stop and delete this world's machines.
 ```
+
+`metrics --json` is read-only. It emits a closed `schemaVersion: 1` object with
+one row per configured world machine. A row is collected only when the v2
+allocation state contains that machine's recorded `smw-v2-*` identity; the
+command never lists or discovers unrelated smolvm machines.
+
+```json
+{
+  "schemaVersion": 1,
+  "world": "redis-foundation",
+  "machines": [
+    {
+      "machine": "runner",
+      "smolvmName": "smw-v2-0123456789ab-fedcba987654",
+      "state": "running",
+      "pid": 12345,
+      "cpus": 2,
+      "memoryMb": 1024,
+      "storageGb": 20,
+      "overlayGb": 2,
+      "cpuSeconds": 12,
+      "cpuMillis": 12345,
+      "rssMb": 384,
+      "diskUsedMb": 96
+    }
+  ]
+}
+```
+
+The actual `smolvmName` is deterministic but world-specific; the example is
+illustrative. All row fields are always present. Unallocated machines and
+unavailable observations use `null` for the affected fields. CPU and RSS are
+host VMM measurements, and disk is host data-directory usage; none represent
+guest-process or guest-filesystem telemetry.
 
 The default configuration is `.smolworld` in the current directory. `-f` and
 `--file` select another path and may appear before or after the command.

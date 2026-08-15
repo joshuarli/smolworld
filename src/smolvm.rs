@@ -31,8 +31,126 @@ pub(crate) struct PreparedExternalWorldSmolfile {
     pub(crate) source_digest: String,
 }
 
+/// Closed metrics record returned by the companion smolvm subprocess.
+///
+/// The public `smolvm machine stats --json` command is intended for operators;
+/// smolworld consumes the same record through the versioned TSV form so this
+/// crate does not need a general-purpose JSON dependency or parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MachineStats {
+    pub(crate) name: String,
+    pub(crate) state: String,
+    pub(crate) pid: Option<i32>,
+    pub(crate) cpus: u8,
+    pub(crate) memory_mb: u32,
+    pub(crate) storage_gb: u64,
+    pub(crate) overlay_gb: u64,
+    pub(crate) cpu_seconds: Option<u64>,
+    pub(crate) cpu_millis: Option<u64>,
+    pub(crate) rss_mb: Option<u64>,
+    pub(crate) disk_used_mb: Option<u64>,
+}
+
 const EXTERNAL_WORLD_TSV_ABI: &str = "external-world-v3";
 const EXTERNAL_WORLD_PREPARE_TSV_ABI: &str = "external-world-prepare-v2";
+const MACHINE_STATS_TSV_ABI: &str = "machine-stats-v1";
+
+/// Collect one exact recorded smolvm machine through the read-only stats
+/// subprocess boundary. The caller is responsible for proving that `name` is
+/// a v2 world identity before invoking this function.
+pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
+    let output = Command::new(smolvm)
+        .args(["machine", "stats", "--name", name, "--format", "tsv"])
+        .output()
+        .map_err(|error| format!("run smolvm machine stats {name}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "smolvm machine stats {name} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "smolvm machine stats emitted non-UTF-8 output".to_string())?;
+    parse_machine_stats_tsv(stdout, name)
+}
+
+fn parse_machine_stats_tsv(output: &str, expected_name: &str) -> Result<MachineStats> {
+    let record = output.strip_suffix('\n').ok_or_else(|| {
+        "smolvm machine stats must emit exactly one newline-terminated record".to_string()
+    })?;
+    if record.contains(['\n', '\r']) {
+        return Err("smolvm machine stats emitted more than one record".into());
+    }
+    let fields: Vec<_> = record.split('\t').collect();
+    if fields.len() != 12 {
+        return Err(format!(
+            "smolvm machine stats returned {} TSV fields, expected 12",
+            fields.len()
+        ));
+    }
+    let [abi, name, state, pid, cpus, memory_mb, storage_gb, overlay_gb, cpu_seconds, cpu_millis, rss_mb, disk_used_mb]: [&str; 12] =
+        fields.try_into().expect("field count checked above");
+    if abi != MACHINE_STATS_TSV_ABI {
+        return Err(format!("unsupported smolvm machine stats ABI '{abi}'"));
+    }
+    if name != expected_name {
+        return Err(format!(
+            "smolvm machine stats returned machine '{name}', expected '{expected_name}'"
+        ));
+    }
+    if !matches!(
+        state,
+        "created" | "running" | "stopped" | "failed" | "unreachable" | "frozen"
+    ) {
+        return Err(format!(
+            "smolvm machine stats returned unknown state '{state}'"
+        ));
+    }
+    Ok(MachineStats {
+        name: name.to_string(),
+        state: state.to_string(),
+        pid: parse_optional_i32(pid, "pid")?,
+        cpus: cpus
+            .parse()
+            .map_err(|_| "smolvm machine stats returned invalid cpus".to_string())?,
+        memory_mb: memory_mb
+            .parse()
+            .map_err(|_| "smolvm machine stats returned invalid memory_mb".to_string())?,
+        storage_gb: storage_gb
+            .parse()
+            .map_err(|_| "smolvm machine stats returned invalid storage_gb".to_string())?,
+        overlay_gb: overlay_gb
+            .parse()
+            .map_err(|_| "smolvm machine stats returned invalid overlay_gb".to_string())?,
+        cpu_seconds: parse_optional_u64(cpu_seconds, "cpu_seconds")?,
+        cpu_millis: parse_optional_u64(cpu_millis, "cpu_millis")?,
+        rss_mb: parse_optional_u64(rss_mb, "rss_mb")?,
+        disk_used_mb: parse_optional_u64(disk_used_mb, "disk_used_mb")?,
+    })
+}
+
+fn parse_optional_i32(value: &str, field: &str) -> Result<Option<i32>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("smolvm machine stats returned invalid {field}"))
+    }
+}
+
+fn parse_optional_u64(value: &str, field: &str) -> Result<Option<u64>> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("smolvm machine stats returned invalid {field}"))
+    }
+}
 
 /// Invoke the only mutating Smolfile image boundary. smolvm owns registry
 /// protocol and archive construction; smolworld consumes only the versioned
@@ -817,6 +935,42 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("invalid local archive digest"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn machine_stats_tsv_accepts_the_closed_versioned_record() {
+        let output =
+            "machine-stats-v1\tsmw-v2-demo-runner\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        let stats = parse_machine_stats_tsv(output, "smw-v2-demo-runner").unwrap();
+        assert_eq!(stats.name, "smw-v2-demo-runner");
+        assert_eq!(stats.state, "running");
+        assert_eq!(stats.pid, Some(42));
+        assert_eq!(stats.cpus, 4);
+        assert_eq!(stats.memory_mb, 4096);
+        assert_eq!(stats.cpu_millis, Some(2345));
+        assert_eq!(stats.rss_mb, Some(128));
+        assert_eq!(stats.disk_used_mb, Some(64));
+    }
+
+    #[test]
+    fn machine_stats_tsv_rejects_wrong_identity_and_shape() {
+        let wrong_name =
+            "machine-stats-v1\tsmw-v2-other\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        assert!(parse_machine_stats_tsv(wrong_name, "smw-v2-demo-runner")
+            .unwrap_err()
+            .contains("expected 'smw-v2-demo-runner'"));
+
+        let unknown_state =
+            "machine-stats-v1\tsmw-v2-demo-runner\tunknown\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        assert!(parse_machine_stats_tsv(unknown_state, "smw-v2-demo-runner")
+            .unwrap_err()
+            .contains("unknown state"));
+
+        assert!(
+            parse_machine_stats_tsv("machine-stats-v1\ttoo-short\n", "too-short")
+                .unwrap_err()
+                .contains("expected 12")
+        );
     }
 
     fn temporary_test_directory() -> PathBuf {

@@ -131,6 +131,10 @@ pub(crate) enum Cli {
         config: PathBuf,
         format: PsFormat,
     },
+    /// Collect host-side metrics for the recorded v2 world machines.
+    Metrics {
+        config: PathBuf,
+    },
     Exec {
         config: PathBuf,
         machine: String,
@@ -190,6 +194,10 @@ pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     config: options.config,
                     format: options.format,
                 });
+            }
+            "metrics" => {
+                let config = parse_metrics_options(config, &args[index + 1..])?;
+                return Ok(Cli::Metrics { config });
             }
             "exec" => {
                 let mut rest = &args[index + 1..];
@@ -370,6 +378,55 @@ pub(crate) fn ps_usage() -> &'static str {
     "usage: smolworld ps [-f PATH] [--json]"
 }
 
+/// Parse the closed metrics command. The JSON flag is explicit so callers do
+/// not accidentally consume a future human-readable presentation as a stable
+/// machine contract.
+pub(crate) fn parse_metrics_options(config: PathBuf, rest: &[String]) -> Result<PathBuf> {
+    let mut config = config;
+    let mut file_seen = false;
+    let mut json_seen = false;
+    let mut index = 0;
+
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "-f" | "--file" => {
+                if file_seen {
+                    return Err("metrics accepts -f/--file at most once".into());
+                }
+                let Some(path) = rest.get(index + 1) else {
+                    return Err("metrics -f/--file requires a path".into());
+                };
+                config = PathBuf::from(path);
+                file_seen = true;
+                index += 2;
+            }
+            "--json" => {
+                if json_seen {
+                    return Err("metrics accepts --json at most once".into());
+                }
+                json_seen = true;
+                index += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown metrics option '{other}'\n{}",
+                    metrics_usage()
+                ))
+            }
+        }
+    }
+
+    if json_seen {
+        Ok(config)
+    } else {
+        Err(metrics_usage().into())
+    }
+}
+
+pub(crate) fn metrics_usage() -> &'static str {
+    "usage: smolworld metrics [-f PATH] --json"
+}
+
 /// Format machine rows without adding a trailing newline.
 pub(crate) fn format_ps(format: PsFormat, machines: &[MachineStatus]) -> String {
     match format {
@@ -413,6 +470,86 @@ pub(crate) fn format_ps_json(machines: &[MachineStatus]) -> String {
     output
 }
 
+/// One row in the closed `metrics --json` world schema.
+///
+/// `None` is rendered as JSON `null`; the field set is intentionally fixed so
+/// consumers can distinguish an absent/unallocated machine from a machine
+/// whose observation is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MachineMetrics {
+    pub(crate) machine: String,
+    pub(crate) smolvm_name: Option<String>,
+    pub(crate) state: String,
+    pub(crate) pid: Option<i32>,
+    pub(crate) cpus: Option<u8>,
+    pub(crate) memory_mb: Option<u32>,
+    pub(crate) storage_gb: Option<u64>,
+    pub(crate) overlay_gb: Option<u64>,
+    pub(crate) cpu_seconds: Option<u64>,
+    pub(crate) cpu_millis: Option<u64>,
+    pub(crate) rss_mb: Option<u64>,
+    pub(crate) disk_used_mb: Option<u64>,
+}
+
+pub(crate) fn format_metrics_json(world: &str, machines: &[MachineMetrics]) -> String {
+    let mut output = String::from("{\"schemaVersion\":1,\"world\":");
+    push_json_string(&mut output, world);
+    output.push_str(",\"machines\":[");
+    for (index, machine) in machines.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push_str("{\"machine\":");
+        push_json_string(&mut output, &machine.machine);
+        output.push_str(",\"smolvmName\":");
+        push_json_optional_string(&mut output, machine.smolvm_name.as_deref());
+        output.push_str(",\"state\":");
+        push_json_string(&mut output, &machine.state);
+        output.push_str(",\"pid\":");
+        push_json_optional_i32(&mut output, machine.pid);
+        output.push_str(",\"cpus\":");
+        push_json_optional_u64(&mut output, machine.cpus.map(u64::from));
+        output.push_str(",\"memoryMb\":");
+        push_json_optional_u64(&mut output, machine.memory_mb.map(u64::from));
+        output.push_str(",\"storageGb\":");
+        push_json_optional_u64(&mut output, machine.storage_gb);
+        output.push_str(",\"overlayGb\":");
+        push_json_optional_u64(&mut output, machine.overlay_gb);
+        output.push_str(",\"cpuSeconds\":");
+        push_json_optional_u64(&mut output, machine.cpu_seconds);
+        output.push_str(",\"cpuMillis\":");
+        push_json_optional_u64(&mut output, machine.cpu_millis);
+        output.push_str(",\"rssMb\":");
+        push_json_optional_u64(&mut output, machine.rss_mb);
+        output.push_str(",\"diskUsedMb\":");
+        push_json_optional_u64(&mut output, machine.disk_used_mb);
+        output.push('}');
+    }
+    output.push_str("]}");
+    output
+}
+
+fn push_json_optional_string(output: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => push_json_string(output, value),
+        None => output.push_str("null"),
+    }
+}
+
+fn push_json_optional_i32(output: &mut String, value: Option<i32>) {
+    match value {
+        Some(value) => output.push_str(&value.to_string()),
+        None => output.push_str("null"),
+    }
+}
+
+fn push_json_optional_u64(output: &mut String, value: Option<u64>) {
+    match value {
+        Some(value) => output.push_str(&value.to_string()),
+        None => output.push_str("null"),
+    }
+}
+
 fn push_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
@@ -434,7 +571,7 @@ fn push_json_string(output: &mut String, value: &str) {
 }
 
 pub(crate) fn usage() -> &'static str {
-    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld [-f .smolworld] exec MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
+    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps|metrics>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld metrics [-f PATH] --json\n       smolworld [-f .smolworld] exec MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
 }
 
 #[cfg(test)]
@@ -614,6 +751,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_metrics_json_and_file_in_either_order() {
+        assert!(matches!(
+            parse_cli(vec![
+                "metrics".into(),
+                "--json".into(),
+                "--file".into(),
+                "world.smolworld".into(),
+            ])
+            .unwrap(),
+            Cli::Metrics { config } if config == PathBuf::from("world.smolworld")
+        ));
+        assert!(matches!(
+            parse_cli(vec![
+                "-f".into(),
+                "world.smolworld".into(),
+                "metrics".into(),
+                "--json".into(),
+            ])
+            .unwrap(),
+            Cli::Metrics { config } if config == PathBuf::from("world.smolworld")
+        ));
+        assert_eq!(
+            parse_cli(vec!["metrics".into()]).err().as_deref(),
+            Some(metrics_usage())
+        );
+        assert!(parse_cli(vec!["metrics".into(), "--json".into(), "--json".into(),]).is_err());
+    }
+
+    #[test]
     fn rejects_invalid_ps_options() {
         assert_eq!(
             parse_ps_options(PathBuf::from("world"), &["--json".into(), "--json".into()])
@@ -700,6 +866,28 @@ mod tests {
         assert_eq!(
             format_ps(PsFormat::Json, &escaped),
             "[{\"machine\":\"a\\\"b\",\"ip\":\"line\\nvalue\",\"mac\":\"slash\\\\value\",\"status\":\"created\"}]"
+        );
+    }
+
+    #[test]
+    fn formats_metrics_as_a_closed_schema_with_nulls() {
+        let machines = vec![MachineMetrics {
+            machine: "runner".into(),
+            smolvm_name: Some("smw-v2-demo-runner".into()),
+            state: "running".into(),
+            pid: Some(42),
+            cpus: Some(4),
+            memory_mb: Some(4096),
+            storage_gb: Some(20),
+            overlay_gb: Some(4),
+            cpu_seconds: Some(2),
+            cpu_millis: Some(2345),
+            rss_mb: Some(128),
+            disk_used_mb: None,
+        }];
+        assert_eq!(
+            format_metrics_json("demo", &machines),
+            "{\"schemaVersion\":1,\"world\":\"demo\",\"machines\":[{\"machine\":\"runner\",\"smolvmName\":\"smw-v2-demo-runner\",\"state\":\"running\",\"pid\":42,\"cpus\":4,\"memoryMb\":4096,\"storageGb\":20,\"overlayGb\":4,\"cpuSeconds\":2,\"cpuMillis\":2345,\"rssMb\":128,\"diskUsedMb\":null}]}"
         );
     }
 }

@@ -1,5 +1,6 @@
 use crate::cli::{
-    format_ps, Cli, LifecycleState as DisplayLifecycleState, MachineStatus, PsFormat,
+    format_metrics_json, format_ps, Cli, LifecycleState as DisplayLifecycleState, MachineMetrics,
+    MachineStatus, PsFormat,
 };
 use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
@@ -8,9 +9,9 @@ use crate::model::{
     WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
-    checkpoint_machine, cleanup_machines, create_machine, materialize_external_world, preflight,
-    release_machines, restore_machine, smolvm_program, start_machine, status_result, stop_machines,
-    validate_external_world,
+    checkpoint_machine, cleanup_machines, create_machine, machine_stats,
+    materialize_external_world, preflight, release_machines, restore_machine, smolvm_program,
+    start_machine, status_result, stop_machines, validate_external_world, MachineStats,
 };
 use crate::state::{
     allocate_v2_allocation_state, digest_file, digest_machine_checkpoint_receipt,
@@ -67,6 +68,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Cli::Release { config, checkpoint } => release(&config, &checkpoint),
         Cli::Down { config } => down(&config),
         Cli::Ps { config, format } => ps(&config, format),
+        Cli::Metrics { config } => metrics(&config),
         Cli::Help => {
             println!("{}", crate::cli::usage());
             Ok(())
@@ -1068,6 +1070,77 @@ pub(crate) fn ps(config_path: &Path, format: PsFormat) -> Result<()> {
     Ok(())
 }
 
+/// Collect read-only host metrics for exactly the configured machines with
+/// recorded v2 allocations. The state file is the identity boundary: this
+/// command never lists or discovers unrelated smolvm records.
+pub(crate) fn metrics(config_path: &Path) -> Result<()> {
+    let config = load_config(config_path)?;
+    let paths = v2_world_paths(config_path)?;
+    let state = load_v2_allocation_state(&paths.state_file)?;
+    let smolvm = smolvm_program();
+    let mut machines = Vec::new();
+
+    for machine in config.machines.keys() {
+        let Some(assignment) = state
+            .as_ref()
+            .and_then(|state| state.assignments.get(machine))
+        else {
+            machines.push(MachineMetrics {
+                machine: machine.clone(),
+                smolvm_name: None,
+                state: "absent".into(),
+                pid: None,
+                cpus: None,
+                memory_mb: None,
+                storage_gb: None,
+                overlay_gb: None,
+                cpu_seconds: None,
+                cpu_millis: None,
+                rss_mb: None,
+                disk_used_mb: None,
+            });
+            continue;
+        };
+
+        require_v2_machine_identity(machine, &assignment.smolvm_name)?;
+        let stats = machine_stats(&smolvm, &assignment.smolvm_name)?;
+        machines.push(machine_metrics(machine, &stats));
+    }
+
+    println!("{}", format_metrics_json(&config.name, &machines));
+    Ok(())
+}
+
+fn require_v2_machine_identity(machine: &str, smolvm_name: &str) -> Result<()> {
+    if smolvm_name.starts_with("smw-v2-")
+        && !smolvm_name.contains(['\t', '\r', '\n'])
+        && !smolvm_name.contains('/')
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "world machine '{machine}' has non-v2 smolvm identity '{smolvm_name}'"
+        ))
+    }
+}
+
+fn machine_metrics(machine: &str, stats: &MachineStats) -> MachineMetrics {
+    MachineMetrics {
+        machine: machine.to_string(),
+        smolvm_name: Some(stats.name.clone()),
+        state: stats.state.clone(),
+        pid: stats.pid,
+        cpus: Some(stats.cpus),
+        memory_mb: Some(stats.memory_mb),
+        storage_gb: Some(stats.storage_gb),
+        overlay_gb: Some(stats.overlay_gb),
+        cpu_seconds: stats.cpu_seconds,
+        cpu_millis: stats.cpu_millis,
+        rss_mb: stats.rss_mb,
+        disk_used_mb: stats.disk_used_mb,
+    }
+}
+
 fn machine_status(smolvm: &Path, name: &str) -> Result<Option<&'static str>> {
     let output = Command::new(smolvm)
         .args(["machine", "status", "--name", name])
@@ -1647,5 +1720,45 @@ mod tests {
                 "expected invalid copy endpoint {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_accepts_only_recorded_v2_machine_identities() {
+        assert!(require_v2_machine_identity("runner", "smw-v2-abcdef-0123").is_ok());
+        for invalid in [
+            "runner",
+            "smolvm-runner",
+            "smw-v1-abcdef-0123",
+            "smw-v2-/runner",
+            "smw-v2-runner\tother",
+        ] {
+            assert!(
+                require_v2_machine_identity("runner", invalid).is_err(),
+                "expected non-v2 identity to be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_maps_the_companion_record_without_reinterpreting_it() {
+        let stats = MachineStats {
+            name: "smw-v2-demo-runner".into(),
+            state: "running".into(),
+            pid: Some(42),
+            cpus: 4,
+            memory_mb: 4096,
+            storage_gb: 20,
+            overlay_gb: 4,
+            cpu_seconds: Some(2),
+            cpu_millis: Some(2345),
+            rss_mb: Some(128),
+            disk_used_mb: Some(64),
+        };
+        let metrics = machine_metrics("runner", &stats);
+        assert_eq!(metrics.machine, "runner");
+        assert_eq!(metrics.smolvm_name.as_deref(), Some("smw-v2-demo-runner"));
+        assert_eq!(metrics.cpu_millis, Some(2345));
+        assert_eq!(metrics.rss_mb, Some(128));
+        assert_eq!(metrics.disk_used_mb, Some(64));
     }
 }
