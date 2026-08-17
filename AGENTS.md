@@ -4,8 +4,8 @@
 
 `smolworld` is a local macOS/Apple-Silicon runner for a small, statically
 provisioned group of smolvm machines. A world is described by one `.smolworld`
-file and runs on a private userspace Ethernet segment. It is a substrate for
-Niceforge's durable workflow/world control plane, not the control plane itself.
+file and runs on a private userspace Ethernet segment. It is an independent
+substrate that higher-level tools may use without changing its world contract.
 
 The product boundary is deliberately small:
 
@@ -289,11 +289,9 @@ receipt whose configuration, material lock, allocation, and topology match the
 selected world; it creates fresh agent and Unix-stream NIC handles. `release`
 is the normal deletion path for a retained checkpoint.
 
-The receipt is a durable same-lineage world artifact, not automatically a
-Niceforge workflow fact. Niceforge separately records a lease-fenced
-PostgreSQL `WorldState` and exact receipt, and releases that database fact only
-after the host releases the checkpoint. smolworld remains independent of
-Niceforge workflow semantics.
+The receipt is a durable same-lineage world artifact. Higher-level systems may
+record or reference it, but smolworld does not define their workflow, lease, or
+state semantics.
 
 A checkpoint is one coherent temporal cut across all machines and the switch:
 
@@ -322,174 +320,12 @@ content audit or a cryptographic claim about guest state. Receipt schema
 changes are intentionally incompatible unless a migration/re-capture contract
 is defined.
 
-## Durable world model and state logistics
+## External integration boundary
 
-The world graph keeps these objects distinct:
-
-```text
-WorldState       immutable logical state, content-addressed by canonical manifest
-WorldTransition  parents + delta + actor/objective/provenance -> child state
-Evaluation       state + evaluator + result + evidence + uncertainty
-WorldCheckpoint  state + materializer ABI + disposable acceleration artifact
-WorldRun         one mutable execution instantiated from a WorldState
-```
-
-A state is not a machine, and a run is not durable state. State identity must
-not include the transition that produced it, an evaluation that inspected it,
-or a host checkpoint path. Independent transitions may produce one
-byte-identical state while retaining distinct transition records.
-
-The semantic state is a canonical manifest over named channels such as:
-
-```text
-source/checkout       Merkle or equivalent source receipt
-source/world          canonical .smolworld + lock identity
-materials/images      immutable material receipts
-topology/services     machine and network manifest
-workspace/runner      workspace state receipt
-nondeterminism/input  captured external observations
-lineage               parent state references
-```
-
-Every semantically relevant input must be immutable, deterministically
-derivable, or explicitly captured as nondeterministic evidence. VM disks, RAM
-images, package caches, compiler outputs, clonefiles, worktrees, and page
-caches are materializations or acceleration inputs. They may be discarded and
-regenerated without losing logical state. A checkpoint must never become the
-sole source of a semantically required dependency.
-
-State logistics is a separate layer from world lifecycle and from the VMM:
-
-```text
-World API / DAG: state, fork, checkpoint, reset, lineage, GC
-State logistics: manifests/CAS, memory and disk deltas, lazy materialization,
-                 prefetch, deduplication, locality, leases, GC, identity reseed
-World runtime:  topology, switch, DNS, lifecycle, checkpoint barrier
-smolvm:         VM lifecycle and guest interaction
-libkrun:        VMM and virtual-device state seam
-```
-
-The reusable index must be content-addressed and host-aware. It should be
-implemented as a separate logical-world materialization index; run-scoped
-`world_states` remain workflow recovery records, not a cache. A physical
-materialization may serve multiple logical states only through explicit
-immutable references. Leases protect materializations during use; pins are
-durable GC roots; cleanup removes only unreachable, unpinned records.
-
-The first storage implementation may use eager immutable directories and
-filesystem CAS. Keep the logical manifest independent so parent-plus-delta
-storage, dirty-page tracking, APFS clone acceleration, checkpoint flattening,
-and bounded chain compaction remain replaceable implementation details.
-
-The memory, disk, and device timelines must remain coherent. If incremental
-dirty tracking is added, both guest CPU writes and virtio/DMA writes must feed
-the same dirty set. Host handles are rebound on restore; they are never
-serialized into state. Concurrent descendants must reseed static IPv4, MAC,
-machine identity, entropy, and guest credentials. New socket paths alone do
-not make a valid identity fork.
-
-The core operations are conceptually:
-
-```text
-checkpoint(run) -> state
-spawn(state) -> run
-fork(state, n) -> run[n]
-reset(run, state)
-destroy(run)
-pin(state) / unpin(state) / gc()
-parent(state) / children(state) / diff(a, b) / ancestry(state)
-```
-
-Do not add privileged machine-state `merge` semantics. A higher-level
-evaluator selects a descendant and advances the canonical pointer; reconciliation
-is an ordinary explicit N-parent transition if it is ever needed.
-
-## Niceforge integration contract
-
-Niceforge owns constitution/mission, sealed workflow plans, objectives, offices,
-leases, step ordering, world lineage, transitions, evaluations, evidence, and
-policy. It supplies exact sealed `.smolworld` material to this runtime and must
-not consult a mutable worktree or world definition during execution.
-
-The first executor boundary may be host-local, but its operations remain typed:
-
-```text
-prepare/check
-materialize or restore WorldState
-await runner attachment
-execute one fixed step action
-capture a transition
-inspect a retained descendant
-stop/pause/resume
-release or retain exact world resources
-```
-
-The failed-step model is:
-
-```text
-failed step
-  -> capture post-failure state W1 before cleanup
-  -> retain immutable W1 and evidence
-  -> inspect a disposable descendant
-  -> restore a child run from W1
-  -> retry only the failed step
-  -> record W2 and its transition/evidence
-```
-
-W1 begins only after all semantically relevant channels are captured and the
-immutable receipt is committed. A source snapshot, job attempt, or live fork
-is not W1. Inspection mutations never rewrite W1 or silently become a retry.
-Literal host-reachable SSH and guest SSH daemons are not required; an
-SSH-shaped local command may delegate through smolvm `exec`.
-
-Niceforge's broader trajectory model keeps the institutional graph separate
-from the world graph. Durable institutional objects are constitution/mission,
-office/charter/authority, objective/commitment, hypothesis/question,
-experiment/proposal, claim/counterargument, evaluation/evidence,
-decision/design principle, and world transition. An office is persistent and
-owns jurisdiction, authority, obligations, budget, subscriptions, unresolved
-agenda, and institutional memory; an agent is a fungible occupant. Scratch
-reasoning may disappear, while consequential deltas, evidence, claims,
-questions, and decisions remain typed records. The first vertical slice may
-use one root office and explicit objectives; do not make agent process identity
-the durable institutional speaker.
-
-The control-plane record shape remains explicit even when storage changes:
-
-```text
-logical world state      canonical channel manifest and digest
-world state channel      named content digest and derivation receipt
-world transition         parent states, delta, objective/step, actor, evidence
-world checkpoint         materializer ABI and disposable acceleration receipt
-world run                state, job/step lease, generated resource identities
-machine/switch receipt   VM/device/material and epoch/FDB/rebind evidence
-evaluation               evaluator version, result, evidence, uncertainty
-```
-
-State identity is content-addressed and immutable. Transition identity remains
-unique even when a child state deduplicates. Evaluation never mutates state
-identity. `fork(state, n)` creates branch references before materializing
-machines; `materialize(state)` creates a mutable run under exact ownership;
-`commit(parents, delta, evidence)` creates or finds the child and records the
-transition. Failed worlds and inspection descendants are explicit retention
-roots, not accidental cache entries.
-
-Step execution is a durable protocol beneath the executor lease:
-
-```text
-pending -> preparing -> running -> capture_requested -> finalizing -> completed
-                                      \-> failed/retained
-                                      \-> cancelled/lost
-```
-
-Every meaningful boundary carries run/job/step/attempt identity, lease/fence,
-monotonic executor sequence, before/after state, action/input digests,
-outcome/reason, evidence receipts, and idempotency/correlation identity. The
-executor may cache expression context for speed, but PostgreSQL events and
-world receipts must reconstruct each semantic boundary. A checkpoint capture
-is committed only after the lease/fence is revalidated in the same durable
-transaction; pre-commit candidates are reconciled by exact receipt, never by
-logs or broad host scans.
+Higher-level systems may treat a prepared world or retained checkpoint as an
+immutable input to their own state, workflow, or evaluation models. The
+runtime exposes only the typed world lifecycle and machine operations described
+here; it does not own those external records, policies, or retry semantics.
 
 ## Acceptance scenarios and measurements
 
@@ -500,13 +336,6 @@ up -> explicit DNS/Redis checks -> down`, and proves that preparation/check
 create no runtime state and cleanup touches only recorded machines and sockets.
 The prepared `redis.tar` archive is an external input; tests never build it or
 invoke Docker, Compose, OrbStack, `DOCKER_HOST`, or a Docker socket.
-
-The Sentry backend is the larger workload fixture, not the only test boundary.
-Its host-prepared Linux/arm64 `checkout.tar` and `python-site.tar` exercise
-parallel independent material preparation, dependency-wave creation, active
-services/workspace, restored private DNS/Redis/Snuba traffic, pytest
-collection, and the exact model test. Keep generic Smolworld tests and cheap
-Niceforge PostgreSQL receipt tests independent of this six-machine workload.
 
 When changing external NIC behavior, the fork gate measures live fork/reconnect
 and private traffic while keeping the frozen golden alive. When changing
@@ -523,7 +352,7 @@ VM pause/capture per machine
 manifest/CAS sealing
 restore process launch
 agent ready and NIC/DNS/private-traffic ready
-step resume ready
+restored world ready
 accounted storage and physical APFS bytes
 ```
 
@@ -544,7 +373,7 @@ schemas, and nearby documentation. For contract changes:
 1. Write the smallest observable regression or acceptance test first.
 2. Update domain types, schemas, and callers deliberately.
 3. Keep canonical bytes, receipts, errors, and cleanup deterministic.
-4. Test crash, duplicate, stale-lease, identity-fork, and exact-cleanup paths.
+4. Test crash, duplicate, stale-state, identity-fork, and exact-cleanup paths.
 5. Update this file and nearby comments where durable meaning lives.
 
 The normal local baseline is:
@@ -598,10 +427,10 @@ broader than the recorded world without explicit approval.
 
 ## Explicit non-goals and deferrals
 
-smolworld does not provide Docker/Compose compatibility, workflow steps,
+smolworld does not provide Docker/Compose compatibility, workflow orchestration,
 generic service readiness, health checks, restart policies, log aggregation,
 host networking, port publishing, smolworld-owned NAT, TAP/vmnet, DHCP, IPv6,
-guest SSH, registry pulls from guests, or a second executor substrate.
+guest SSH, registry pulls from guests, or workflow/executor policy.
 
 It also does not define distributed scheduling, multi-world merge semantics,
 GPU fabrics, a universal state codec, persistent agent personalities, or a

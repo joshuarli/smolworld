@@ -1,6 +1,6 @@
 # Redis foundation world
 
-This fixture is the first Smolfile-composed world in the Niceforge migration.
+This fixture is the first Smolfile-composed world fixture.
 It contains two machines on one private static network:
 
 | machine | Smolfile | role |

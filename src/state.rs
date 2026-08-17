@@ -82,7 +82,7 @@ pub(crate) fn v2_world_paths(config_path: &Path) -> Result<V2WorldPaths> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct V2SmolfileObservation {
     /// Immutable user-authored declaration, relative to the `.smolworld`
-    /// directory. This keeps a prepared world valid after Niceforge copies its
+    /// directory. This keeps a prepared world valid after a caller copies its
     /// sealed source tree into an immutable run snapshot.
     pub(crate) authored_relative_path: PathBuf,
     pub(crate) authored_digest: String,
@@ -1746,7 +1746,7 @@ mod tests {
             seeds: vec![V2SeedObservation {
                 machine: "clickhouse".to_string(),
                 source_relative_path: PathBuf::from("assets/clickhouse.xml"),
-                destination: "/etc/clickhouse-server/config.d/niceforge.xml".to_string(),
+                destination: "/etc/clickhouse-server/config.d/world.xml".to_string(),
                 mode: 0o644,
                 digest: digest_bytes(b"<clickhouse/>\n"),
             }],

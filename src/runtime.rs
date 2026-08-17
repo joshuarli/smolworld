@@ -389,9 +389,8 @@ pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
 }
 
 /// Control messages accepted only by the process that owns the switch and its
-/// recorded world lock. Keep this deliberately small and typed; Niceforge will
-/// invoke the same operation through its local world adapter rather than by
-/// reconstructing lifecycle state itself.
+/// recorded world lock. Keep this deliberately small and typed so an external
+/// world adapter can invoke it without reconstructing lifecycle state.
 enum RuntimeControlCommand {
     Checkpoint { output: PathBuf },
 }

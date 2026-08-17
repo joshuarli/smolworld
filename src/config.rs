@@ -180,10 +180,11 @@ fn yaml_path(value: &Yaml, path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(value))
 }
 
-/// Authored world material must stay inside the world directory.  A prepared
-/// world is copied into a Niceforge snapshot before it is run, so an absolute
-/// host path or lexical escape would make its material lock non-portable and
-/// would let a snapshot silently consume an undeclared host input.
+/// Authored world material must stay inside the world directory. A prepared
+/// world is copied into an immutable run snapshot before it is run, so an
+/// absolute host path or lexical escape would make its material lock
+/// non-portable and would let a snapshot silently consume an undeclared host
+/// input.
 fn yaml_world_relative_path(value: &Yaml, path: &str) -> Result<PathBuf> {
     let value = yaml_path(value, path)?;
     if value.is_absolute()
