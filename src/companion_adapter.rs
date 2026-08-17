@@ -1,8 +1,8 @@
-//! Smolworld's one internal companion-operation boundary.
+//! Smolworld's one internal companion-operation adapter.
 //!
 //! This is intentionally **not** an smolvm protocol. Smolvm and Smolfiles are
 //! upstream contracts. `src/smolvm.rs` is the only adapter allowed to translate
-//! these typed world operations to their existing CLI flags and versioned TSV
+//! these typed world operations to its existing CLI flags and versioned TSV
 //! replies. Keeping process execution here makes that translation explicit and
 //! prevents the rest of smolworld from acquiring another smolvm command shape.
 

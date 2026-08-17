@@ -1,38 +1,19 @@
-# World metrics boundary
+# Metrics adapter note
 
-`smolworld metrics --json` is a read-only observation command. It reports one
-fixed-shape row for each machine declared in the `.smolworld` file.
+The normative `metrics --json` command, its closed `schemaVersion: 1` output,
+row fields, nullability, and measurement meanings are defined in the
+[world contract](world-contract.md). This page is an implementation-scope
+note, not a second schema.
 
-For a machine with an allocation, smolworld uses only the recorded
-`smw-*` name from its world state file and delegates measurement to:
+For an allocated machine, smolworld uses only the exact recorded `smw-*` name
+from world state and delegates host observation to the selected smolvm
+adapter. The upstream subprocess record is the literal `machine-stats-v1`
+ABI. smolworld verifies the returned identity and lifecycle state before
+rendering its world-owned JSON. Process sampling and disk accounting remain in
+smolvm; world identity, namespacing, and the public envelope remain in
+smolworld.
 
-```text
-smolvm machine stats --name RECORDED_NAME --format tsv
-```
-
-The subprocess record is versioned as `machine-stats-v1`. smolworld verifies
-the returned identity and lifecycle state before rendering its own JSON. This
-keeps process sampling and disk accounting in smolvm, while world identity,
-namespacing, and the world-level schema remain owned by smolworld.
-
-The output has exactly these top-level fields:
-
-```json
-{
-  "schemaVersion": 1,
-  "world": "world-name",
-  "machines": []
-}
-```
-
-Each machine row has exactly these fields:
-
-```text
-machine smolvmName state pid cpus memoryMb storageGb overlayGb
-cpuSeconds cpuMillis rssMb diskUsedMb
-```
-
-Values are JSON `null` when the machine has no recorded allocation or an
-observation is unavailable. CPU counters are cumulative for the current host
-VMM process and reset on restart; RSS and disk are instantaneous host gauges.
-These are not guest-process or guest-filesystem measurements.
+The adapter never lists or discovers unrelated smolvm machines. Upstream flag,
+TSV-position, and ABI changes belong at the narrow adapter boundary described
+in [`docs/smolvm-world-protocol.md`](smolvm-world-protocol.md), with the
+user-facing consequences recorded in the [world contract](world-contract.md).

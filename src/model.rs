@@ -45,6 +45,33 @@ pub(crate) struct SeedFile {
     pub(crate) mode: u32,
 }
 
+/// The only image origins the world preparation boundary records. The
+/// companion owns parsing Smolfiles and resolving either form; smolworld keeps
+/// this closed type so a malformed companion reply cannot become durable
+/// material state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageSourceKind {
+    Registry,
+    LocalArchive,
+}
+
+impl ImageSourceKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Registry => "registry",
+            Self::LocalArchive => "local-archive",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "registry" => Ok(Self::Registry),
+            "local-archive" => Ok(Self::LocalArchive),
+            _ => Err(format!("unknown image source kind '{value}'")),
+        }
+    }
+}
+
 /// The host inputs for one smolvm external-world launch. Keeping this
 /// separate from `MachineConfig` makes the configuration-to-host boundary
 /// explicit: static network identity and the opaque Smolfile reference are

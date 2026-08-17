@@ -1,8 +1,8 @@
 use crate::model::{
-    format_mac, Assignment, MachineLaunch, NetworkConfig, SeedFile, WorldAllocationState,
-    WorldConfig,
+    format_mac, Assignment, ImageSourceKind, MachineLaunch, NetworkConfig, SeedFile,
+    WorldAllocationState, WorldConfig,
 };
-use crate::world_protocol::{self, Operation};
+use crate::companion_adapter::{self, Operation};
 use crate::Result;
 use std::env;
 use std::fs;
@@ -28,7 +28,7 @@ pub(crate) struct ExternalWorldMaterial {
 pub(crate) struct PreparedExternalWorldSmolfile {
     pub(crate) authored_smolfile: PathBuf,
     pub(crate) prepared_smolfile: PathBuf,
-    pub(crate) source_kind: String,
+    pub(crate) source_kind: ImageSourceKind,
     pub(crate) source_reference: String,
     pub(crate) source_digest: String,
 }
@@ -41,7 +41,7 @@ pub(crate) struct PreparedExternalWorldSmolfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachineStats {
     pub(crate) name: String,
-    pub(crate) state: String,
+    pub(crate) state: CompanionMachineState,
     pub(crate) pid: Option<i32>,
     pub(crate) cpus: u8,
     pub(crate) memory_mb: u32,
@@ -57,13 +57,51 @@ const EXTERNAL_WORLD_TSV_ABI: &str = "external-world-v3";
 const EXTERNAL_WORLD_PREPARE_TSV_ABI: &str = "external-world-prepare-v2";
 const MACHINE_STATS_TSV_ABI: &str = "machine-stats-v1";
 
+/// Closed lifecycle observations returned by smolvm's machine inspection
+/// commands. This adapter parses upstream text immediately, so no
+/// unrecognized status crosses into world runtime logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompanionMachineState {
+    Created,
+    Running,
+    Stopped,
+    Failed,
+    Unreachable,
+    Frozen,
+}
+
+impl CompanionMachineState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+            Self::Unreachable => "unreachable",
+            Self::Frozen => "frozen",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "created" => Ok(Self::Created),
+            "running" => Ok(Self::Running),
+            "stopped" => Ok(Self::Stopped),
+            "failed" => Ok(Self::Failed),
+            "unreachable" => Ok(Self::Unreachable),
+            "frozen" => Ok(Self::Frozen),
+            _ => Err(format!("unknown smolvm machine state '{value}'")),
+        }
+    }
+}
+
 /// Collect one exact recorded smolvm machine through the read-only stats
 /// subprocess boundary. The caller is responsible for proving that `name` is
 /// a world identity before invoking this function.
 pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
     let mut command = Command::new(smolvm);
     command.args(["machine", "stats", "--name", name, "--format", "tsv"]);
-    let output = world_protocol::output(Operation::Stats, &mut command)?;
+    let output = companion_adapter::output(Operation::Stats, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm machine stats {name} exited with {}: {}",
@@ -78,17 +116,20 @@ pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
 
 /// Query an exact recorded identity through the upstream status command. This
 /// keeps its human-oriented response parsing contained in the adapter.
-pub(crate) fn machine_status(smolvm: &Path, name: &str) -> Result<Option<&'static str>> {
+pub(crate) fn machine_status(
+    smolvm: &Path,
+    name: &str,
+) -> Result<Option<CompanionMachineState>> {
     let mut command = Command::new(smolvm);
     command.args(["machine", "status", "--name", name]);
-    let output = world_protocol::output(Operation::Status, &mut command)?;
+    let output = companion_adapter::output(Operation::Status, &mut command)?;
     if !output.status.success() {
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(["running", "created", "stopped", "failed", "unreachable"]
-        .into_iter()
-        .find(|state| text.split_whitespace().any(|word| word == *state)))
+    Ok(text
+        .split_whitespace()
+        .find_map(|word| CompanionMachineState::parse(word).ok()))
 }
 
 pub(crate) fn exec_machine(
@@ -103,7 +144,7 @@ pub(crate) fn exec_machine(
         invocation.args(["--secret-env", value]);
     }
     invocation.arg("--").args(command);
-    world_protocol::status(Operation::Exec, &mut invocation)
+    companion_adapter::status(Operation::Exec, &mut invocation)
 }
 
 pub(crate) fn copy_machine(
@@ -121,7 +162,7 @@ pub(crate) fn copy_machine(
     } else {
         invocation.args([&remote, local_path]);
     }
-    world_protocol::status(Operation::Copy, &mut invocation)
+    companion_adapter::status(Operation::Copy, &mut invocation)
 }
 
 /// Place one sealed world input through smolvm's generic running-machine
@@ -155,7 +196,7 @@ pub(crate) fn install_seed_files(smolvm: &Path, name: &str, seeds: &[SeedFile]) 
             .args(["machine", "exec", "--name", name, "--", "/bin/chmod"])
             .arg(mode)
             .arg(destination);
-        world_protocol::status(Operation::Exec, &mut chmod)?;
+        companion_adapter::status(Operation::Exec, &mut chmod)?;
     }
     Ok(())
 }
@@ -184,17 +225,11 @@ fn parse_machine_stats_tsv(output: &str, expected_name: &str) -> Result<MachineS
             "smolvm machine stats returned machine '{name}', expected '{expected_name}'"
         ));
     }
-    if !matches!(
-        state,
-        "created" | "running" | "stopped" | "failed" | "unreachable" | "frozen"
-    ) {
-        return Err(format!(
-            "smolvm machine stats returned unknown state '{state}'"
-        ));
-    }
+    let state = CompanionMachineState::parse(state)
+        .map_err(|_| format!("smolvm machine stats returned unknown state '{state}'"))?;
     Ok(MachineStats {
         name: name.to_string(),
-        state: state.to_string(),
+        state,
         pid: parse_optional_i32(pid, "pid")?,
         cpus: cpus
             .parse()
@@ -253,7 +288,7 @@ pub(crate) fn materialize_external_world(
             "--smolfile",
         ])
         .arg(smolfile);
-    let output = world_protocol::output(Operation::Prepare, &mut command)?;
+    let output = companion_adapter::output(Operation::Prepare, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm external-world materialization exited with {}: {}",
@@ -315,20 +350,19 @@ fn parse_external_world_prepare_tsv(
             prepared_smolfile.display()
         )
     })?;
-    if !matches!(source_kind, "registry" | "local-archive") {
-        return Err(format!(
+    let source_kind = ImageSourceKind::parse(source_kind).map_err(|_| {
+        format!(
             "smolvm external-world materialization returned unknown source kind '{source_kind}'"
-        ));
-    }
+        )
+    })?;
     if source_reference.is_empty() || source_reference.contains(['\t', '\r', '\n']) {
         return Err(
             "smolvm external-world materialization returned an invalid source reference".into(),
         );
     }
     let source_digest_is_valid = match source_kind {
-        "registry" => is_algorithm_digest(source_digest, "sha256"),
-        "local-archive" => is_algorithm_digest(source_digest, "blake3"),
-        _ => false,
+        ImageSourceKind::Registry => is_algorithm_digest(source_digest, "sha256"),
+        ImageSourceKind::LocalArchive => is_algorithm_digest(source_digest, "blake3"),
     };
     if !source_digest_is_valid {
         return Err(
@@ -338,7 +372,7 @@ fn parse_external_world_prepare_tsv(
     Ok(PreparedExternalWorldSmolfile {
         authored_smolfile: expected_authored,
         prepared_smolfile,
-        source_kind: source_kind.to_string(),
+        source_kind,
         source_reference: source_reference.to_string(),
         source_digest: source_digest.to_string(),
     })
@@ -376,7 +410,7 @@ pub(crate) fn validate_external_world(
     if network.egress {
         command.arg("--net-egress");
     }
-    let output = world_protocol::output(Operation::Validate, &mut command)?;
+    let output = companion_adapter::output(Operation::Validate, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm external-world validation exited with {}: {}",
@@ -648,7 +682,7 @@ pub(crate) fn create_machine(
     network: &NetworkConfig,
 ) -> Result<()> {
     let mut invocation = build_machine_create_command(smolvm, &launch, network);
-    world_protocol::status(Operation::Create, &mut invocation)
+    companion_adapter::status(Operation::Create, &mut invocation)
 }
 
 /// Build the exact, restricted `machine create` invocation without starting
@@ -689,7 +723,7 @@ fn build_machine_create_command(
 pub(crate) fn start_machine(smolvm: &Path, name: &str) -> Result<()> {
     let mut command = Command::new(smolvm);
     command.args(["machine", "start", "--name", name, "--forkable"]);
-    world_protocol::status(Operation::Start, &mut command)
+    companion_adapter::status(Operation::Start, &mut command)
 }
 
 /// Capture one forkable world machine into a checkpoint-owned subdirectory.
@@ -698,7 +732,7 @@ pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Re
     command
         .args(["machine", "checkpoint", "--name", name, "--output"])
         .arg(output);
-    world_protocol::captured_status(Operation::Checkpoint, &mut command)
+    companion_adapter::captured_status(Operation::Checkpoint, &mut command)
 }
 
 /// Restore one stopped world machine from its receipt with fresh host handles.
@@ -707,7 +741,7 @@ pub(crate) fn restore_machine(smolvm: &Path, name: &str, checkpoint: &Path) -> R
     command
         .args(["machine", "restore", "--name", name, "--checkpoint"])
         .arg(checkpoint);
-    world_protocol::captured_status(Operation::Restore, &mut command)
+    companion_adapter::captured_status(Operation::Restore, &mut command)
 }
 
 pub(crate) fn status_result(action: &str, status: ExitStatus) -> Result<()> {
@@ -732,7 +766,7 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationStat
             .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = world_protocol::status(Operation::Delete, &mut command);
+        let _ = companion_adapter::status(Operation::Delete, &mut command);
     }
 }
 
@@ -746,7 +780,7 @@ pub(crate) fn stop_machines(smolvm: &Path, state: &WorldAllocationState) {
             .args(["machine", "stop", "--name", &assignment.smolvm_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = world_protocol::status(Operation::Stop, &mut command);
+        let _ = companion_adapter::status(Operation::Stop, &mut command);
     }
 }
 
@@ -758,10 +792,10 @@ pub(crate) fn release_machines(smolvm: &Path, state: &WorldAllocationState) -> R
     for assignment in state.assignments.values() {
         let mut stop = Command::new(smolvm);
         stop.args(["machine", "stop", "--name", &assignment.smolvm_name]);
-        world_protocol::status(Operation::Stop, &mut stop)?;
+        companion_adapter::status(Operation::Stop, &mut stop)?;
         let mut delete = Command::new(smolvm);
         delete.args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"]);
-        world_protocol::status(Operation::Delete, &mut delete)?;
+        companion_adapter::status(Operation::Delete, &mut delete)?;
     }
     Ok(())
 }
@@ -862,6 +896,33 @@ mod tests {
                 "02:00:00:00:00:17",
             ]
         );
+    }
+
+    #[test]
+    fn external_world_prepare_tsv_closes_image_source_kinds() {
+        let root = temporary_test_directory();
+        let authored = root.join("authored.Smolfile");
+        let prepared = root.join("prepared.Smolfile");
+        fs::write(&authored, "image = \"./redis.tar\"\n").unwrap();
+        fs::write(&prepared, "image = \"/sealed/redis.tar\"\n").unwrap();
+        let authored = fs::canonicalize(&authored).unwrap();
+        let prepared = fs::canonicalize(&prepared).unwrap();
+        let output = format!(
+            "external-world-prepare-v2\t{}\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\n",
+            authored.display(),
+            prepared.display(),
+            "a".repeat(64),
+            "a".repeat(64),
+        );
+
+        let material = parse_external_world_prepare_tsv(&output, &authored).unwrap();
+        assert_eq!(material.source_kind, ImageSourceKind::Registry);
+
+        let unsupported = output.replacen("\tregistry\t", "\tother\t", 1);
+        assert!(parse_external_world_prepare_tsv(&unsupported, &authored)
+            .unwrap_err()
+            .contains("unknown source kind"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -981,7 +1042,7 @@ mod tests {
             "machine-stats-v1\tsmw-demo-runner\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
         let stats = parse_machine_stats_tsv(output, "smw-demo-runner").unwrap();
         assert_eq!(stats.name, "smw-demo-runner");
-        assert_eq!(stats.state, "running");
+        assert_eq!(stats.state, CompanionMachineState::Running);
         assert_eq!(stats.pid, Some(42));
         assert_eq!(stats.cpus, 4);
         assert_eq!(stats.memory_mb, 4096);
@@ -1039,7 +1100,10 @@ mod tests {
         let stats = machine_stats(&fake, "smw-runner").unwrap();
         assert_eq!(stats.name, "smw-runner");
         assert_eq!(stats.pid, Some(42));
-        assert_eq!(machine_status(&fake, "smw-runner").unwrap(), Some("running"));
+        assert_eq!(
+            machine_status(&fake, "smw-runner").unwrap(),
+            Some(CompanionMachineState::Running)
+        );
 
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
