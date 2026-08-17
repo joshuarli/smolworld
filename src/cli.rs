@@ -131,7 +131,7 @@ pub(crate) enum Cli {
         config: PathBuf,
         format: PsFormat,
     },
-    /// Collect host-side metrics for the recorded v2 world machines.
+    /// Collect host-side metrics for the recorded world machines.
     Metrics {
         config: PathBuf,
     },
@@ -873,7 +873,7 @@ mod tests {
     fn formats_metrics_as_a_closed_schema_with_nulls() {
         let machines = vec![MachineMetrics {
             machine: "runner".into(),
-            smolvm_name: Some("smw-v2-demo-runner".into()),
+            smolvm_name: Some("smw-demo-runner".into()),
             state: "running".into(),
             pid: Some(42),
             cpus: Some(4),
@@ -887,7 +887,7 @@ mod tests {
         }];
         assert_eq!(
             format_metrics_json("demo", &machines),
-            "{\"schemaVersion\":1,\"world\":\"demo\",\"machines\":[{\"machine\":\"runner\",\"smolvmName\":\"smw-v2-demo-runner\",\"state\":\"running\",\"pid\":42,\"cpus\":4,\"memoryMb\":4096,\"storageGb\":20,\"overlayGb\":4,\"cpuSeconds\":2,\"cpuMillis\":2345,\"rssMb\":128,\"diskUsedMb\":null}]}"
+            "{\"schemaVersion\":1,\"world\":\"demo\",\"machines\":[{\"machine\":\"runner\",\"smolvmName\":\"smw-demo-runner\",\"state\":\"running\",\"pid\":42,\"cpus\":4,\"memoryMb\":4096,\"storageGb\":20,\"overlayGb\":4,\"cpuSeconds\":2,\"cpuMillis\":2345,\"rssMb\":128,\"diskUsedMb\":null}]}"
         );
     }
 }

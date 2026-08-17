@@ -4,7 +4,7 @@
 fixed-shape row for each machine declared in the `.smolworld` file.
 
 For a machine with an allocation, smolworld uses only the recorded
-`smw-v2-*` name from its v2 state file and delegates measurement to:
+`smw-*` name from its world state file and delegates measurement to:
 
 ```text
 smolvm machine stats --name RECORDED_NAME --format tsv

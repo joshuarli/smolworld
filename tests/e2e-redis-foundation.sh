@@ -94,7 +94,7 @@ state_file=""
 baseline_machines="$temporary_dir/machines-before.json"
 state_assignments="$temporary_dir/assignments.json"
 
-# Keep the runtime namespace calculation in lockstep with `v2_world_paths`.
+# Keep the runtime namespace calculation in lockstep with `world_paths`.
 # It lets the read-only preparation checks prove that no world listener can
 # exist, rather than merely proving that no allocation state was written.
 world_hash=$(python3 - "$world_file" <<'PY'
@@ -108,8 +108,8 @@ for byte in os.fsencode(os.path.realpath(sys.argv[1])):
 print(format(value, "012x"))
 PY
 )
-expected_state_dir="$isolated_home/.smolworld/v2/world-$world_hash"
-runtime_dir="/tmp/smw-v2-$world_hash"
+expected_state_dir="$isolated_home/.smolworld/world-$world_hash"
+runtime_dir="/tmp/smw-$world_hash"
 
 process_running() {
     local pid="$1"
@@ -224,7 +224,7 @@ for raw in open(source, encoding="utf-8"):
     else:
         raise SystemExit(f"malformed or repeated allocation-state line: {line!r}")
 if version != "2" or seed is None or not re.fullmatch(r"[0-9a-f]{16}", seed):
-    raise SystemExit("foundation allocation state is not a complete v2 record")
+    raise SystemExit("foundation allocation state is not a complete world record")
 if set(records) != {"redis", "runner"}:
     raise SystemExit(f"foundation allocation state identities are {sorted(records)}, not redis and runner")
 ips, macs = set(), set()
@@ -235,8 +235,8 @@ for machine, record in records.items():
         raise SystemExit(f"{machine} has an invalid reserved/private address {ip}")
     if not re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", record["mac"]):
         raise SystemExit(f"{machine} has an invalid MAC {record['mac']!r}")
-    if not record["smolvmName"].startswith("smw-v2-") or any(c in record["smolvmName"] for c in "\t\r\n/"):
-        raise SystemExit(f"{machine} has an invalid v2 smolvm identity {record['smolvmName']!r}")
+    if not record["smolvmName"].startswith("smw-") or any(c in record["smolvmName"] for c in "\t\r\n/"):
+        raise SystemExit(f"{machine} has an invalid world smolvm identity {record['smolvmName']!r}")
     ips.add(record["ip"])
     macs.add(record["mac"])
 if len(ips) != len(records) or len(macs) != len(records):

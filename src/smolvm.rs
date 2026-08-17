@@ -59,7 +59,7 @@ const MACHINE_STATS_TSV_ABI: &str = "machine-stats-v1";
 
 /// Collect one exact recorded smolvm machine through the read-only stats
 /// subprocess boundary. The caller is responsible for proving that `name` is
-/// a v2 world identity before invoking this function.
+/// a world identity before invoking this function.
 pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
     let mut command = Command::new(smolvm);
     command.args(["machine", "stats", "--name", name, "--format", "tsv"]);
@@ -345,7 +345,7 @@ fn parse_external_world_prepare_tsv(
 }
 
 /// Invoke smolvm's read-only external-world resolver and parse its deliberately
-/// small versioned TSV record. This must run before smolworld allocates v2
+/// small versioned TSV record. This must run before smolworld allocates world
 /// state, binds a listener, or creates a machine.
 pub(crate) fn validate_external_world(
     smolvm: &Path,
@@ -786,7 +786,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_launch<'a>(
         assignment: &'a Assignment,
@@ -813,11 +816,11 @@ mod tests {
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
             mac: [0x02, 0, 0, 0, 0, 0x17],
-            smolvm_name: "smw-v2-demo-api".into(),
+            smolvm_name: "smw-demo-api".into(),
         };
         let launch = test_launch(
             &assignment,
-            Path::new("/tmp/smw-v2-api.sock"),
+            Path::new("/tmp/smw-api.sock"),
             Path::new("/tmp/api.Smolfile"),
         );
         let network = NetworkConfig {
@@ -841,14 +844,14 @@ mod tests {
                 "machine",
                 "create",
                 "--name",
-                "smw-v2-demo-api",
+                "smw-demo-api",
                 "--smolfile",
                 "/tmp/api.Smolfile",
                 "--net",
                 "--net-backend",
                 "virtio-net",
                 "--net-unixstream",
-                "/tmp/smw-v2-api.sock",
+                "/tmp/smw-api.sock",
                 "--net-address",
                 "10.89.0.17/24",
                 "--net-gateway",
@@ -871,7 +874,7 @@ mod tests {
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
             mac: [0x02, 0, 0, 0, 0, 0x17],
-            smolvm_name: "smw-v2-demo-machine".into(),
+            smolvm_name: "smw-demo-machine".into(),
         };
         let network = NetworkConfig {
             subnet: [10, 89, 0, 0],
@@ -880,7 +883,7 @@ mod tests {
             domain: "demo.test".into(),
             egress: false,
         };
-        let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
+        let socket = Path::new("/tmp/smw-demo-machine.sock");
         let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
         let canonical_archive = fs::canonicalize(&archive).unwrap();
         let output = format!(
@@ -908,7 +911,7 @@ mod tests {
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
             mac: [0x02, 0, 0, 0, 0, 0x17],
-            smolvm_name: "smw-v2-demo-machine".into(),
+            smolvm_name: "smw-demo-machine".into(),
         };
         let network = NetworkConfig {
             subnet: [10, 89, 0, 0],
@@ -919,7 +922,7 @@ mod tests {
         };
         let canonical_smolfile = fs::canonicalize(&smolfile).unwrap();
         let output = format!(
-            "external-world-v3\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\t/tmp/smw-v2-demo-machine.sock\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
+            "external-world-v3\t{}\tregistry\tdocker.io/library/redis@sha256:{}\tsha256:{}\t/tmp/smw-demo-machine.sock\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
             canonical_smolfile.display(),
             "a".repeat(64),
             "a".repeat(64),
@@ -929,7 +932,7 @@ mod tests {
             &output,
             &smolfile,
             &assignment,
-            Path::new("/tmp/smw-v2-demo-machine.sock"),
+            Path::new("/tmp/smw-demo-machine.sock"),
             &network,
         )
         .unwrap_err();
@@ -948,7 +951,7 @@ mod tests {
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
             mac: [0x02, 0, 0, 0, 0, 0x17],
-            smolvm_name: "smw-v2-demo-machine".into(),
+            smolvm_name: "smw-demo-machine".into(),
         };
         let network = NetworkConfig {
             subnet: [10, 89, 0, 0],
@@ -957,7 +960,7 @@ mod tests {
             domain: "demo.test".into(),
             egress: false,
         };
-        let socket = Path::new("/tmp/smw-v2-demo-machine.sock");
+        let socket = Path::new("/tmp/smw-demo-machine.sock");
         let output = format!(
             "external-world-v3\t{}\tlocal-archive\t{}\tsha256:{}\t{}\t10.89.0.17/24\t10.89.0.1\t10.89.0.1\t02:00:00:00:00:17\tfalse\n",
             fs::canonicalize(&smolfile).unwrap().display(),
@@ -975,9 +978,9 @@ mod tests {
     #[test]
     fn machine_stats_tsv_accepts_the_closed_versioned_record() {
         let output =
-            "machine-stats-v1\tsmw-v2-demo-runner\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
-        let stats = parse_machine_stats_tsv(output, "smw-v2-demo-runner").unwrap();
-        assert_eq!(stats.name, "smw-v2-demo-runner");
+            "machine-stats-v1\tsmw-demo-runner\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        let stats = parse_machine_stats_tsv(output, "smw-demo-runner").unwrap();
+        assert_eq!(stats.name, "smw-demo-runner");
         assert_eq!(stats.state, "running");
         assert_eq!(stats.pid, Some(42));
         assert_eq!(stats.cpus, 4);
@@ -990,14 +993,14 @@ mod tests {
     #[test]
     fn machine_stats_tsv_rejects_wrong_identity_and_shape() {
         let wrong_name =
-            "machine-stats-v1\tsmw-v2-other\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
-        assert!(parse_machine_stats_tsv(wrong_name, "smw-v2-demo-runner")
+            "machine-stats-v1\tsmw-other\trunning\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        assert!(parse_machine_stats_tsv(wrong_name, "smw-demo-runner")
             .unwrap_err()
-            .contains("expected 'smw-v2-demo-runner'"));
+            .contains("expected 'smw-demo-runner'"));
 
         let unknown_state =
-            "machine-stats-v1\tsmw-v2-demo-runner\tunknown\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
-        assert!(parse_machine_stats_tsv(unknown_state, "smw-v2-demo-runner")
+            "machine-stats-v1\tsmw-demo-runner\tunknown\t42\t4\t4096\t20\t4\t2\t2345\t128\t64\n";
+        assert!(parse_machine_stats_tsv(unknown_state, "smw-demo-runner")
             .unwrap_err()
             .contains("unknown state"));
 
@@ -1026,22 +1029,22 @@ mod tests {
                exit 0\n\
              fi\n\
              if [ \"$1\" = machine ] && [ \"$2\" = start ]; then exit 23; fi\n\
-             if [ \"$1\" = machine ] && [ \"$2\" = stop ] && [ \"$4\" = smw-v2-fail ]; then exit 24; fi\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = stop ] && [ \"$4\" = smw-fail ]; then exit 24; fi\n\
              exit 0\n",
             log = log.display(),
         );
         fs::write(&fake, script).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let stats = machine_stats(&fake, "smw-v2-runner").unwrap();
-        assert_eq!(stats.name, "smw-v2-runner");
+        let stats = machine_stats(&fake, "smw-runner").unwrap();
+        assert_eq!(stats.name, "smw-runner");
         assert_eq!(stats.pid, Some(42));
-        assert_eq!(machine_status(&fake, "smw-v2-runner").unwrap(), Some("running"));
+        assert_eq!(machine_status(&fake, "smw-runner").unwrap(), Some("running"));
 
         let assignment = Assignment {
             ip: "10.89.0.17".parse().unwrap(),
             mac: [0x02, 0, 0, 0, 0, 0x17],
-            smolvm_name: "smw-v2-runner".into(),
+            smolvm_name: "smw-runner".into(),
         };
         let network = NetworkConfig {
             subnet: [10, 89, 0, 0],
@@ -1065,27 +1068,27 @@ mod tests {
             &network,
         )
         .unwrap();
-        assert!(start_machine(&fake, "smw-v2-runner")
+        assert!(start_machine(&fake, "smw-runner")
             .unwrap_err()
             .contains("start"));
-        checkpoint_machine(&fake, "smw-v2-runner", &root.join("checkpoint")).unwrap();
-        restore_machine(&fake, "smw-v2-runner", &root.join("checkpoint")).unwrap();
+        checkpoint_machine(&fake, "smw-runner", &root.join("checkpoint")).unwrap();
+        restore_machine(&fake, "smw-runner", &root.join("checkpoint")).unwrap();
         exec_machine(
             &fake,
-            "smw-v2-runner",
+            "smw-runner",
             &["TOKEN=HOST_TOKEN".into()],
             &["/bin/sh".into(), "-c".into(), "true".into()],
         )
         .unwrap();
         copy_machine(
             &fake,
-            "smw-v2-runner",
+            "smw-runner",
             "/tmp/guest-file",
             &root.join("host-file").display().to_string(),
             true,
         )
         .unwrap();
-        install_seed_files(&fake, "smw-v2-runner", &seeds).unwrap();
+        install_seed_files(&fake, "smw-runner", &seeds).unwrap();
 
         let failing_state = WorldAllocationState {
             seed: 1,
@@ -1094,7 +1097,7 @@ mod tests {
                 Assignment {
                     ip: "10.89.0.18".parse().unwrap(),
                     mac: [0x02, 0, 0, 0, 0, 0x18],
-                    smolvm_name: "smw-v2-fail".into(),
+                    smolvm_name: "smw-fail".into(),
                 },
             )]),
         };
@@ -1103,17 +1106,17 @@ mod tests {
             .contains("stop"));
 
         let calls = fs::read_to_string(&log).unwrap();
-        assert!(calls.contains("machine create --name smw-v2-runner"));
+        assert!(calls.contains("machine create --name smw-runner"));
         assert!(calls.contains("--net-unixstream"));
         assert!(calls.contains("--net-egress"));
         assert!(!calls.contains("--seed-file"));
         assert!(calls.contains("machine cp "));
         assert!(calls.contains("/bin/chmod 0640 /etc/demo/seed"));
-        assert!(calls.contains("machine checkpoint --name smw-v2-runner"));
-        assert!(calls.contains("machine restore --name smw-v2-runner"));
-        assert!(calls.contains("machine exec --name smw-v2-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"));
-        assert!(calls.contains("machine stop --name smw-v2-fail"));
-        assert!(!calls.contains("machine delete --name smw-v2-fail -f"));
+        assert!(calls.contains("machine checkpoint --name smw-runner"));
+        assert!(calls.contains("machine restore --name smw-runner"));
+        assert!(calls.contains("machine exec --name smw-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"));
+        assert!(calls.contains("machine stop --name smw-fail"));
+        assert!(!calls.contains("machine delete --name smw-fail -f"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1122,11 +1125,18 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "smolworld-smolvm-test-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
+        for _ in 0..16 {
+            let sequence = TEST_DIRECTORY_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "smolworld-smolvm-test-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test directory {}: {error}", root.display()),
+            }
+        }
+        panic!("allocate a unique smolvm test directory")
     }
 }

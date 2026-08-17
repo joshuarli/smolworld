@@ -16,14 +16,14 @@ use crate::smolvm::{
     start_machine, stop_machines, validate_external_world, MachineStats,
 };
 use crate::state::{
-    allocate_v2_allocation_state, digest_file, digest_machine_checkpoint_receipt,
-    inspect_v2_recovery, load_v2_allocation_state, load_v2_lifecycle, load_v2_material_lock,
-    load_world_checkpoint_receipt, mark_v2_absent, mark_v2_attached, mark_v2_capture_rolled_back,
-    mark_v2_captured, mark_v2_capturing, mark_v2_created, mark_v2_running, mark_v2_starting,
-    material_lock_resolver_abi, normalize_relative_path, prepare_v2_runtime_dir,
-    remove_v2_runtime_dir, remove_v2_stale_temporary_files, v2_world_paths,
-    write_v2_allocation_state, write_v2_material_lock, write_world_checkpoint_receipt,
-    V2ImageMaterial, V2MaterialLock, V2SeedObservation, V2SmolfileObservation, V2WorldPaths,
+    allocate_allocation_state, digest_file, digest_machine_checkpoint_receipt,
+    inspect_recovery, load_allocation_state, load_lifecycle, load_material_lock,
+    load_world_checkpoint_receipt, mark_absent, mark_attached, mark_capture_rolled_back,
+    mark_captured, mark_capturing, mark_created, mark_running, mark_starting,
+    material_lock_resolver_abi, normalize_relative_path, prepare_runtime_dir,
+    remove_runtime_dir, remove_stale_temporary_files, world_paths,
+    write_allocation_state, write_material_lock, write_world_checkpoint_receipt,
+    ImageMaterial, MaterialLock, SeedObservation, SmolfileObservation, WorldPaths,
     WorldLock, MACHINE_CHECKPOINT_RECEIPT_NAME,
 };
 use crate::switch::{
@@ -91,7 +91,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
 pub(crate) fn check(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
     topological_order(&config)?;
-    let paths = v2_world_paths(config_path)?;
+    let paths = world_paths(config_path)?;
     verify_prepared_world(&config, &paths, &smolvm_program())?;
     println!("smolworld: {} is ready", config.name);
     Ok(())
@@ -102,23 +102,23 @@ pub(crate) fn check(config_path: &Path) -> Result<()> {
 pub(crate) fn prepare(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
     topological_order(&config)?;
-    let paths = v2_world_paths(config_path)?;
+    let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
     preflight(&config, &paths.config_dir, &smolvm)?;
     let material = prepare_world_material(&config, &paths, &smolvm)?;
-    write_v2_material_lock(&paths, &material)?;
+    write_material_lock(&paths, &material)?;
     println!("smolworld: prepared {}", config.name);
     Ok(())
 }
 
 /// Ask the current supervisor, rather than a second CLI process, to close the
 /// switch epoch and capture its live machines. The runtime directory socket is
-/// private to this exact v2 world and vanishes when the supervisor exits.
+/// private to this exact world and vanishes when the supervisor exits.
 pub(crate) fn checkpoint(config_path: &Path, output: &Path) -> Result<()> {
     if !output.is_absolute() {
         return Err("checkpoint --output must be an absolute directory".into());
     }
-    let paths = v2_world_paths(config_path)?;
+    let paths = world_paths(config_path)?;
     let socket = runtime_control_socket_path(&paths);
     let mut stream = UnixStream::connect(&socket)
         .map_err(|error| format!("connect world supervisor {}: {error}", socket.display()))?;
@@ -151,11 +151,11 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     }
     let config = load_config(config_path)?;
     topological_waves(&config)?;
-    let paths = v2_world_paths(config_path)?;
+    let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
-    let _world_lock = WorldLock::acquire_v2(&paths)?;
+    let _world_lock = WorldLock::acquire(&paths)?;
     verify_prepared_world(&config, &paths, &smolvm)?;
-    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if !matches!(
         lifecycle.state,
         LifecycleState::Captured | LifecycleState::Capturing
@@ -166,13 +166,13 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
             lifecycle.state.as_str()
         ));
     }
-    let state = load_v2_allocation_state(&paths.state_file)?
+    let state = load_allocation_state(&paths.state_file)?
         .ok_or_else(|| "captured world has no allocation state".to_string())?;
     let receipt = load_world_checkpoint_receipt(checkpoint)?;
     verify_world_checkpoint_receipt(&config, &paths, &state, checkpoint, &receipt)?;
-    remove_v2_stale_temporary_files(&paths)?;
-    remove_v2_runtime_dir(&paths)?;
-    mark_v2_starting(&paths)?;
+    remove_stale_temporary_files(&paths)?;
+    remove_runtime_dir(&paths)?;
+    mark_starting(&paths)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let (switch_tx, switch_rx) = mpsc::channel();
@@ -182,7 +182,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     let mut switch_handle = None;
     let retain_checkpoint_sources = true;
     let result = (|| {
-        prepare_v2_runtime_dir(&paths)?;
+        prepare_runtime_dir(&paths)?;
         let control_listener = bind_runtime_control_listener(&paths)?;
         let switch_shutdown = shutdown.clone();
         switch_handle = Some(
@@ -218,8 +218,8 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
             )
         })?;
         wait_for_attachments(&attached_rx, &config)?;
-        mark_v2_attached(&paths)?;
-        mark_v2_running(&paths)?;
+        mark_attached(&paths)?;
+        mark_running(&paths)?;
         install_signal_handlers();
         eprintln!("smolworld: restored world is up; press Ctrl-C to stop it");
         while !STOP_REQUESTED.load(Ordering::SeqCst) {
@@ -283,16 +283,16 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     if let Some(handle) = switch_handle {
         let _ = handle.join();
     }
-    let _ = remove_v2_runtime_dir(&paths);
+    let _ = remove_runtime_dir(&paths);
     if retain_checkpoint_sources {
-        let _ = mark_v2_captured(&paths);
+        let _ = mark_captured(&paths);
     }
     result
 }
 
 fn verify_world_checkpoint_receipt(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     state: &crate::model::WorldAllocationState,
     checkpoint: &Path,
     receipt: &WorldCheckpointReceipt,
@@ -352,9 +352,9 @@ pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
         return Err("release --checkpoint must be an absolute directory".into());
     }
     let config = load_config(config_path)?;
-    let paths = v2_world_paths(config_path)?;
-    let _world_lock = WorldLock::acquire_v2(&paths)?;
-    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let paths = world_paths(config_path)?;
+    let _world_lock = WorldLock::acquire(&paths)?;
+    let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if !matches!(
         lifecycle.state,
         LifecycleState::Captured | LifecycleState::Capturing
@@ -365,7 +365,7 @@ pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
             lifecycle.state.as_str()
         ));
     }
-    let state = load_v2_allocation_state(&paths.state_file)?
+    let state = load_allocation_state(&paths.state_file)?
         .ok_or_else(|| "captured world has no allocation state".to_string())?;
     let receipt = load_world_checkpoint_receipt(checkpoint)?;
     verify_world_checkpoint_receipt(&config, &paths, &state, checkpoint, &receipt)?;
@@ -384,7 +384,7 @@ pub(crate) fn release(config_path: &Path, checkpoint: &Path) -> Result<()> {
             checkpoint.display()
         )
     })?;
-    mark_v2_absent(&paths)?;
+    mark_absent(&paths)?;
     println!("smolworld: released checkpoint {}", checkpoint.display());
     Ok(())
 }
@@ -396,11 +396,11 @@ enum RuntimeControlCommand {
     Checkpoint { output: PathBuf },
 }
 
-fn runtime_control_socket_path(paths: &V2WorldPaths) -> PathBuf {
+fn runtime_control_socket_path(paths: &WorldPaths) -> PathBuf {
     paths.runtime_dir.join("control.sock")
 }
 
-fn bind_runtime_control_listener(paths: &V2WorldPaths) -> Result<UnixListener> {
+fn bind_runtime_control_listener(paths: &WorldPaths) -> Result<UnixListener> {
     let path = runtime_control_socket_path(paths);
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("bind supervisor control {}: {error}", path.display()))?;
@@ -475,12 +475,12 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     let config = load_config(config_path)?;
     let waves = topological_waves(&config)?;
-    let paths = v2_world_paths(config_path)?;
+    let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
-    let _world_lock = WorldLock::acquire_v2(&paths)?;
+    let _world_lock = WorldLock::acquire(&paths)?;
     let material = verify_prepared_world(&config, &paths, &smolvm)?;
 
-    let recovery = inspect_v2_recovery(&paths)?;
+    let recovery = inspect_recovery(&paths)?;
     if recovery.lifecycle.state.retains_checkpoint_sources() {
         return Err(format!(
             "world '{}' has a retained or in-progress durable capture; run `smolworld restore --checkpoint DIR` or explicitly release that checkpoint before a fresh up",
@@ -499,14 +499,14 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
             config.name
         );
     }
-    let previous = load_v2_allocation_state(&paths.state_file)?;
+    let previous = load_allocation_state(&paths.state_file)?;
     cleanup_machines(&smolvm, previous.as_ref());
-    remove_v2_stale_temporary_files(&paths)?;
-    remove_v2_runtime_dir(&paths)?;
+    remove_stale_temporary_files(&paths)?;
+    remove_runtime_dir(&paths)?;
 
-    let state = allocate_v2_allocation_state(previous, &config, &paths)?;
-    write_v2_allocation_state(&paths, &state)?;
-    mark_v2_starting(&paths)?;
+    let state = allocate_allocation_state(previous, &config, &paths)?;
+    write_allocation_state(&paths, &state)?;
+    mark_starting(&paths)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let (switch_tx, switch_rx) = mpsc::channel();
     let (attached_tx, attached_rx) = mpsc::channel();
@@ -516,7 +516,7 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     let mut switch_handle = None;
     let mut retain_checkpoint_sources = false;
     let result = (|| {
-        prepare_v2_runtime_dir(&paths)?;
+        prepare_runtime_dir(&paths)?;
         let control_listener = bind_runtime_control_listener(&paths)?;
         let switch_shutdown = shutdown.clone();
         switch_handle = Some(
@@ -562,7 +562,7 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
                 )
             })?;
         }
-        mark_v2_created(&paths)?;
+        mark_created(&paths)?;
         for wave in &waves {
             parallel_machine_operations(wave, "start", |name| {
                 start_machine(
@@ -582,9 +582,9 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
         }
 
         wait_for_attachments(&attached_rx, &config)?;
-        mark_v2_attached(&paths)?;
+        mark_attached(&paths)?;
         print_allocations(&config, &state);
-        mark_v2_running(&paths)?;
+        mark_running(&paths)?;
         install_signal_handlers();
         eprintln!("smolworld: world is up; press Ctrl-C to stop it");
         while !STOP_REQUESTED.load(Ordering::SeqCst) {
@@ -622,7 +622,7 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
                                     // recovery; deleting them here would turn a surfaced
                                     // commit failure into silent data loss.
                                     let retained_lifecycle =
-                                        match load_v2_lifecycle(&paths.lifecycle_path()) {
+                                        match load_lifecycle(&paths.lifecycle_path()) {
                                             Ok(Some(lifecycle)) => {
                                                 lifecycle.state.retains_checkpoint_sources()
                                             }
@@ -665,9 +665,9 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
     if let Some(handle) = switch_handle {
         let _ = handle.join();
     }
-    let _ = remove_v2_runtime_dir(&paths);
+    let _ = remove_runtime_dir(&paths);
     if !retain_checkpoint_sources {
-        let _ = mark_v2_absent(&paths);
+        let _ = mark_absent(&paths);
     }
     result
 }
@@ -721,14 +721,14 @@ where
 fn checkpoint_running_world(
     config: &WorldConfig,
     state: &crate::model::WorldAllocationState,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
     switch_tx: &mpsc::Sender<SwitchEvent>,
     attached_rx: &mpsc::Receiver<String>,
     output: &Path,
 ) -> Result<()> {
     let (parent, staging) = create_world_checkpoint_staging(output)?;
-    if let Err(error) = mark_v2_capturing(paths) {
+    if let Err(error) = mark_capturing(paths) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
@@ -830,12 +830,12 @@ fn checkpoint_running_world(
     // the earlier `Capturing` intent in place so `up` cannot clean its stopped
     // sources; `restore`/`release` accept that recoverable state after receipt
     // verification.
-    mark_v2_captured(paths)?;
+    mark_captured(paths)?;
     Ok(())
 }
 
 fn abandon_unstarted_world_checkpoint(
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     staging: &Path,
     original_error: String,
 ) -> Result<()> {
@@ -845,7 +845,7 @@ fn abandon_unstarted_world_checkpoint(
             staging.display()
         )
     });
-    let lifecycle = mark_v2_capture_rolled_back(paths);
+    let lifecycle = mark_capture_rolled_back(paths);
     match (remove, lifecycle) {
         (Ok(()), Ok(_)) => Err(original_error),
         (remove, lifecycle) => Err(format!(
@@ -976,7 +976,7 @@ fn parallel_checkpoint_machines(
 /// world. Keeping the rollback boundary explicit makes it harder to resume
 /// forwarding before every successfully frozen machine has fresh attachments.
 struct CheckpointRollback<'a> {
-    paths: &'a V2WorldPaths,
+    paths: &'a WorldPaths,
     smolvm: &'a Path,
     state: &'a crate::model::WorldAllocationState,
     staging: &'a Path,
@@ -1010,7 +1010,7 @@ fn rollback_world_checkpoint(
     resume_switch(rollback.switch_tx);
     match attached {
         Ok(()) => {
-            if let Err(error) = mark_v2_capture_rolled_back(rollback.paths) {
+            if let Err(error) = mark_capture_rolled_back(rollback.paths) {
                 return Err(format!(
                     "{original_error}; checkpoint rollback restored the world but could not clear its capture intent: {error}"
                 ));
@@ -1031,10 +1031,10 @@ fn rollback_world_checkpoint(
 }
 
 pub(crate) fn down(config_path: &Path) -> Result<()> {
-    let paths = v2_world_paths(config_path)?;
-    let _world_lock = WorldLock::acquire_v2(&paths)?;
-    let state = load_v2_allocation_state(&paths.state_file)?;
-    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let paths = world_paths(config_path)?;
+    let _world_lock = WorldLock::acquire(&paths)?;
+    let state = load_allocation_state(&paths.state_file)?;
+    let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if lifecycle.state.retains_checkpoint_sources() {
         return Err(
             "world has a retained durable checkpoint; use `smolworld release --checkpoint DIR` to delete its exact source machines and artifact"
@@ -1044,10 +1044,10 @@ pub(crate) fn down(config_path: &Path) -> Result<()> {
     if let Some(state) = &state {
         cleanup_machines(&smolvm_program(), Some(state));
     }
-    remove_v2_stale_temporary_files(&paths)?;
-    remove_v2_runtime_dir(&paths)?;
+    remove_stale_temporary_files(&paths)?;
+    remove_runtime_dir(&paths)?;
     if state.is_some() {
-        mark_v2_absent(&paths)?;
+        mark_absent(&paths)?;
     }
     println!("smolworld: down");
     Ok(())
@@ -1055,9 +1055,9 @@ pub(crate) fn down(config_path: &Path) -> Result<()> {
 
 pub(crate) fn ps(config_path: &Path, format: PsFormat) -> Result<()> {
     let config = load_config(config_path)?;
-    let paths = v2_world_paths(config_path)?;
-    let state = load_v2_allocation_state(&paths.state_file)?;
-    let lifecycle = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let paths = world_paths(config_path)?;
+    let state = load_allocation_state(&paths.state_file)?;
+    let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     let smolvm = smolvm_program();
     let mut machines = Vec::new();
     for name in config.machines.keys() {
@@ -1083,12 +1083,12 @@ pub(crate) fn ps(config_path: &Path, format: PsFormat) -> Result<()> {
 }
 
 /// Collect read-only host metrics for exactly the configured machines with
-/// recorded v2 allocations. The state file is the identity boundary: this
+/// recorded world allocations. The state file is the identity boundary: this
 /// command never lists or discovers unrelated smolvm records.
 pub(crate) fn metrics(config_path: &Path) -> Result<()> {
     let config = load_config(config_path)?;
-    let paths = v2_world_paths(config_path)?;
-    let state = load_v2_allocation_state(&paths.state_file)?;
+    let paths = world_paths(config_path)?;
+    let state = load_allocation_state(&paths.state_file)?;
     let smolvm = smolvm_program();
     let mut machines = Vec::new();
 
@@ -1114,7 +1114,7 @@ pub(crate) fn metrics(config_path: &Path) -> Result<()> {
             continue;
         };
 
-        require_v2_machine_identity(machine, &assignment.smolvm_name)?;
+        require_machine_identity(machine, &assignment.smolvm_name)?;
         let stats = machine_stats(&smolvm, &assignment.smolvm_name)?;
         machines.push(machine_metrics(machine, &stats));
     }
@@ -1123,15 +1123,15 @@ pub(crate) fn metrics(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn require_v2_machine_identity(machine: &str, smolvm_name: &str) -> Result<()> {
-    if smolvm_name.starts_with("smw-v2-")
+fn require_machine_identity(machine: &str, smolvm_name: &str) -> Result<()> {
+    if smolvm_name.starts_with("smw-")
         && !smolvm_name.contains(['\t', '\r', '\n'])
         && !smolvm_name.contains('/')
     {
         Ok(())
     } else {
         Err(format!(
-            "world machine '{machine}' has non-v2 smolvm identity '{smolvm_name}'"
+            "world machine '{machine}' has an unrecognized smolvm identity '{smolvm_name}'"
         ))
     }
 }
@@ -1189,8 +1189,8 @@ pub(crate) fn exec(
     if !config.machines.contains_key(machine) {
         return Err(format!("unknown world machine '{machine}'"));
     }
-    let paths = v2_world_paths(config_path)?;
-    let state = load_v2_allocation_state(&paths.state_file)?
+    let paths = world_paths(config_path)?;
+    let state = load_allocation_state(&paths.state_file)?
         .ok_or_else(|| "world has no state; run `smolworld up` first".to_string())?;
     let assignment = state
         .assignments
@@ -1205,8 +1205,8 @@ pub(crate) fn exec(
 /// durable allocation state and is never exposed to callers.
 pub(crate) fn copy(config_path: &Path, source: &str, destination: &str) -> Result<()> {
     let config = load_config(config_path)?;
-    let paths = v2_world_paths(config_path)?;
-    let state = load_v2_allocation_state(&paths.state_file)?
+    let paths = world_paths(config_path)?;
+    let state = load_allocation_state(&paths.state_file)?
         .ok_or_else(|| "world has no state; run `smolworld up` first".to_string())?;
     let source_remote = parse_copy_remote_endpoint(source)?;
     let destination_remote = parse_copy_remote_endpoint(destination)?;
@@ -1261,11 +1261,11 @@ fn safe_copy_guest_path(path: &str) -> bool {
 
 fn verify_prepared_world(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
-) -> Result<V2MaterialLock> {
+) -> Result<MaterialLock> {
     preflight(config, &paths.config_dir, smolvm)?;
-    let prepared = load_v2_material_lock(&paths.material_lock_path())?.ok_or_else(|| {
+    let prepared = load_material_lock(&paths.material_lock_path())?.ok_or_else(|| {
         format!(
             "world material lock is missing at {}; run `smolworld prepare` first",
             paths.material_lock_path().display()
@@ -1281,11 +1281,11 @@ fn verify_prepared_world(
 /// Smolfiles before any allocation state or listener exists.
 fn prepare_world_material(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
-) -> Result<V2MaterialLock> {
+) -> Result<MaterialLock> {
     let mut lock =
-        V2MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
+        MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
     let names: Vec<_> = config.machines.keys().cloned().collect();
     let indices: BTreeMap<_, _> = names
         .iter()
@@ -1315,14 +1315,14 @@ fn prepare_world_material(
 }
 
 struct PreparedMachineMaterial {
-    smolfile: V2SmolfileObservation,
-    image: V2ImageMaterial,
-    seeds: Vec<V2SeedObservation>,
+    smolfile: SmolfileObservation,
+    image: ImageMaterial,
+    seeds: Vec<SeedObservation>,
 }
 
 fn prepare_one_machine_material(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
     name: &str,
     index: usize,
@@ -1357,7 +1357,7 @@ fn prepare_one_machine_material(
                 sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
             validate_seed_source_for_copy(&source)?;
             validate_seed_destination(&seed.destination)?;
-            Ok(V2SeedObservation {
+            Ok(SeedObservation {
                 machine: name.to_string(),
                 source_relative_path,
                 destination: seed.destination.to_string_lossy().into_owned(),
@@ -1367,13 +1367,13 @@ fn prepare_one_machine_material(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PreparedMachineMaterial {
-        smolfile: V2SmolfileObservation {
+        smolfile: SmolfileObservation {
             authored_relative_path,
             authored_digest,
             prepared_path: material.smolfile,
             prepared_digest,
         },
-        image: V2ImageMaterial {
+        image: ImageMaterial {
             machine: name.to_string(),
             source_kind: preparation.source_kind,
             source_reference: preparation.source_reference,
@@ -1389,9 +1389,9 @@ fn prepare_one_machine_material(
 /// `check` and `up` use only the exact local inputs sealed by `prepare`.
 fn verify_material_lock(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
-    prepared: &V2MaterialLock,
+    prepared: &MaterialLock,
 ) -> Result<()> {
     prepared.validate()?;
     if prepared.resolver_abi != material_lock_resolver_abi() {
@@ -1402,7 +1402,7 @@ fn verify_material_lock(
         ));
     }
     let current =
-        V2MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
+        MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
     if prepared.world != current.world {
         return Err(format!(
             "world declaration no longer matches {}; run `smolworld prepare` again",
@@ -1443,12 +1443,12 @@ fn verify_material_lock(
 
 fn verify_one_machine_material(
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     smolvm: &Path,
-    prepared: &V2MaterialLock,
+    prepared: &MaterialLock,
     name: &str,
     index: usize,
-) -> Result<Vec<V2SeedObservation>> {
+) -> Result<Vec<SeedObservation>> {
     let machine = config
         .machines
         .get(name)
@@ -1511,7 +1511,7 @@ fn verify_one_machine_material(
                 sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
             validate_seed_source_for_copy(&source)?;
             validate_seed_destination(&seed.destination)?;
-            Ok(V2SeedObservation {
+            Ok(SeedObservation {
                 machine: name.to_string(),
                 source_relative_path,
                 destination: seed.destination.to_string_lossy().into_owned(),
@@ -1522,7 +1522,7 @@ fn verify_one_machine_material(
         .collect()
 }
 
-fn seed_identity(left: &V2SeedObservation, right: &V2SeedObservation) -> std::cmp::Ordering {
+fn seed_identity(left: &SeedObservation, right: &SeedObservation) -> std::cmp::Ordering {
     (
         &left.machine,
         &left.source_relative_path,
@@ -1542,7 +1542,7 @@ fn seed_identity(left: &V2SeedObservation, right: &V2SeedObservation) -> std::cm
 /// Create a deterministic, non-persisted NIC identity for smolvm's read-only
 /// resolver. Runtime allocation remains separate and is written only by `up`.
 fn validation_assignment(
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
     config: &WorldConfig,
     machine: &str,
     index: usize,
@@ -1562,11 +1562,11 @@ fn validation_assignment(
             host,
         ),
         mac,
-        smolvm_name: format!("smw-v2-validate-{machine}"),
+        smolvm_name: format!("smw-validate-{machine}"),
     })
 }
 
-fn validation_socket_path(paths: &V2WorldPaths, machine: &str) -> PathBuf {
+fn validation_socket_path(paths: &WorldPaths, machine: &str) -> PathBuf {
     paths.runtime_dir.join(format!("validate-{machine}.sock"))
 }
 
@@ -1642,7 +1642,7 @@ fn validate_seed_destination(destination: &Path) -> Result<()> {
 /// files whose content digests still match the prepared world.
 fn prepared_seed_files(
     config_dir: &Path,
-    material: &V2MaterialLock,
+    material: &MaterialLock,
     machine: &str,
 ) -> Result<Vec<SeedFile>> {
     material
@@ -1707,18 +1707,18 @@ mod tests {
     }
 
     #[test]
-    fn metrics_accepts_only_recorded_v2_machine_identities() {
-        assert!(require_v2_machine_identity("runner", "smw-v2-abcdef-0123").is_ok());
+    fn metrics_accepts_only_recorded_machine_identities() {
+        assert!(require_machine_identity("runner", "smw-abcdef-0123").is_ok());
         for invalid in [
             "runner",
             "smolvm-runner",
-            "smw-v1-abcdef-0123",
-            "smw-v2-/runner",
-            "smw-v2-runner\tother",
+            "smw",
+            "smw-/runner",
+            "smw-runner\tother",
         ] {
             assert!(
-                require_v2_machine_identity("runner", invalid).is_err(),
-                "expected non-v2 identity to be rejected: {invalid:?}"
+                require_machine_identity("runner", invalid).is_err(),
+                "expected unrecognized identity to be rejected: {invalid:?}"
             );
         }
     }
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn metrics_maps_the_companion_record_without_reinterpreting_it() {
         let stats = MachineStats {
-            name: "smw-v2-demo-runner".into(),
+            name: "smw-demo-runner".into(),
             state: "running".into(),
             pid: Some(42),
             cpus: 4,
@@ -1740,7 +1740,7 @@ mod tests {
         };
         let metrics = machine_metrics("runner", &stats);
         assert_eq!(metrics.machine, "runner");
-        assert_eq!(metrics.smolvm_name.as_deref(), Some("smw-v2-demo-runner"));
+        assert_eq!(metrics.smolvm_name.as_deref(), Some("smw-demo-runner"));
         assert_eq!(metrics.cpu_millis, Some(2345));
         assert_eq!(metrics.rss_mb, Some(128));
         assert_eq!(metrics.disk_used_mb, Some(64));

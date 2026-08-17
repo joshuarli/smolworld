@@ -53,4 +53,4 @@ grep -Fqx 'entrypoint = ["redis-server"]' "$redis_smolfile" || fail "redis must 
 grep -Fqx 'entrypoint = ["sleep"]' "$runner_smolfile" || fail "runner must stay available"
 grep -Fqx 'cmd = ["infinity"]' "$runner_smolfile" || fail "runner must stay available"
 
-echo "PASS: Redis foundation fixture uses v2 topology plus restricted local Smolfiles"
+echo "PASS: Redis foundation fixture uses world topology plus restricted local Smolfiles"

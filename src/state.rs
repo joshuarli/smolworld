@@ -14,19 +14,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const V2_STATE_VERSION: u8 = 2;
-const V2_LIFECYCLE_VERSION: u8 = 2;
+const STATE_VERSION: u8 = 2;
+const LIFECYCLE_VERSION: u8 = 2;
 const MATERIAL_LOCK_VERSION: u8 = 5;
 const MATERIAL_LOCK_RESOLVER_ABI: &str = "smolvm-external-world/v3";
 const WORLD_CHECKPOINT_RECEIPT_NAME: &str = "smolworld-checkpoint";
 pub(crate) const MACHINE_CHECKPOINT_RECEIPT_NAME: &str = "smolvm-checkpoint.json";
 const MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES: u64 = 1024 * 1024;
 
-/// Paths owned by the v2 materializer.  The explicit `v2` component is an
-/// ownership boundary: v2 never reads, adopts, or removes the pre-switch
-/// allocation directory.
+/// Paths owned by the world materializer. These paths are derived only from
+/// the canonical configuration, so cleanup never reads, adopts, or removes
+/// another world's allocation directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2WorldPaths {
+pub(crate) struct WorldPaths {
     pub(crate) canonical_config: PathBuf,
     pub(crate) config_dir: PathBuf,
     pub(crate) hash: u64,
@@ -35,7 +35,7 @@ pub(crate) struct V2WorldPaths {
     pub(crate) runtime_dir: PathBuf,
 }
 
-impl V2WorldPaths {
+impl WorldPaths {
     pub(crate) fn lock_path(&self) -> PathBuf {
         self.state_dir.join("world.lock")
     }
@@ -51,9 +51,9 @@ impl V2WorldPaths {
     }
 }
 
-/// Return the private v2 namespace for a configuration.  This deliberately
-/// does not inspect the v1 directory and has no fallback to it.
-pub(crate) fn v2_world_paths(config_path: &Path) -> Result<V2WorldPaths> {
+/// Return the private allocation namespace for a configuration. This
+/// deliberately does not inspect legacy state and has no fallback to it.
+pub(crate) fn world_paths(config_path: &Path) -> Result<WorldPaths> {
     let canonical_config = fs::canonicalize(config_path)
         .map_err(|error| format!("canonicalize {}: {error}", config_path.display()))?;
     let config_dir = canonical_config
@@ -64,11 +64,10 @@ pub(crate) fn v2_world_paths(config_path: &Path) -> Result<V2WorldPaths> {
     let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
     let state_dir = PathBuf::from(home)
         .join(".smolworld")
-        .join("v2")
         .join(format!("world-{hash:012x}"));
     let state_file = state_dir.join("state");
-    let runtime_dir = PathBuf::from("/tmp").join(format!("smw-v2-{hash:012x}"));
-    Ok(V2WorldPaths {
+    let runtime_dir = PathBuf::from("/tmp").join(format!("smw-{hash:012x}"));
+    Ok(WorldPaths {
         canonical_config,
         config_dir,
         hash,
@@ -80,7 +79,7 @@ pub(crate) fn v2_world_paths(config_path: &Path) -> Result<V2WorldPaths> {
 
 /// A content digest observation for one machine's Smolfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2SmolfileObservation {
+pub(crate) struct SmolfileObservation {
     /// Immutable user-authored declaration, relative to the `.smolworld`
     /// directory. This keeps a prepared world valid after a caller copies its
     /// sealed source tree into an immutable run snapshot.
@@ -96,10 +95,10 @@ pub(crate) struct V2SmolfileObservation {
 /// identity, so changing only the guest path or permissions invalidates the
 /// material record just as changing the source bytes does.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2SeedObservation {
+pub(crate) struct SeedObservation {
     pub(crate) machine: String,
     /// Source path relative to the `.smolworld` directory. See
-    /// `V2SmolfileObservation::authored_relative_path`.
+    /// `SmolfileObservation::authored_relative_path`.
     pub(crate) source_relative_path: PathBuf,
     pub(crate) destination: String,
     pub(crate) mode: u32,
@@ -109,7 +108,7 @@ pub(crate) struct V2SeedObservation {
 /// A local image/rootfs material reference resolved by the host-side resolver.
 /// Guests consume this local path; they never resolve or pull the image.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2ImageMaterial {
+pub(crate) struct ImageMaterial {
     pub(crate) machine: String,
     /// Image kind before preparation: `registry` or `local-archive`.
     pub(crate) source_kind: String,
@@ -121,15 +120,15 @@ pub(crate) struct V2ImageMaterial {
     pub(crate) image_digest: String,
 }
 
-/// Identity of the world declaration captured by a v2 material record. The
+/// Identity of the world declaration captured by a material record. The
 /// digest binds the exact declaration bytes without binding a portable lock to
 /// a developer-checkout path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2WorldIdentity {
+pub(crate) struct WorldIdentity {
     pub(crate) config_digest: String,
 }
 
-/// Durable host-side inputs for one v2 world materialization.
+/// Durable host-side inputs for one world materialization.
 ///
 /// The maps are keyed by the machine's declared name and are serialized in
 /// sorted order.  Seed observations remain a vector because a machine may
@@ -137,15 +136,15 @@ pub(crate) struct V2WorldIdentity {
 /// fields.  This is a lock/material record, not a cache: every listed local
 /// reference and digest is required for `check` to accept the prepared world.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct V2MaterialLock {
+pub(crate) struct MaterialLock {
     pub(crate) resolver_abi: String,
-    pub(crate) world: V2WorldIdentity,
-    pub(crate) smolfiles: BTreeMap<String, V2SmolfileObservation>,
-    pub(crate) seeds: Vec<V2SeedObservation>,
-    pub(crate) images: BTreeMap<String, V2ImageMaterial>,
+    pub(crate) world: WorldIdentity,
+    pub(crate) smolfiles: BTreeMap<String, SmolfileObservation>,
+    pub(crate) seeds: Vec<SeedObservation>,
+    pub(crate) images: BTreeMap<String, ImageMaterial>,
 }
 
-impl V2MaterialLock {
+impl MaterialLock {
     /// Build the identity portion from a canonical configuration path. The
     /// caller supplies the resolver ABI so an ABI change cannot reuse old
     /// prepared material accidentally.
@@ -160,7 +159,7 @@ impl V2MaterialLock {
         validate_field(resolver_abi, "resolver ABI")?;
         Ok(Self {
             resolver_abi: resolver_abi.to_string(),
-            world: V2WorldIdentity {
+            world: WorldIdentity {
                 config_digest: digest_bytes(&content),
             },
             smolfiles: BTreeMap::new(),
@@ -324,16 +323,16 @@ pub(crate) fn digest_machine_checkpoint_receipt(path: &Path) -> Result<String> {
     Ok(digest_bytes(&bytes))
 }
 
-pub(crate) fn load_v2_material_lock(path: &Path) -> Result<Option<V2MaterialLock>> {
+pub(crate) fn load_material_lock(path: &Path) -> Result<Option<MaterialLock>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read {}: {error}", path.display())),
     };
-    parse_v2_material_lock(&content).map(Some)
+    parse_material_lock(&content).map(Some)
 }
 
-pub(crate) fn write_v2_material_lock(paths: &V2WorldPaths, record: &V2MaterialLock) -> Result<()> {
+pub(crate) fn write_material_lock(paths: &WorldPaths, record: &MaterialLock) -> Result<()> {
     record.validate()?;
     // Preparation seals this file beside the authored world declaration.  It
     // must not create or inspect the runtime allocation namespace: `check`
@@ -349,7 +348,7 @@ pub(crate) fn write_v2_material_lock(paths: &V2WorldPaths, record: &V2MaterialLo
         .map_err(|error| format!("create {}: {error}", temporary.display()))?;
     fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("chmod {}: {error}", temporary.display()))?;
-    file.write_all(serialize_v2_material_lock(record).as_bytes())
+    file.write_all(serialize_material_lock(record).as_bytes())
         .map_err(|error| format!("write material lock: {error}"))?;
     file.sync_all()
         .map_err(|error| format!("sync material lock: {error}"))?;
@@ -358,7 +357,7 @@ pub(crate) fn write_v2_material_lock(paths: &V2WorldPaths, record: &V2MaterialLo
     Ok(())
 }
 
-fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
+fn parse_material_lock(content: &str) -> Result<MaterialLock> {
     let mut version = None;
     let mut resolver_abi = None;
     let mut config_digest = None;
@@ -401,7 +400,7 @@ fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
                 if smolfiles
                     .insert(
                         (*machine).to_string(),
-                        V2SmolfileObservation {
+                        SmolfileObservation {
                             authored_relative_path: normalize_relative_path(
                                 Path::new(authored_relative_path),
                                 "authored Smolfile path",
@@ -421,7 +420,7 @@ fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
             ["seed", machine, source_relative_path, destination, mode, digest] => {
                 let mode = u32::from_str_radix(mode, 8)
                     .map_err(|_| "material lock has invalid seed mode".to_string())?;
-                seeds.push(V2SeedObservation {
+                seeds.push(SeedObservation {
                     machine: (*machine).to_string(),
                     source_relative_path: normalize_relative_path(
                         Path::new(source_relative_path),
@@ -436,7 +435,7 @@ fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
                 if images
                     .insert(
                         (*machine).to_string(),
-                        V2ImageMaterial {
+                        ImageMaterial {
                             machine: (*machine).to_string(),
                             source_kind: (*source_kind).to_string(),
                             source_reference: (*source_reference).to_string(),
@@ -458,10 +457,10 @@ fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
             "material lock format is not version {MATERIAL_LOCK_VERSION}"
         ));
     }
-    let record = V2MaterialLock {
+    let record = MaterialLock {
         resolver_abi: resolver_abi
             .ok_or_else(|| "material lock is missing resolver ABI".to_string())?,
-        world: V2WorldIdentity {
+        world: WorldIdentity {
             config_digest: config_digest
                 .ok_or_else(|| "material lock is missing world identity".to_string())?,
         },
@@ -473,7 +472,7 @@ fn parse_v2_material_lock(content: &str) -> Result<V2MaterialLock> {
     Ok(record)
 }
 
-fn serialize_v2_material_lock(record: &V2MaterialLock) -> String {
+fn serialize_material_lock(record: &MaterialLock) -> String {
     let mut output = String::new();
     output.push_str(&format!("version\t{MATERIAL_LOCK_VERSION}\n"));
     output.push_str(&format!("resolver_abi\t{}\n", record.resolver_abi));
@@ -629,7 +628,7 @@ pub(crate) struct WorldLock {
 }
 
 impl WorldLock {
-    pub(crate) fn acquire_v2(paths: &V2WorldPaths) -> Result<Self> {
+    pub(crate) fn acquire(paths: &WorldPaths) -> Result<Self> {
         ensure_private_dir(&paths.state_dir)?;
         Self::acquire_at(paths.lock_path())
     }
@@ -670,8 +669,8 @@ pub(crate) fn fnv1a(input: &[u8]) -> u64 {
     hash
 }
 
-pub(crate) fn load_v2_lifecycle(path: &Path) -> Result<Option<LifecycleMetadata>> {
-    load_lifecycle_version(path, V2_LIFECYCLE_VERSION, "v2 lifecycle")
+pub(crate) fn load_lifecycle(path: &Path) -> Result<Option<LifecycleMetadata>> {
+    load_lifecycle_version(path, LIFECYCLE_VERSION, "world lifecycle")
 }
 
 fn load_lifecycle_version(
@@ -762,13 +761,13 @@ fn load_lifecycle_version(
     LifecycleMetadata::new(state, owner_pid, generation).map(Some)
 }
 
-pub(crate) fn write_v2_lifecycle(paths: &V2WorldPaths, lifecycle: LifecycleMetadata) -> Result<()> {
+pub(crate) fn write_lifecycle(paths: &WorldPaths, lifecycle: LifecycleMetadata) -> Result<()> {
     write_lifecycle_at(
         &paths.state_dir,
         paths.lifecycle_path(),
         lifecycle,
-        V2_LIFECYCLE_VERSION,
-        "v2 lifecycle",
+        LIFECYCLE_VERSION,
+        "world lifecycle",
     )
 }
 
@@ -809,8 +808,8 @@ fn write_lifecycle_at(
 /// directory. The caller must hold [`WorldLock`] before invoking this helper;
 /// the lock makes it safe to remove a temporary left by an interrupted writer
 /// without racing another lifecycle operation.
-pub(crate) fn remove_v2_stale_temporary_files(paths: &V2WorldPaths) -> Result<usize> {
-    remove_stale_temporary_files_at(&paths.state_dir, "v2 state")
+pub(crate) fn remove_stale_temporary_files(paths: &WorldPaths) -> Result<usize> {
+    remove_stale_temporary_files_at(&paths.state_dir, "world state")
 }
 
 fn remove_stale_temporary_files_at(state_dir: &Path, label: &str) -> Result<usize> {
@@ -873,23 +872,23 @@ fn is_state_temporary_file(name: &std::ffi::OsStr) -> bool {
         && name.len() > ".tmp".len() + 1
 }
 
-pub(crate) fn mark_v2_starting(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    let previous = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+pub(crate) fn mark_starting(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     let lifecycle = LifecycleMetadata::new(
         LifecycleState::Starting,
         Some(std::process::id()),
         previous.generation.wrapping_add(1),
     )?;
-    write_v2_lifecycle(paths, lifecycle)?;
+    write_lifecycle(paths, lifecycle)?;
     Ok(lifecycle)
 }
 
-pub(crate) fn mark_v2_created(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    transition_v2_lifecycle(paths, LifecycleState::Created, &[LifecycleState::Starting])
+pub(crate) fn mark_created(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(paths, LifecycleState::Created, &[LifecycleState::Starting])
 }
 
-pub(crate) fn mark_v2_attached(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    transition_v2_lifecycle(
+pub(crate) fn mark_attached(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(
         paths,
         LifecycleState::Attached,
         // A fresh `up` reaches attachment after machine creation. A durable
@@ -905,8 +904,8 @@ pub(crate) fn mark_v2_attached(paths: &V2WorldPaths) -> Result<LifecycleMetadata
     )
 }
 
-pub(crate) fn mark_v2_running(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    transition_v2_lifecycle(
+pub(crate) fn mark_running(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(
         paths,
         LifecycleState::Running,
         &[LifecycleState::Attached, LifecycleState::Running],
@@ -916,8 +915,8 @@ pub(crate) fn mark_v2_running(paths: &V2WorldPaths) -> Result<LifecycleMetadata>
 /// Record a durable capture intent before the supervisor asks any VM to freeze.
 /// A process death in this state is not ordinary stale startup: the operator
 /// must explicitly restore or release the exact retained source records.
-pub(crate) fn mark_v2_capturing(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    transition_v2_lifecycle(
+pub(crate) fn mark_capturing(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(
         paths,
         LifecycleState::Capturing,
         &[LifecycleState::Running, LifecycleState::Attached],
@@ -927,15 +926,15 @@ pub(crate) fn mark_v2_capturing(paths: &V2WorldPaths) -> Result<LifecycleMetadat
 /// Return a fully rolled-back capture attempt to its live-supervisor state.
 /// If this write fails, callers deliberately leave `Capturing` in place so a
 /// future ordinary `up` cannot erase uncertain source machines.
-pub(crate) fn mark_v2_capture_rolled_back(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    transition_v2_lifecycle(paths, LifecycleState::Running, &[LifecycleState::Capturing])
+pub(crate) fn mark_capture_rolled_back(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    transition_lifecycle(paths, LifecycleState::Running, &[LifecycleState::Capturing])
 }
 
 /// Publish a committed durable checkpoint after the supervisor has stopped
 /// every source VM. Captured state has no live owner process: the allocation
 /// and stopped smolvm records are intentionally retained for a later restore.
-pub(crate) fn mark_v2_captured(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    let previous = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+pub(crate) fn mark_captured(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if !matches!(
         previous.state,
         LifecycleState::Starting
@@ -944,7 +943,7 @@ pub(crate) fn mark_v2_captured(paths: &V2WorldPaths) -> Result<LifecycleMetadata
             | LifecycleState::Capturing
     ) {
         return Err(format!(
-            "cannot transition v2 lifecycle from {} to captured",
+            "cannot transition world lifecycle from {} to captured",
             previous.state.as_str()
         ));
     }
@@ -953,52 +952,52 @@ pub(crate) fn mark_v2_captured(paths: &V2WorldPaths) -> Result<LifecycleMetadata
         None,
         previous.generation.wrapping_add(1),
     )?;
-    write_v2_lifecycle(paths, lifecycle)?;
+    write_lifecycle(paths, lifecycle)?;
     Ok(lifecycle)
 }
 
-pub(crate) fn mark_v2_absent(paths: &V2WorldPaths) -> Result<LifecycleMetadata> {
-    let previous = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+pub(crate) fn mark_absent(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     let lifecycle = LifecycleMetadata::new(LifecycleState::Absent, None, previous.generation)?;
-    write_v2_lifecycle(paths, lifecycle)?;
+    write_lifecycle(paths, lifecycle)?;
     Ok(lifecycle)
 }
 
-fn transition_v2_lifecycle(
-    paths: &V2WorldPaths,
+fn transition_lifecycle(
+    paths: &WorldPaths,
     next: LifecycleState,
     allowed_previous: &[LifecycleState],
 ) -> Result<LifecycleMetadata> {
-    let previous = load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if !allowed_previous.contains(&previous.state) {
         return Err(format!(
-            "cannot transition v2 lifecycle from {} to {}",
+            "cannot transition world lifecycle from {} to {}",
             previous.state.as_str(),
             next.as_str()
         ));
     }
     let lifecycle = LifecycleMetadata::new(next, previous.owner_pid, previous.generation)?;
-    write_v2_lifecycle(paths, lifecycle)?;
+    write_lifecycle(paths, lifecycle)?;
     Ok(lifecycle)
 }
 
-pub(crate) fn inspect_v2_recovery(paths: &V2WorldPaths) -> Result<RecoveryStatus> {
+pub(crate) fn inspect_recovery(paths: &WorldPaths) -> Result<RecoveryStatus> {
     Ok(RecoveryStatus {
         state_file: artifact_state(&paths.state_file)?,
         lifecycle_file: artifact_state(&paths.lifecycle_path())?,
         runtime_dir: artifact_state(&paths.runtime_dir)?,
-        lifecycle: load_v2_lifecycle(&paths.lifecycle_path())?.unwrap_or_default(),
+        lifecycle: load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default(),
     })
 }
 
-pub(crate) fn prepare_v2_runtime_dir(paths: &V2WorldPaths) -> Result<()> {
+pub(crate) fn prepare_runtime_dir(paths: &WorldPaths) -> Result<()> {
     ensure_private_dir(&paths.runtime_dir)
 }
 
-/// Remove only the exact runtime directory derived for this v2 world.  A
+/// Remove only the exact runtime directory derived for this world. A
 /// missing directory is already clean; a non-directory at that path is an
 /// error rather than a reason to broaden cleanup.
-pub(crate) fn remove_v2_runtime_dir(paths: &V2WorldPaths) -> Result<()> {
+pub(crate) fn remove_runtime_dir(paths: &WorldPaths) -> Result<()> {
     match fs::symlink_metadata(&paths.runtime_dir) {
         Ok(metadata) if metadata.file_type().is_dir() => {
             fs::remove_dir_all(&paths.runtime_dir)
@@ -1006,14 +1005,14 @@ pub(crate) fn remove_v2_runtime_dir(paths: &V2WorldPaths) -> Result<()> {
         }
         Ok(_) => {
             return Err(format!(
-                "v2 runtime path is not a directory: {}",
+                "world runtime path is not a directory: {}",
                 paths.runtime_dir.display()
             ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(format!(
-                "inspect v2 runtime path {}: {error}",
+                "inspect world runtime path {}: {error}",
                 paths.runtime_dir.display()
             ));
         }
@@ -1029,8 +1028,8 @@ fn artifact_state(path: &Path) -> Result<ArtifactState> {
     }
 }
 
-pub(crate) fn load_v2_allocation_state(path: &Path) -> Result<Option<WorldAllocationState>> {
-    load_state_version(path, V2_STATE_VERSION, "v2 state")
+pub(crate) fn load_allocation_state(path: &Path) -> Result<Option<WorldAllocationState>> {
+    load_state_version(path, STATE_VERSION, "world state")
 }
 
 fn load_state_version(
@@ -1080,7 +1079,7 @@ fn load_state_version(
                 let mac = parse_mac(mac)
                     .map_err(|reason| format!("{label} machine '{name}': {reason}"))?;
                 if smolvm_name.is_empty()
-                    || !smolvm_name.starts_with("smw-v2-")
+                    || !smolvm_name.starts_with("smw-")
                     || smolvm_name.contains(['\t', '\r', '\n'])
                     || mac[0] & 3 != 2
                     || !assigned_ips.insert(ip)
@@ -1114,16 +1113,16 @@ fn load_state_version(
     }))
 }
 
-pub(crate) fn write_v2_allocation_state(
-    paths: &V2WorldPaths,
+pub(crate) fn write_allocation_state(
+    paths: &WorldPaths,
     state: &WorldAllocationState,
 ) -> Result<()> {
     write_state_at(
         &paths.state_dir,
         paths.state_file.clone(),
         state,
-        V2_STATE_VERSION,
-        "v2 state",
+        STATE_VERSION,
+        "world state",
     )
 }
 
@@ -1506,16 +1505,15 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
         .map_err(|error| format!("chmod {}: {error}", path.display()))
 }
 
-/// Allocate v2 identities only from the v2 record and paths.  This mirrors
-/// the stable address/MAC invariants of v1 while deliberately avoiding every
-/// v1 load/write/allocation entry point.
-pub(crate) fn allocate_v2_allocation_state(
+/// Allocate world identities only from the world record and paths. This keeps
+/// stable address/MAC invariants while using only the current state boundary.
+pub(crate) fn allocate_allocation_state(
     previous: Option<WorldAllocationState>,
     config: &WorldConfig,
-    paths: &V2WorldPaths,
+    paths: &WorldPaths,
 ) -> Result<WorldAllocationState> {
     let previous = previous.unwrap_or_else(|| WorldAllocationState {
-        seed: new_v2_seed(paths),
+        seed: new_seed(paths),
         assignments: BTreeMap::new(),
     });
     let mut assigned_ips = HashSet::new();
@@ -1542,7 +1540,7 @@ pub(crate) fn allocate_v2_allocation_state(
         if assignments.contains_key(name) {
             continue;
         }
-        let assignment = allocate_v2_assignment(
+        let assignment = allocate_assignment(
             previous.seed,
             paths.hash,
             name,
@@ -1560,7 +1558,7 @@ pub(crate) fn allocate_v2_allocation_state(
     })
 }
 
-pub(crate) fn new_v2_seed(paths: &V2WorldPaths) -> u64 {
+pub(crate) fn new_seed(paths: &WorldPaths) -> u64 {
     new_seed_for_config(&paths.canonical_config)
 }
 
@@ -1590,7 +1588,7 @@ pub(crate) fn valid_existing_assignment(
         && !assigned_macs.contains(&assignment.mac)
 }
 
-fn allocate_v2_assignment(
+fn allocate_assignment(
     seed: u64,
     world_hash: u64,
     name: &str,
@@ -1605,7 +1603,7 @@ fn allocate_v2_assignment(
         subnet,
         assigned_ips,
         assigned_macs,
-        "smw-v2",
+        "smw",
     )
 }
 
@@ -1703,16 +1701,16 @@ mod tests {
             self.root.join("demo/.smolworld")
         }
 
-        fn v1_state_dir(&self) -> PathBuf {
-            self.root.join("v1-state")
+        fn legacy_state_dir(&self) -> PathBuf {
+            self.root.join("home/.smolworld/v2/world-2a")
         }
 
-        fn v1_state_file(&self) -> PathBuf {
-            self.v1_state_dir().join("state")
+        fn legacy_state_file(&self) -> PathBuf {
+            self.legacy_state_dir().join("state")
         }
 
-        fn v1_lifecycle_file(&self) -> PathBuf {
-            self.v1_state_dir().join("lifecycle")
+        fn legacy_lifecycle_file(&self) -> PathBuf {
+            self.legacy_state_dir().join("lifecycle")
         }
     }
 
@@ -1722,28 +1720,28 @@ mod tests {
         }
     }
 
-    fn v2_paths_for(world: &TemporaryWorld) -> V2WorldPaths {
-        let state_dir = world.root.join("home/.smolworld/v2/world-2a");
-        V2WorldPaths {
+    fn paths_for(world: &TemporaryWorld) -> WorldPaths {
+        let state_dir = world.root.join("home/.smolworld/world-2a");
+        WorldPaths {
             canonical_config: world.config_path(),
             config_dir: world.root.join("demo"),
             hash: 42,
             state_file: state_dir.join("state"),
             state_dir,
-            runtime_dir: world.root.join("runtime-v2"),
+            runtime_dir: world.root.join("runtime"),
         }
     }
 
-    fn material_lock() -> V2MaterialLock {
-        V2MaterialLock {
+    fn material_lock() -> MaterialLock {
+        MaterialLock {
             resolver_abi: material_lock_resolver_abi().to_string(),
-            world: V2WorldIdentity {
+            world: WorldIdentity {
                 config_digest: digest_bytes(b"world: sentry-backend\n"),
             },
             smolfiles: BTreeMap::from([
                 (
                     "postgres".to_string(),
-                    V2SmolfileObservation {
+                    SmolfileObservation {
                         authored_relative_path: PathBuf::from("smol/postgres.Smolfile"),
                         authored_digest: digest_bytes(b"image = \"postgres\"\n"),
                         prepared_path: PathBuf::from(
@@ -1754,7 +1752,7 @@ mod tests {
                 ),
                 (
                     "runner".to_string(),
-                    V2SmolfileObservation {
+                    SmolfileObservation {
                         authored_relative_path: PathBuf::from("smol/runner.Smolfile"),
                         authored_digest: digest_bytes(b"image = \"runner\"\n"),
                         prepared_path: PathBuf::from("/tmp/smolworld/prepared/runner.Smolfile"),
@@ -1762,7 +1760,7 @@ mod tests {
                     },
                 ),
             ]),
-            seeds: vec![V2SeedObservation {
+            seeds: vec![SeedObservation {
                 machine: "clickhouse".to_string(),
                 source_relative_path: PathBuf::from("assets/clickhouse.xml"),
                 destination: "/etc/clickhouse-server/config.d/world.xml".to_string(),
@@ -1771,7 +1769,7 @@ mod tests {
             }],
             images: BTreeMap::from([(
                 "postgres".to_string(),
-                V2ImageMaterial {
+                ImageMaterial {
                     machine: "postgres".to_string(),
                     source_kind: "registry".to_string(),
                     source_reference: "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -1784,22 +1782,22 @@ mod tests {
     }
 
     #[test]
-    fn v2_material_lock_round_trips_all_material_identity() {
+    fn material_lock_round_trips_all_material_identity() {
         let world = TemporaryWorld::new();
         fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
         fs::write(world.config_path(), b"format: 2\n").unwrap();
-        let mut paths = v2_paths_for(&world);
+        let mut paths = paths_for(&world);
         paths.canonical_config = fs::canonicalize(world.config_path()).unwrap();
         paths.state_file = paths.state_dir.join("state");
         let record = material_lock();
-        write_v2_material_lock(&paths, &record).unwrap();
+        write_material_lock(&paths, &record).unwrap();
 
         let serialized = fs::read_to_string(paths.material_lock_path()).unwrap();
         assert!(serialized.starts_with("version\t5\nresolver_abi\tsmolvm-external-world/v3\n"));
         assert!(!serialized.contains(&world.root.display().to_string()));
         assert!(!paths.state_dir.exists());
         assert_eq!(
-            load_v2_material_lock(&paths.material_lock_path()).unwrap(),
+            load_material_lock(&paths.material_lock_path()).unwrap(),
             Some(record)
         );
     }
@@ -1821,7 +1819,7 @@ mod tests {
                     Assignment {
                         ip: "10.89.0.2".parse().unwrap(),
                         mac: [0x02, 0, 0, 0, 0, 2],
-                        smolvm_name: "smw-v2-00000000002a-runner".to_string(),
+                        smolvm_name: "smw-00000000002a-runner".to_string(),
                     },
                 )]),
             },
@@ -1886,36 +1884,36 @@ mod tests {
     }
 
     #[test]
-    fn v2_paths_are_separate_and_do_not_adopt_v1_state() {
+    fn world_paths_do_not_adopt_legacy_state() {
         let world = TemporaryWorld::new();
         fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
         fs::write(world.config_path(), b"format: 2\n").unwrap();
         let canonical_config = fs::canonicalize(world.config_path()).unwrap();
-        ensure_private_dir(&world.v1_state_dir()).unwrap();
-        fs::write(world.v1_state_file(), b"v1 allocation remains untouched\n").unwrap();
-        let mut v2 = v2_paths_for(&world);
-        v2.canonical_config = canonical_config;
+        ensure_private_dir(&world.legacy_state_dir()).unwrap();
+        fs::write(world.legacy_state_file(), b"legacy allocation remains untouched\n").unwrap();
+        let mut paths = paths_for(&world);
+        paths.canonical_config = canonical_config;
 
-        assert_ne!(world.v1_state_dir(), v2.state_dir);
-        assert_eq!(v2.state_dir.parent().unwrap().file_name().unwrap(), "v2");
+        assert_ne!(world.legacy_state_dir(), paths.state_dir);
+        assert_eq!(paths.state_dir.parent().unwrap().file_name().unwrap(), ".smolworld");
         assert_eq!(
-            load_v2_material_lock(&v2.material_lock_path()).unwrap(),
+            load_material_lock(&paths.material_lock_path()).unwrap(),
             None
         );
         let record = material_lock();
-        write_v2_material_lock(&v2, &record).unwrap();
+        write_material_lock(&paths, &record).unwrap();
         assert_eq!(
-            fs::read(world.v1_state_file()).unwrap(),
-            b"v1 allocation remains untouched\n"
+            fs::read(world.legacy_state_file()).unwrap(),
+            b"legacy allocation remains untouched\n"
         );
-        assert!(world.v1_state_file().exists());
-        assert!(!v2.state_dir.exists());
+        assert!(world.legacy_state_file().exists());
+        assert!(!paths.state_dir.exists());
     }
 
     #[test]
-    fn v2_state_round_trips_with_an_explicit_v2_version() {
+    fn state_round_trips_with_explicit_version() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
+        let paths = paths_for(&world);
         let state = WorldAllocationState {
             seed: 0xfeed,
             assignments: BTreeMap::from([(
@@ -1923,14 +1921,14 @@ mod tests {
                 Assignment {
                     ip: Ipv4Addr::new(10, 89, 0, 2),
                     mac: [0x02, 1, 2, 3, 4, 5],
-                    smolvm_name: "smw-v2-redis".to_string(),
+                    smolvm_name: "smw-redis".to_string(),
                 },
             )]),
         };
 
-        write_v2_allocation_state(&paths, &state).unwrap();
+        write_allocation_state(&paths, &state).unwrap();
         assert_eq!(
-            load_v2_allocation_state(&paths.state_file).unwrap(),
+            load_allocation_state(&paths.state_file).unwrap(),
             Some(state.clone())
         );
         assert_eq!(
@@ -1943,14 +1941,14 @@ mod tests {
     }
 
     #[test]
-    fn v2_state_rejects_duplicate_scalars_and_unsafe_allocations() {
+    fn state_rejects_duplicate_scalars_and_unsafe_allocations() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
+        let paths = paths_for(&world);
         fs::create_dir_all(&paths.state_dir).unwrap();
         let state = |body: &str| {
             fs::write(&paths.state_file, body).unwrap();
-            load_v2_allocation_state(&paths.state_file)
-                .expect_err("tampered v2 state must fail closed")
+            load_allocation_state(&paths.state_file)
+                .expect_err("tampered world state must fail closed")
         };
 
         assert!(state("version\t2\nversion\t2\nseed\t0000000000000001\n")
@@ -1959,13 +1957,13 @@ mod tests {
             .contains("repeats seed"));
         assert!(state(concat!(
             "version\t2\nseed\t0000000000000001\n",
-            "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tsmw-v2-demo-api\n",
-            "machine\tworker\t10.89.0.2\t02:00:00:00:00:03\tsmw-v2-demo-worker\n",
+            "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tsmw-demo-api\n",
+            "machine\tworker\t10.89.0.2\t02:00:00:00:00:03\tsmw-demo-worker\n",
         ))
         .contains("unsafe or repeated allocation"));
         assert!(state(concat!(
             "version\t2\nseed\t0000000000000001\n",
-            "machine\tapi\t10.89.0.2\t00:00:00:00:00:02\tsmw-v2-demo-api\n",
+            "machine\tapi\t10.89.0.2\t00:00:00:00:00:02\tsmw-demo-api\n",
         ))
         .contains("unsafe or repeated allocation"));
         assert!(state(concat!(
@@ -1976,9 +1974,9 @@ mod tests {
     }
 
     #[test]
-    fn v2_allocation_is_stable_reserved_and_version_namespaced() {
+    fn allocation_is_stable_reserved_and_namespaced() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
+        let paths = paths_for(&world);
         let config = WorldConfig {
             name: "demo".to_string(),
             network: NetworkConfig {
@@ -2007,7 +2005,7 @@ mod tests {
                 ),
             ]),
         };
-        let first = allocate_v2_allocation_state(
+        let first = allocate_allocation_state(
             Some(WorldAllocationState {
                 seed: 7,
                 assignments: BTreeMap::new(),
@@ -2016,7 +2014,7 @@ mod tests {
             &paths,
         )
         .unwrap();
-        let second = allocate_v2_allocation_state(Some(first.clone()), &config, &paths).unwrap();
+        let second = allocate_allocation_state(Some(first.clone()), &config, &paths).unwrap();
 
         assert_eq!(first, second);
         assert!(first
@@ -2026,7 +2024,7 @@ mod tests {
         assert!(first
             .assignments
             .values()
-            .all(|assignment| assignment.smolvm_name.starts_with("smw-v2-")));
+            .all(|assignment| assignment.smolvm_name.starts_with("smw-")));
         assert_ne!(
             first.assignments["redis"].ip,
             first.assignments["client"].ip
@@ -2034,30 +2032,30 @@ mod tests {
     }
 
     #[test]
-    fn v2_lifecycle_and_recovery_never_adopt_v1_files() {
+    fn lifecycle_and_recovery_never_adopt_legacy_files() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
-        ensure_private_dir(&world.v1_state_dir()).unwrap();
+        let paths = paths_for(&world);
+        ensure_private_dir(&world.legacy_state_dir()).unwrap();
         fs::write(
-            world.v1_state_file(),
+            world.legacy_state_file(),
             b"version\t1\nseed\t000000000000000b\n",
         )
         .unwrap();
         fs::write(
-            world.v1_lifecycle_file(),
+            world.legacy_lifecycle_file(),
             b"version\t1\nstate\tstarting\nowner_pid\t-\ngeneration\t0000000000000001\n",
         )
         .unwrap();
 
-        assert_eq!(load_v2_allocation_state(&paths.state_file).unwrap(), None);
-        assert_eq!(load_v2_lifecycle(&paths.lifecycle_path()).unwrap(), None);
-        let absent = inspect_v2_recovery(&paths).unwrap();
+        assert_eq!(load_allocation_state(&paths.state_file).unwrap(), None);
+        assert_eq!(load_lifecycle(&paths.lifecycle_path()).unwrap(), None);
+        let absent = inspect_recovery(&paths).unwrap();
         assert_eq!(absent.state_file, ArtifactState::Missing);
         assert_eq!(absent.lifecycle_file, ArtifactState::Missing);
         assert_eq!(absent.runtime_dir, ArtifactState::Missing);
         assert!(!absent.needs_recovery());
 
-        let lifecycle = mark_v2_starting(&paths).unwrap();
+        let lifecycle = mark_starting(&paths).unwrap();
         assert_eq!(lifecycle.state, LifecycleState::Starting);
         assert_eq!(
             fs::read_to_string(paths.lifecycle_path())
@@ -2066,7 +2064,7 @@ mod tests {
                 .next(),
             Some("version\t2")
         );
-        write_v2_allocation_state(
+        write_allocation_state(
             &paths,
             &WorldAllocationState {
                 seed: 12,
@@ -2075,38 +2073,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            load_v2_allocation_state(&paths.state_file)
+            load_allocation_state(&paths.state_file)
                 .unwrap()
                 .unwrap()
                 .seed,
             12
         );
-        assert!(inspect_v2_recovery(&paths).unwrap().needs_recovery());
+        assert!(inspect_recovery(&paths).unwrap().needs_recovery());
 
-        mark_v2_absent(&paths).unwrap();
-        assert!(!inspect_v2_recovery(&paths).unwrap().needs_recovery());
-        assert!(world.v1_state_file().exists());
-        assert!(world.v1_lifecycle_file().exists());
+        mark_absent(&paths).unwrap();
+        assert!(!inspect_recovery(&paths).unwrap().needs_recovery());
+        assert!(world.legacy_state_file().exists());
+        assert!(world.legacy_lifecycle_file().exists());
     }
 
     #[test]
     fn capture_intent_prevents_stale_world_cleanup_until_rollback_or_commit() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
+        let paths = paths_for(&world);
 
-        mark_v2_starting(&paths).unwrap();
-        mark_v2_created(&paths).unwrap();
-        mark_v2_attached(&paths).unwrap();
-        mark_v2_running(&paths).unwrap();
-        let capturing = mark_v2_capturing(&paths).unwrap();
+        mark_starting(&paths).unwrap();
+        mark_created(&paths).unwrap();
+        mark_attached(&paths).unwrap();
+        mark_running(&paths).unwrap();
+        let capturing = mark_capturing(&paths).unwrap();
         assert_eq!(capturing.state, LifecycleState::Capturing);
         assert!(capturing.state.retains_checkpoint_sources());
         assert!(!capturing.state.needs_recovery());
 
-        let rolled_back = mark_v2_capture_rolled_back(&paths).unwrap();
+        let rolled_back = mark_capture_rolled_back(&paths).unwrap();
         assert_eq!(rolled_back.state, LifecycleState::Running);
-        mark_v2_capturing(&paths).unwrap();
-        let captured = mark_v2_captured(&paths).unwrap();
+        mark_capturing(&paths).unwrap();
+        let captured = mark_captured(&paths).unwrap();
         assert_eq!(captured.state, LifecycleState::Captured);
         assert!(captured.state.retains_checkpoint_sources());
     }
@@ -2114,37 +2112,37 @@ mod tests {
     #[test]
     fn restored_world_can_attach_without_a_synthetic_create_transition() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
+        let paths = paths_for(&world);
 
-        mark_v2_starting(&paths).unwrap();
-        let attached = mark_v2_attached(&paths).unwrap();
+        mark_starting(&paths).unwrap();
+        let attached = mark_attached(&paths).unwrap();
         assert_eq!(attached.state, LifecycleState::Attached);
         assert_eq!(
-            mark_v2_running(&paths).unwrap().state,
+            mark_running(&paths).unwrap().state,
             LifecycleState::Running
         );
     }
 
     #[test]
-    fn v2_cleanup_is_scoped_to_v2_runtime_and_temporary_files() {
+    fn cleanup_is_scoped_to_world_runtime_and_temporary_files() {
         let world = TemporaryWorld::new();
-        let paths = v2_paths_for(&world);
-        ensure_private_dir(&world.v1_state_dir()).unwrap();
+        let paths = paths_for(&world);
+        ensure_private_dir(&world.legacy_state_dir()).unwrap();
         ensure_private_dir(&paths.state_dir).unwrap();
-        fs::write(paths.state_dir.join("state.123.tmp"), b"v2 temporary").unwrap();
-        fs::write(world.v1_state_dir().join("state.123.tmp"), b"v1 temporary").unwrap();
-        prepare_v2_runtime_dir(&paths).unwrap();
-        fs::write(paths.runtime_dir.join("owned"), b"v2").unwrap();
+        fs::write(paths.state_dir.join("state.123.tmp"), b"world temporary").unwrap();
+        fs::write(world.legacy_state_dir().join("state.123.tmp"), b"legacy temporary").unwrap();
+        prepare_runtime_dir(&paths).unwrap();
+        fs::write(paths.runtime_dir.join("owned"), b"world").unwrap();
 
-        assert_eq!(remove_v2_stale_temporary_files(&paths).unwrap(), 1);
-        assert!(world.v1_state_dir().join("state.123.tmp").exists());
-        assert_eq!(remove_v2_runtime_dir(&paths), Ok(()));
+        assert_eq!(remove_stale_temporary_files(&paths).unwrap(), 1);
+        assert!(world.legacy_state_dir().join("state.123.tmp").exists());
+        assert_eq!(remove_runtime_dir(&paths), Ok(()));
         assert!(!paths.runtime_dir.exists());
-        assert!(world.v1_state_dir().exists());
+        assert!(world.legacy_state_dir().exists());
     }
 
     #[test]
-    fn v2_material_lock_requires_absolute_seed_destinations_and_matching_image_keys() {
+    fn material_lock_requires_absolute_seed_destinations_and_matching_image_keys() {
         let mut record = material_lock();
         record.seeds[0].destination = "relative/path".to_string();
         assert!(record.validate().is_err());
@@ -2155,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_material_lock_keeps_oci_and_local_digest_algorithms_separate() {
+    fn material_lock_keeps_oci_and_local_digest_algorithms_separate() {
         let mut registry = material_lock();
         registry.images.get_mut("postgres").unwrap().source_digest =
             "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
@@ -2175,12 +2173,12 @@ mod tests {
     }
 
     #[test]
-    fn v2_identity_from_config_records_portable_content_digest() {
+    fn identity_from_config_records_portable_content_digest() {
         let world = TemporaryWorld::new();
         fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
         fs::write(world.config_path(), b"format: 2\n").unwrap();
         let record =
-            V2MaterialLock::from_config(&world.config_path(), material_lock_resolver_abi())
+            MaterialLock::from_config(&world.config_path(), material_lock_resolver_abi())
                 .unwrap();
         assert_eq!(record.world.config_digest, digest_bytes(b"format: 2\n"));
     }

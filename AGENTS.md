@@ -227,9 +227,9 @@ they lack a sealed tree identity. Every local input is recorded in
 * Unknown, broadcast, and multicast destination MACs flood to other attached
   ports. Known unicast targets the learned port. Detach removes the port and
   its forwarding-database entries.
-* `up` owns only deterministic `smw-v2-...` machine names recorded in v2 world
-  state. `down`, signal cleanup, restore failure cleanup, and release never
-  affect unrelated smolvm machines or v1 state.
+* `up` owns only deterministic `smw-...` machine names recorded in world state.
+  `down`, signal cleanup, restore failure cleanup, and release never affect
+  unrelated smolvm machines or legacy state.
 * Validate configuration, sealed material, and inspectable runtime
   prerequisites before creating state, listeners, or machines. Cleanup is
   always constrained by exact recorded identities.
@@ -266,7 +266,7 @@ and deletes the exact world; `down` is safe after an interrupted foreground
 process.
 
 `metrics --json` is read-only and emits a closed `schemaVersion: 1` object with
-one row per configured machine. It reads only v2 allocation records and never
+one row per configured machine. It reads only world allocation records and never
 lists or discovers unrelated smolvm machines. CPU/RSS are host VMM
 observations, and disk usage is host data-directory usage; none is guest
 process or guest-filesystem telemetry.

@@ -288,7 +288,7 @@ machines:
                     Assignment {
                         ip: "10.89.0.2".parse().unwrap(),
                         mac: [2, 0, 0, 0, 0, 2],
-                        smolvm_name: "smw-v2-redis".to_string(),
+                        smolvm_name: "smw-redis".to_string(),
                     },
                 ),
                 (
@@ -296,7 +296,7 @@ machines:
                     Assignment {
                         ip: "10.89.0.3".parse().unwrap(),
                         mac: [2, 0, 0, 0, 0, 3],
-                        smolvm_name: "smw-v2-client".to_string(),
+                        smolvm_name: "smw-client".to_string(),
                     },
                 ),
             ]),
@@ -344,7 +344,7 @@ machines:
                 Assignment {
                     ip: "10.89.0.2".parse().unwrap(),
                     mac: [2, 0, 0, 0, 0, 2],
-                    smolvm_name: "smw-v2-redis".to_string(),
+                    smolvm_name: "smw-redis".to_string(),
                 },
             )]),
         };
@@ -392,7 +392,7 @@ machines:
                 Assignment {
                     ip: "10.89.0.2".parse().unwrap(),
                     mac: [2, 0, 0, 0, 0, 2],
-                    smolvm_name: "smw-v2-redis".to_string(),
+                    smolvm_name: "smw-redis".to_string(),
                 },
             )]),
         };
