@@ -60,6 +60,27 @@ pub(crate) fn status(operation: Operation, command: &mut Command) -> Result<()> 
     status_result(operation, status)
 }
 
+/// Run a control operation whose successful output is not part of the world
+/// CLI response. Capturing stderr here preserves the upstream failure detail
+/// for checkpoint/restore transaction diagnostics without swallowing the
+/// caller-visible stdout of `exec` or `cp`.
+pub(crate) fn captured_status(operation: Operation, command: &mut Command) -> Result<()> {
+    let output = output(operation, command)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if detail.is_empty() {
+        status_result(operation, output.status)
+    } else {
+        Err(format!(
+            "upstream smolvm {} exited with {}: {detail}",
+            operation.name(),
+            output.status
+        ))
+    }
+}
+
 pub(crate) fn status_result(operation: Operation, status: ExitStatus) -> Result<()> {
     if status.success() {
         Ok(())

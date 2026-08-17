@@ -9,7 +9,8 @@ use crate::model::{
     WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
-    checkpoint_machine, cleanup_machines, copy_machine, create_machine, exec_machine, machine_stats,
+    checkpoint_machine, cleanup_machines, copy_machine, create_machine, exec_machine,
+    install_seed_files as install_machine_seed_files, machine_stats,
     machine_status as upstream_machine_status,
     materialize_external_world, preflight, release_machines, restore_machine, smolvm_program,
     start_machine, stop_machines, validate_external_world, MachineStats,
@@ -550,14 +551,12 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
                     .smolfiles
                     .get(name)
                     .expect("prepared material has every configured machine");
-                let seed_files = prepared_seed_files(&paths.config_dir, &material, name)?;
                 create_machine(
                     &smolvm,
                     MachineLaunch {
                         assignment,
                         socket: socket_paths.get(name).expect("socket allocated"),
                         smolfile: &smolfile.prepared_path,
-                        seed_files: &seed_files,
                     },
                     &config.network,
                 )
@@ -574,6 +573,11 @@ pub(crate) fn up(config_path: &Path) -> Result<()> {
                         .expect("allocated machine")
                         .smolvm_name,
                 )
+            })?;
+            parallel_machine_operations(wave, "install sealed seed files", |name| {
+                let assignment = state.assignments.get(name).expect("allocated machine");
+                let seed_files = prepared_seed_files(&paths.config_dir, &material, name)?;
+                install_machine_seed_files(&smolvm, &assignment.smolvm_name, &seed_files)
             })?;
         }
 
@@ -1351,6 +1355,7 @@ fn prepare_one_machine_material(
                 normalize_relative_path(&seed.source, "configured seed source")?;
             let source =
                 sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
+            validate_seed_source_for_copy(&source)?;
             validate_seed_destination(&seed.destination)?;
             Ok(V2SeedObservation {
                 machine: name.to_string(),
@@ -1504,6 +1509,7 @@ fn verify_one_machine_material(
                 normalize_relative_path(&seed.source, "configured seed source")?;
             let source =
                 sealed_relative_file(&paths.config_dir, &source_relative_path, "seed source")?;
+            validate_seed_source_for_copy(&source)?;
             validate_seed_destination(&seed.destination)?;
             Ok(V2SeedObservation {
                 machine: name.to_string(),
@@ -1583,15 +1589,26 @@ fn sealed_relative_file(config_dir: &Path, relative_path: &Path, label: &str) ->
             source.display()
         ));
     }
-    let source_text = canonical
+    canonical
         .to_str()
         .ok_or_else(|| format!("{label} {} is not valid UTF-8", canonical.display()))?;
-    if source_text.contains('=') {
+    Ok(canonical)
+}
+
+/// `smolvm machine cp` uses `MACHINE:/guest/path` endpoint syntax. Keep that
+/// delimiter out of sealed host inputs at preparation time instead of allowing
+/// a later launch to reinterpret a local source as a guest endpoint.
+fn validate_seed_source_for_copy(source: &Path) -> Result<()> {
+    let source_text = source
+        .to_str()
+        .ok_or_else(|| format!("seed source {} is not valid UTF-8", source.display()))?;
+    if source_text.contains(':') {
         return Err(format!(
-            "{label} {} must not contain '=' because the smolvm seed-file ABI uses SOURCE=DESTINATION:MODE", canonical.display()
+            "seed source {} cannot contain ':' because world seed copies use smolvm machine cp endpoints",
+            source.display()
         ));
     }
-    Ok(canonical)
+    Ok(())
 }
 
 fn validate_seed_destination(destination: &Path) -> Result<()> {
@@ -1611,19 +1628,18 @@ fn validate_seed_destination(destination: &Path) -> Result<()> {
         || destination_text == "/"
         || destination_text.ends_with('/')
         || destination_text.contains("//")
-        || destination_text.contains([':', '='])
     {
         return Err(format!(
-            "seed destination {} must be a non-root normalized absolute guest path without ':' or '='",
+            "seed destination {} must be a non-root normalized absolute guest path",
             destination.display()
         ));
     }
     Ok(())
 }
 
-/// Convert sealed lock observations back into smolvm's pre-workload seed-file
-/// input. The lock is re-observed before this is called, so these are canonical
-/// regular-file paths whose content digests still match the prepared world.
+/// Convert sealed lock observations into world-owned guest-copy inputs. The
+/// lock is re-observed before this is called, so these are canonical regular
+/// files whose content digests still match the prepared world.
 fn prepared_seed_files(
     config_dir: &Path,
     material: &V2MaterialLock,
@@ -1635,13 +1651,7 @@ fn prepared_seed_files(
         .filter(|seed| seed.machine == machine)
         .map(|seed| {
             let source = sealed_relative_file(config_dir, &seed.source_relative_path, "seed source")?;
-            if source.to_string_lossy().contains('=')
-                || seed.destination.contains([':', '='])
-            {
-                return Err(format!(
-                    "sealed seed for machine '{machine}' cannot be encoded for smolvm's SOURCE=DESTINATION:MODE ABI"
-                ));
-            }
+            validate_seed_source_for_copy(&source)?;
             Ok(SeedFile {
                 source,
                 destination: PathBuf::from(&seed.destination),
@@ -1656,15 +1666,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_destinations_match_the_atomic_smolvm_seed_abi() {
+    fn seed_destinations_match_the_world_seed_contract() {
         assert!(validate_seed_destination(Path::new("/etc/app/config.toml")).is_ok());
+        assert!(validate_seed_destination(Path::new("/etc/app/config:local=1.toml")).is_ok());
         for invalid in [
             "relative/config.toml",
             "/",
             "/etc/app/",
             "/etc//app/config.toml",
-            "/etc/app/config:old.toml",
-            "/etc/app/config=old.toml",
             "/etc/app/../config.toml",
         ] {
             assert!(
@@ -1672,6 +1681,8 @@ mod tests {
                 "expected invalid seed destination {invalid}"
             );
         }
+        assert!(validate_seed_source_for_copy(Path::new("/tmp/sealed-input")).is_ok());
+        assert!(validate_seed_source_for_copy(Path::new("/tmp/sealed:input")).is_err());
     }
 
     #[test]

@@ -53,7 +53,6 @@ pub(crate) struct MachineLaunch<'a> {
     pub(crate) assignment: &'a Assignment,
     pub(crate) socket: &'a Path,
     pub(crate) smolfile: &'a Path,
-    pub(crate) seed_files: &'a [SeedFile],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,6 +19,10 @@ binary="$project_dir/target/debug/smolworld"
 : "${SMOLWORLD_SMOLVM:?set SMOLWORLD_SMOLVM to the patched smolvm binary}"
 : "${SMOLVM_AGENT_ROOTFS:?set SMOLVM_AGENT_ROOTFS to a built agent rootfs}"
 : "${SMOLVM_LIB_DIR:?set SMOLVM_LIB_DIR to the matching libkrun/libkrunfw directory}"
+# A source-built smolvm is dynamically linked to libkrun. Keep the loaded
+# library pair identical to the pair that `check` validated, regardless of a
+# caller's existing shell environment.
+export DYLD_LIBRARY_PATH="$SMOLVM_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 redis_archive="${SMOLWORLD_REDIS_ARCHIVE:-$fixture_dir/redis.tar}"
 
 if [[ ! -f "$redis_archive" ]]; then
@@ -357,12 +361,14 @@ PY
         expected_ip=$1
         expected_mac=$2
         expected_dns=$3
-        set -- $(ip -o -4 addr show dev eth0)
-        test "${4%/*}" = "$expected_ip"
+        # The workload image deliberately is not a network-tools image. The
+        # kernel proc/sys views are present in every supported guest and
+        # avoid making this substrate gate depend on an `iproute2` package.
+        test -e /sys/class/net/eth0
+        grep -Eq "^[[:space:]]*\\|-- $expected_ip$" /proc/net/fib_trie
         test "$(cat /sys/class/net/eth0/address)" = "$expected_mac"
         grep -Fqx "nameserver $expected_dns" /etc/resolv.conf
-        route=$(ip -4 route get "$expected_dns")
-        case "$route" in *"dev eth0"*) ;; *) exit 1 ;; esac
+        awk '\''$1 == "eth0" && $3 == "00000000" { found = 1 } END { exit !found }'\'' /proc/net/route
     ' smolworld-e2e "$expected_ip" "$expected_mac" "10.89.0.1"
 }
 
@@ -384,7 +390,7 @@ assert_egress_contract() {
     [[ "${SMOLWORLD_E2E_EGRESS:-}" == "1" ]] || return 0
     "$binary" -f "$world_file" exec runner -- /bin/sh -ceu '
         test -e /sys/class/net/eth1
-        ip -4 route show default | grep -Eq "(^| )dev eth1( |$)"
+        awk '\''$1 == "eth1" && $2 == "00000000" { found = 1 } END { exit !found }'\'' /proc/net/route
         getent hosts one.one.one.one >/dev/null
     '
 }

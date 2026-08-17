@@ -1,5 +1,6 @@
 use crate::model::{
-    format_mac, Assignment, MachineLaunch, NetworkConfig, WorldAllocationState, WorldConfig,
+    format_mac, Assignment, MachineLaunch, NetworkConfig, SeedFile, WorldAllocationState,
+    WorldConfig,
 };
 use crate::world_protocol::{self, Operation};
 use crate::Result;
@@ -121,6 +122,42 @@ pub(crate) fn copy_machine(
         invocation.args([&remote, local_path]);
     }
     world_protocol::status(Operation::Copy, &mut invocation)
+}
+
+/// Place one sealed world input through smolvm's generic running-machine
+/// operations. The companion's specialized `--seed-file` path targets an
+/// image-overlay namespace that is not the workload namespace; keeping this
+/// step here makes the world contract observable without extending Smolfiles
+/// or adding another upstream-specific seed protocol.
+pub(crate) fn install_seed_files(smolvm: &Path, name: &str, seeds: &[SeedFile]) -> Result<()> {
+    for seed in seeds {
+        let source = seed
+            .source
+            .to_str()
+            .ok_or_else(|| format!("seed source {} is not valid UTF-8", seed.source.display()))?;
+        if source.contains(':') {
+            return Err(format!(
+                "seed source {} cannot contain ':' because smolvm machine cp uses MACHINE:/path endpoints",
+                seed.source.display()
+            ));
+        }
+        let destination = seed.destination.to_str().ok_or_else(|| {
+            format!(
+                "seed destination {} is not valid UTF-8",
+                seed.destination.display()
+            )
+        })?;
+        copy_machine(smolvm, name, destination, source, true)?;
+
+        let mode = format!("{:04o}", seed.mode);
+        let mut chmod = Command::new(smolvm);
+        chmod
+            .args(["machine", "exec", "--name", name, "--", "/bin/chmod"])
+            .arg(mode)
+            .arg(destination);
+        world_protocol::status(Operation::Exec, &mut chmod)?;
+    }
+    Ok(())
 }
 
 fn parse_machine_stats_tsv(output: &str, expected_name: &str) -> Result<MachineStats> {
@@ -616,8 +653,9 @@ pub(crate) fn create_machine(
 
 /// Build the exact, restricted `machine create` invocation without starting
 /// it. The Smolfile is the machine declaration; smolworld supplies only its
-/// generated identity, complete external NIC tuple, and already-sealed
-/// pre-workload seed copies.
+/// generated identity and complete external NIC tuple. Sealed world seed
+/// copies use the generic running-machine boundary after the agent is ready;
+/// they are deliberately not an smolvm Smolfile concern.
 fn build_machine_create_command(
     smolvm: &Path,
     launch: &MachineLaunch<'_>,
@@ -641,15 +679,6 @@ fn build_machine_create_command(
     if network.egress {
         invocation.arg("--net-egress");
     }
-    for seed in launch.seed_files {
-        invocation.args(["--seed-file"]);
-        invocation.arg(format!(
-            "{}={}:{:04o}",
-            seed.source.display(),
-            seed.destination.display(),
-            seed.mode
-        ));
-    }
     invocation
 }
 
@@ -669,7 +698,7 @@ pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Re
     command
         .args(["machine", "checkpoint", "--name", name, "--output"])
         .arg(output);
-    world_protocol::status(Operation::Checkpoint, &mut command)
+    world_protocol::captured_status(Operation::Checkpoint, &mut command)
 }
 
 /// Restore one stopped world machine from its receipt with fresh host handles.
@@ -678,7 +707,7 @@ pub(crate) fn restore_machine(smolvm: &Path, name: &str, checkpoint: &Path) -> R
     command
         .args(["machine", "restore", "--name", name, "--checkpoint"])
         .arg(checkpoint);
-    world_protocol::status(Operation::Restore, &mut command)
+    world_protocol::captured_status(Operation::Restore, &mut command)
 }
 
 pub(crate) fn status_result(action: &str, status: ExitStatus) -> Result<()> {
@@ -753,21 +782,21 @@ pub(crate) fn local_smolfile_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Assignment, SeedFile};
+    use crate::model::Assignment;
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_launch<'a>(
         assignment: &'a Assignment,
         socket: &'a Path,
         smolfile: &'a Path,
-        seed_files: &'a [SeedFile],
     ) -> MachineLaunch<'a> {
         MachineLaunch {
             assignment,
             socket,
             smolfile,
-            seed_files,
         }
     }
 
@@ -786,16 +815,10 @@ mod tests {
             mac: [0x02, 0, 0, 0, 0, 0x17],
             smolvm_name: "smw-v2-demo-api".into(),
         };
-        let seed_files = vec![SeedFile {
-            source: PathBuf::from("/tmp/clickhouse-config.xml"),
-            destination: PathBuf::from("/etc/clickhouse-server/config.d/world.xml"),
-            mode: 0o644,
-        }];
         let launch = test_launch(
             &assignment,
             Path::new("/tmp/smw-v2-api.sock"),
             Path::new("/tmp/api.Smolfile"),
-            &seed_files,
         );
         let network = NetworkConfig {
             subnet: [10, 89, 0, 0],
@@ -834,8 +857,6 @@ mod tests {
                 "10.89.0.1",
                 "--net-mac",
                 "02:00:00:00:00:17",
-                "--seed-file",
-                "/tmp/clickhouse-config.xml=/etc/clickhouse-server/config.d/world.xml:0644",
             ]
         );
     }
@@ -985,6 +1006,115 @@ mod tests {
                 .unwrap_err()
                 .contains("expected 12")
         );
+    }
+
+    #[test]
+    fn fake_upstream_exercises_world_adapter_and_fault_boundaries() {
+        let root = temporary_test_directory();
+        let fake = root.join("smolvm");
+        let log = root.join("calls");
+        let script = format!(
+            "#!/bin/sh\n\
+             printf '%s ' \"$@\" >> '{log}'\n\
+             printf '\\n' >> '{log}'\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = stats ]; then\n\
+               printf 'machine-stats-v1\\t%s\\trunning\\t42\\t1\\t256\\t1\\t1\\t2\\t2000\\t32\\t4\\n' \"$4\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = status ]; then\n\
+               printf '%s running\\n' \"$4\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = start ]; then exit 23; fi\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = stop ] && [ \"$4\" = smw-v2-fail ]; then exit 24; fi\n\
+             exit 0\n",
+            log = log.display(),
+        );
+        fs::write(&fake, script).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let stats = machine_stats(&fake, "smw-v2-runner").unwrap();
+        assert_eq!(stats.name, "smw-v2-runner");
+        assert_eq!(stats.pid, Some(42));
+        assert_eq!(machine_status(&fake, "smw-v2-runner").unwrap(), Some("running"));
+
+        let assignment = Assignment {
+            ip: "10.89.0.17".parse().unwrap(),
+            mac: [0x02, 0, 0, 0, 0, 0x17],
+            smolvm_name: "smw-v2-runner".into(),
+        };
+        let network = NetworkConfig {
+            subnet: [10, 89, 0, 0],
+            gateway: "10.89.0.1".parse().unwrap(),
+            dns: "10.89.0.1".parse().unwrap(),
+            domain: "demo.test".into(),
+            egress: true,
+        };
+        let seeds = [SeedFile {
+            source: root.join("seed"),
+            destination: PathBuf::from("/etc/demo/seed"),
+            mode: 0o640,
+        }];
+        create_machine(
+            &fake,
+            test_launch(
+                &assignment,
+                &root.join("runner.sock"),
+                &root.join("runner.Smolfile"),
+            ),
+            &network,
+        )
+        .unwrap();
+        assert!(start_machine(&fake, "smw-v2-runner")
+            .unwrap_err()
+            .contains("start"));
+        checkpoint_machine(&fake, "smw-v2-runner", &root.join("checkpoint")).unwrap();
+        restore_machine(&fake, "smw-v2-runner", &root.join("checkpoint")).unwrap();
+        exec_machine(
+            &fake,
+            "smw-v2-runner",
+            &["TOKEN=HOST_TOKEN".into()],
+            &["/bin/sh".into(), "-c".into(), "true".into()],
+        )
+        .unwrap();
+        copy_machine(
+            &fake,
+            "smw-v2-runner",
+            "/tmp/guest-file",
+            &root.join("host-file").display().to_string(),
+            true,
+        )
+        .unwrap();
+        install_seed_files(&fake, "smw-v2-runner", &seeds).unwrap();
+
+        let failing_state = WorldAllocationState {
+            seed: 1,
+            assignments: BTreeMap::from([(
+                "runner".into(),
+                Assignment {
+                    ip: "10.89.0.18".parse().unwrap(),
+                    mac: [0x02, 0, 0, 0, 0, 0x18],
+                    smolvm_name: "smw-v2-fail".into(),
+                },
+            )]),
+        };
+        assert!(release_machines(&fake, &failing_state)
+            .unwrap_err()
+            .contains("stop"));
+
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("machine create --name smw-v2-runner"));
+        assert!(calls.contains("--net-unixstream"));
+        assert!(calls.contains("--net-egress"));
+        assert!(!calls.contains("--seed-file"));
+        assert!(calls.contains("machine cp "));
+        assert!(calls.contains("/bin/chmod 0640 /etc/demo/seed"));
+        assert!(calls.contains("machine checkpoint --name smw-v2-runner"));
+        assert!(calls.contains("machine restore --name smw-v2-runner"));
+        assert!(calls.contains("machine exec --name smw-v2-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"));
+        assert!(calls.contains("machine stop --name smw-v2-fail"));
+        assert!(!calls.contains("machine delete --name smw-v2-fail -f"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn temporary_test_directory() -> PathBuf {

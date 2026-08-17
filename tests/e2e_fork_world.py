@@ -204,6 +204,7 @@ class ForkWorld:
         self.checkpoint_root: Path | None = None
         self.checkpoint_released = False
         self.environment = dict(os.environ)
+        inherited_dyld = self.environment.get("DYLD_LIBRARY_PATH")
         self.environment.update(
             {
                 "HOME": str(self.home),
@@ -212,6 +213,12 @@ class ForkWorld:
                 "SMOLVM_LIB_DIR": str(lib_dir),
                 "SMOLVM_RUNTIME_ROOT": str(self.runtime_root),
             }
+        )
+        # Keep the dynamic library actually loaded by a source-built smolvm
+        # aligned with the pair the harness validated. This avoids a stale
+        # release library silently answering a newer control command.
+        self.environment["DYLD_LIBRARY_PATH"] = str(lib_dir) + (
+            f":{inherited_dyld}" if inherited_dyld else ""
         )
 
     def smolworld_command(self, arguments: Sequence[str]) -> list[str]:
