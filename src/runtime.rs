@@ -9,9 +9,10 @@ use crate::model::{
     WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
-    checkpoint_machine, cleanup_machines, create_machine, machine_stats,
+    checkpoint_machine, cleanup_machines, copy_machine, create_machine, exec_machine, machine_stats,
+    machine_status as upstream_machine_status,
     materialize_external_world, preflight, release_machines, restore_machine, smolvm_program,
-    start_machine, status_result, stop_machines, validate_external_world, MachineStats,
+    start_machine, stop_machines, validate_external_world, MachineStats,
 };
 use crate::state::{
     allocate_v2_allocation_state, digest_file, digest_machine_checkpoint_receipt,
@@ -34,7 +35,6 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -413,14 +413,23 @@ fn bind_runtime_control_listener(paths: &V2WorldPaths) -> Result<UnixListener> {
 }
 
 fn read_runtime_control_command(stream: &mut UnixStream) -> Result<RuntimeControlCommand> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("set supervisor request timeout: {error}"))?;
+    if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+        // macOS rejects this option for an in-process UnixStream pair even
+        // though the supervisor's listener accepts it. Keep parser tests and
+        // local control callers on the same framing path.
+        if error.kind() != std::io::ErrorKind::InvalidInput {
+            return Err(format!("set supervisor request timeout: {error}"));
+        }
+    }
     let line = read_runtime_control_line(stream)?;
     let (verb, argument) = line
         .split_once('\t')
         .ok_or_else(|| "supervisor request is malformed".to_string())?;
-    if verb != "checkpoint" || argument.is_empty() || argument.contains(['\t', '\r', '\n']) {
+    if verb != "checkpoint"
+        || argument.is_empty()
+        || argument.contains(['\t', '\r', '\n'])
+        || !Path::new(argument).is_absolute()
+    {
         return Err("supervisor request is malformed".into());
     }
     Ok(RuntimeControlCommand::Checkpoint {
@@ -1141,17 +1150,7 @@ fn machine_metrics(machine: &str, stats: &MachineStats) -> MachineMetrics {
 }
 
 fn machine_status(smolvm: &Path, name: &str) -> Result<Option<&'static str>> {
-    let output = Command::new(smolvm)
-        .args(["machine", "status", "--name", name])
-        .output()
-        .map_err(|error| format!("run smolvm machine status: {error}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    Ok(["running", "created", "stopped", "failed", "unreachable"]
-        .into_iter()
-        .find(|state| text.split_whitespace().any(|word| word == *state)))
+    upstream_machine_status(smolvm, name)
 }
 
 fn display_lifecycle_state(
@@ -1193,21 +1192,7 @@ pub(crate) fn exec(
         .assignments
         .get(machine)
         .ok_or_else(|| format!("machine '{machine}' has no allocation"))?;
-    let mut invocation = Command::new(smolvm_program());
-    invocation
-        .arg("machine")
-        .arg("exec")
-        .arg("--name")
-        .arg(&assignment.smolvm_name);
-    for value in secret_env {
-        invocation.arg("--secret-env").arg(value);
-    }
-    let status = invocation
-        .arg("--")
-        .args(command)
-        .status()
-        .map_err(|error| format!("run smolvm machine exec: {error}"))?;
-    status_result("smolvm machine exec", status)
+    exec_machine(&smolvm_program(), &assignment.smolvm_name, secret_env, command)
 }
 
 /// Copy one regular host file to or from exactly one recorded world machine.
@@ -1238,24 +1223,13 @@ pub(crate) fn copy(config_path: &Path, source: &str, destination: &str) -> Resul
         .assignments
         .get(machine)
         .ok_or_else(|| format!("machine '{machine}' has no allocation"))?;
-    let remote = format!("{}:{guest_path}", assignment.smolvm_name);
-    let status = if upload {
-        Command::new(smolvm_program())
-            .arg("machine")
-            .arg("cp")
-            .arg(local_path)
-            .arg(remote)
-            .status()
-    } else {
-        Command::new(smolvm_program())
-            .arg("machine")
-            .arg("cp")
-            .arg(remote)
-            .arg(local_path)
-            .status()
-    }
-    .map_err(|error| format!("run smolvm machine cp: {error}"))?;
-    status_result("smolvm machine cp", status)
+    copy_machine(
+        &smolvm_program(),
+        &assignment.smolvm_name,
+        guest_path,
+        local_path,
+        upload,
+    )
 }
 
 fn parse_copy_remote_endpoint(value: &str) -> Result<Option<(&str, &str)>> {
@@ -1759,5 +1733,67 @@ mod tests {
         assert_eq!(metrics.cpu_millis, Some(2345));
         assert_eq!(metrics.rss_mb, Some(128));
         assert_eq!(metrics.disk_used_mb, Some(64));
+    }
+
+    #[test]
+    fn supervisor_control_accepts_only_one_absolute_checkpoint_path() {
+        let parse = |message: &str| {
+            let (mut reader, mut writer) = UnixStream::pair().unwrap();
+            writer.write_all(message.as_bytes()).unwrap();
+            drop(writer);
+            read_runtime_control_command(&mut reader)
+        };
+        match parse("checkpoint\t/private/tmp/world\n") {
+            Ok(RuntimeControlCommand::Checkpoint { output }) => {
+                assert_eq!(output, PathBuf::from("/private/tmp/world"));
+            }
+            Err(error) => panic!("valid supervisor request failed: {error}"),
+        }
+        for invalid in [
+            "checkpoint\trelative\n",
+            "checkpoint\t/private/tmp/world\textra\n",
+            "restore\t/private/tmp/world\n",
+            "checkpoint\t/private/tmp/world\r\n",
+        ] {
+            assert!(parse(invalid).is_err(), "expected invalid control request {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_staging_never_overwrites_a_visible_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "smolworld-checkpoint-staging-test-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let output = root.join("world");
+        fs::create_dir(&output).unwrap();
+        assert!(create_world_checkpoint_staging(&output)
+            .unwrap_err()
+            .contains("refusing to overwrite"));
+        fs::remove_dir(&output).unwrap();
+        let (parent, staging) = create_world_checkpoint_staging(&output).unwrap();
+        assert_eq!(parent, root);
+        assert!(staging.is_dir());
+        assert!(!output.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn parallel_operations_wait_for_every_machine_before_returning_the_first_error() {
+        let names = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+        let error = parallel_machine_operations(&names, "test", |name| {
+            completed.fetch_add(1, Ordering::SeqCst);
+            if name == "second" {
+                Err("injected failure".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("second"));
+        assert_eq!(completed.load(Ordering::SeqCst), names.len());
     }
 }

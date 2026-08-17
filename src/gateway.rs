@@ -370,6 +370,67 @@ machines:
         assert_eq!(gateway.handle(&invalid_total_length), None);
     }
 
+    #[test]
+    fn dns_is_case_insensitive_and_distinguishes_nxdomain_from_known_non_a() {
+        let config = parse_config(
+            r#"
+format: 2
+world:
+  name: demo
+network:
+  subnet: 10.89.0.0/24
+machines:
+  redis:
+    smolfile: ./redis.Smolfile
+"#,
+        )
+        .unwrap();
+        let state = WorldAllocationState {
+            seed: 7,
+            assignments: BTreeMap::from([(
+                "redis".to_string(),
+                Assignment {
+                    ip: "10.89.0.2".parse().unwrap(),
+                    mac: [2, 0, 0, 0, 0, 2],
+                    smolvm_name: "smw-v2-redis".to_string(),
+                },
+            )]),
+        };
+        let gateway = Gateway::new(&config, &state);
+        let client_mac = [2, 0, 0, 0, 0, 9];
+        let client_ip = [10, 89, 0, 9];
+
+        let reply = gateway
+            .handle(&dns_request(
+                client_mac,
+                client_ip,
+                gateway.mac,
+                gateway.ip,
+                "ReDiS.DeMo",
+            ))
+            .unwrap();
+        assert!(reply.ends_with(&[10, 89, 0, 2]));
+
+        let unknown = gateway
+            .handle(&dns_request(
+                client_mac,
+                client_ip,
+                gateway.mac,
+                gateway.ip,
+                "missing.demo",
+            ))
+            .unwrap();
+        let dns_start = 14 + 20 + 8;
+        assert_eq!(u16::from_be_bytes([unknown[dns_start + 2], unknown[dns_start + 3]]) & 0x000f, 3);
+
+        let mut known_aaaa = dns_request(client_mac, client_ip, gateway.mac, gateway.ip, "redis");
+        let query_type = known_aaaa.len() - 4;
+        known_aaaa[query_type..query_type + 2].copy_from_slice(&28_u16.to_be_bytes());
+        let reply = gateway.handle(&known_aaaa).unwrap();
+        assert_eq!(&reply[dns_start + 2..dns_start + 4], &0x8180_u16.to_be_bytes());
+        assert_eq!(&reply[dns_start + 6..dns_start + 8], &0_u16.to_be_bytes());
+    }
+
     fn dns_request(
         client_mac: [u8; 6],
         client_ip: [u8; 4],

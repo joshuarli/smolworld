@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Fast, VM-free contract check for the Redis foundation fixture.
 #
-# Keep this check independent of smolworld's parser while the v2 Smolfile
-# boundary is being implemented. It catches accidental reintroduction of the
-# legacy image/command fields and of host-capability settings in the fixture.
+# Keep this check independent of smolworld's parser while the format-2 world
+# configuration boundary is being implemented. Smolfiles remain upstream;
+# this catches accidental reintroduction of legacy world-level image/command
+# fields and host-capability settings in the fixture.
 
 set -euo pipefail
 

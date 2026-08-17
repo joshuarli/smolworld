@@ -410,6 +410,48 @@ mod tests {
     }
 
     #[test]
+    fn detach_removes_the_port_and_every_learned_address() {
+        let (writer, _peer) = UnixStream::pair().unwrap();
+        let mut ports = BTreeMap::from([(
+            "runner".to_string(),
+            Arc::new(Mutex::new(writer)),
+        )]);
+        let mut active = BTreeMap::from([("runner".to_string(), 7)]);
+        let mut fdb = HashMap::from([
+            ([0x02, 0, 0, 0, 0, 2], "runner".to_string()),
+            ([0x02, 0, 0, 0, 0, 3], "other".to_string()),
+        ]);
+
+        detach_port("runner", &mut ports, &mut active, &mut fdb);
+
+        assert!(ports.is_empty());
+        assert!(active.is_empty());
+        assert!(!fdb.contains_key(&[0x02, 0, 0, 0, 0, 2]));
+        assert_eq!(fdb[&[0x02, 0, 0, 0, 0, 3]], "other");
+    }
+
+    #[test]
+    fn malformed_or_truncated_port_frames_do_not_reach_the_switch() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let (events, observed) = mpsc::channel();
+        let reader = thread::spawn(move || read_port_frames("runner", 4, receiver, &events));
+
+        sender.write_all(&13_u32.to_be_bytes()).unwrap();
+        drop(sender);
+        reader.join().unwrap();
+        assert!(observed.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let (events, observed) = mpsc::channel();
+        let reader = thread::spawn(move || read_port_frames("runner", 5, receiver, &events));
+        sender.write_all(&14_u32.to_be_bytes()).unwrap();
+        sender.write_all(&[0; 5]).unwrap();
+        drop(sender);
+        reader.join().unwrap();
+        assert!(observed.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
     fn accepted_port_stream_blocks_until_a_frame_is_available() {
         let (mut reader, mut writer) = UnixStream::pair().unwrap();
         reader.set_nonblocking(true).unwrap();

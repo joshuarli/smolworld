@@ -397,6 +397,12 @@ SMOLVM_LIB_DIR=/path/to/smolvm/lib \
 bash tests/e2e-redis-foundation.sh
 ```
 
+Set `SMOLWORLD_E2E_EGRESS=1` with the same inputs to run the explicit opt-in
+egress variant. It proves the private NIC remains `eth0`, smolvm adds its
+existing NAT NIC as `eth1`, the default route uses `eth1`, and an unknown DNS
+name is forwarded through the gateway. The default foundation run remains
+offline and has no egress dependency.
+
 The fork and coordinated durable-world gates are opt-in measurements for the
 external NIC and checkpoint boundaries:
 

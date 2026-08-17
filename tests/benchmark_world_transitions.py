@@ -28,6 +28,8 @@ cannot affect timing or byte measurements.
 from __future__ import annotations
 
 import os
+import json
+import secrets
 import shutil
 import signal
 import subprocess
@@ -125,22 +127,23 @@ class SmolvmBenchmark:
         self.owned_names: list[str] = []
         self.iteration_names: list[str] = []
 
-    def command(self, arguments: Sequence[str], *, check: bool = True) -> None:
+    def command(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             [str(self.smolvm_bin), *arguments],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE if check else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             check=False,
         )
-        if check and completed.returncode != 0:
+        if completed.returncode != 0:
             if completed.stderr:
                 sys.stderr.write(completed.stderr)
             rendered = " ".join(arguments)
             raise BenchmarkError(
                 f"smolvm command failed with exit {completed.returncode}: {rendered}"
             )
+        return completed
 
     def register_machine(self, name: str) -> None:
         # Children and cold controls are registered after their golden. Deleting
@@ -148,22 +151,53 @@ class SmolvmBenchmark:
         self.owned_names.append(name)
         self.iteration_names.append(name)
 
+    def assert_name_absent(self, name: str) -> None:
+        """Refuse to claim a machine name which this benchmark did not create."""
+
+        output = self.command(["machine", "ls", "--json"]).stdout
+        try:
+            machines = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise BenchmarkError(f"smolvm machine ls emitted invalid JSON: {error}") from error
+        if not isinstance(machines, list):
+            raise BenchmarkError("smolvm machine ls JSON is not an array")
+        observed = {
+            machine.get("name")
+            for machine in machines
+            if isinstance(machine, dict) and isinstance(machine.get("name"), str)
+        }
+        if name in observed:
+            raise BenchmarkError(
+                f"refusing to reuse existing machine name {name}; benchmark owns only newly created names"
+            )
+
     def delete_names(self, names: Sequence[str]) -> None:
+        failures: list[str] = []
         for name in reversed(names):
-            self.command(["machine", "delete", "--name", name, "-f"], check=False)
-            if name in self.owned_names:
-                self.owned_names.remove(name)
+            try:
+                self.command(["machine", "delete", "--name", name, "-f"])
+            except BenchmarkError as error:
+                failures.append(str(error))
+                continue
+            self.owned_names.remove(name)
+            if name in self.iteration_names:
+                self.iteration_names.remove(name)
+        if failures:
+            raise BenchmarkError("benchmark cleanup failed: " + "; ".join(failures))
 
     def cleanup_iteration(self) -> None:
-        self.delete_names(self.iteration_names)
-        self.iteration_names = []
+        self.delete_names(self.iteration_names[:])
 
     def cleanup(self) -> None:
         self.delete_names(self.owned_names[:])
-        shutil.rmtree(self.runtime_root, ignore_errors=True)
+        shutil.rmtree(self.runtime_root)
+        if self.runtime_root.exists():
+            raise BenchmarkError(
+                f"benchmark cleanup left its private runtime root: {self.runtime_root}"
+            )
 
     def create_machine(self, name: str) -> None:
-        self.register_machine(name)
+        self.assert_name_absent(name)
         self.command(
             [
                 "machine",
@@ -186,6 +220,7 @@ class SmolvmBenchmark:
                 "exec sleep infinity",
             ]
         )
+        self.register_machine(name)
 
     def start_golden(self, name: str) -> None:
         self.command(["machine", "start", "--name", name, "--forkable"])
@@ -194,8 +229,9 @@ class SmolvmBenchmark:
         self.command(["machine", "start", "--name", name])
 
     def fork(self, golden: str, clone: str) -> None:
-        self.register_machine(clone)
+        self.assert_name_absent(clone)
         self.command(["machine", "fork", "--golden", golden, "--name", clone])
+        self.register_machine(clone)
 
     def write_mutation(self, name: str, marker: str) -> None:
         # `marker` is an argument, not source text. Keeping the guest script
@@ -259,7 +295,9 @@ def main() -> int:
     # A deep macOS TMPDIR forces SmolVM to a shared fallback socket root. A
     # unique direct child of /tmp stays below Darwin's sockaddr_un path limit,
     # preserving both private state and a valid byte census.
-    runtime_root = Path(tempfile.mkdtemp(prefix="smolworld-transition-benchmark.", dir="/tmp"))
+    runtime_root = Path(
+        tempfile.mkdtemp(prefix=f"smolworld-transition-benchmark-{secrets.token_hex(8)}.", dir="/tmp")
+    )
     os.environ["SMOLVM_AGENT_ROOTFS"] = str(agent_rootfs)
     os.environ["SMOLVM_RUNTIME_ROOT"] = str(runtime_root)
     benchmark = SmolvmBenchmark(smolvm_bin, archive, runtime_root)

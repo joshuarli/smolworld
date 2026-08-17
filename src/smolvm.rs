@@ -1,6 +1,7 @@
 use crate::model::{
     format_mac, Assignment, MachineLaunch, NetworkConfig, WorldAllocationState, WorldConfig,
 };
+use crate::world_protocol::{self, Operation};
 use crate::Result;
 use std::env;
 use std::fs;
@@ -59,10 +60,9 @@ const MACHINE_STATS_TSV_ABI: &str = "machine-stats-v1";
 /// subprocess boundary. The caller is responsible for proving that `name` is
 /// a v2 world identity before invoking this function.
 pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
-    let output = Command::new(smolvm)
-        .args(["machine", "stats", "--name", name, "--format", "tsv"])
-        .output()
-        .map_err(|error| format!("run smolvm machine stats {name}: {error}"))?;
+    let mut command = Command::new(smolvm);
+    command.args(["machine", "stats", "--name", name, "--format", "tsv"]);
+    let output = world_protocol::output(Operation::Stats, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm machine stats {name} exited with {}: {}",
@@ -73,6 +73,54 @@ pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "smolvm machine stats emitted non-UTF-8 output".to_string())?;
     parse_machine_stats_tsv(stdout, name)
+}
+
+/// Query an exact recorded identity through the upstream status command. This
+/// keeps its human-oriented response parsing contained in the adapter.
+pub(crate) fn machine_status(smolvm: &Path, name: &str) -> Result<Option<&'static str>> {
+    let mut command = Command::new(smolvm);
+    command.args(["machine", "status", "--name", name]);
+    let output = world_protocol::output(Operation::Status, &mut command)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(["running", "created", "stopped", "failed", "unreachable"]
+        .into_iter()
+        .find(|state| text.split_whitespace().any(|word| word == *state)))
+}
+
+pub(crate) fn exec_machine(
+    smolvm: &Path,
+    name: &str,
+    secret_env: &[String],
+    command: &[String],
+) -> Result<()> {
+    let mut invocation = Command::new(smolvm);
+    invocation.args(["machine", "exec", "--name", name]);
+    for value in secret_env {
+        invocation.args(["--secret-env", value]);
+    }
+    invocation.arg("--").args(command);
+    world_protocol::status(Operation::Exec, &mut invocation)
+}
+
+pub(crate) fn copy_machine(
+    smolvm: &Path,
+    name: &str,
+    guest_path: &str,
+    local_path: &str,
+    upload: bool,
+) -> Result<()> {
+    let remote = format!("{name}:{guest_path}");
+    let mut invocation = Command::new(smolvm);
+    invocation.args(["machine", "cp"]);
+    if upload {
+        invocation.args([local_path, &remote]);
+    } else {
+        invocation.args([&remote, local_path]);
+    }
+    world_protocol::status(Operation::Copy, &mut invocation)
 }
 
 fn parse_machine_stats_tsv(output: &str, expected_name: &str) -> Result<MachineStats> {
@@ -159,17 +207,16 @@ pub(crate) fn materialize_external_world(
     smolvm: &Path,
     smolfile: &Path,
 ) -> Result<PreparedExternalWorldSmolfile> {
-    let output = Command::new(smolvm)
-        .args([
+    let mut command = Command::new(smolvm);
+    command.args([
             "smolfile",
             "materialize-external",
             "--format",
             "tsv",
             "--smolfile",
         ])
-        .arg(smolfile)
-        .output()
-        .map_err(|error| format!("run smolvm external-world materialization: {error}"))?;
+        .arg(smolfile);
+    let output = world_protocol::output(Operation::Prepare, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm external-world materialization exited with {}: {}",
@@ -292,9 +339,7 @@ pub(crate) fn validate_external_world(
     if network.egress {
         command.arg("--net-egress");
     }
-    let output = command
-        .output()
-        .map_err(|error| format!("run smolvm external-world validation: {error}"))?;
+    let output = world_protocol::output(Operation::Validate, &mut command)?;
     if !output.status.success() {
         return Err(format!(
             "smolvm external-world validation exited with {}: {}",
@@ -565,14 +610,8 @@ pub(crate) fn create_machine(
     launch: MachineLaunch<'_>,
     network: &NetworkConfig,
 ) -> Result<()> {
-    let name = launch.assignment.smolvm_name.clone();
     let mut invocation = build_machine_create_command(smolvm, &launch, network);
-    status_result(
-        &format!("create machine {name}"),
-        invocation
-            .status()
-            .map_err(|error| format!("run smolvm machine create: {error}"))?,
-    )
+    world_protocol::status(Operation::Create, &mut invocation)
 }
 
 /// Build the exact, restricted `machine create` invocation without starting
@@ -619,37 +658,27 @@ fn build_machine_create_command(
 /// socket up front makes the supervisor's later durable checkpoint barrier a
 /// capture operation rather than a cold restart of the machine.
 pub(crate) fn start_machine(smolvm: &Path, name: &str) -> Result<()> {
-    status_result(
-        &format!("start machine {name}"),
-        Command::new(smolvm)
-            .args(["machine", "start", "--name", name, "--forkable"])
-            .status()
-            .map_err(|error| format!("run smolvm machine start: {error}"))?,
-    )
+    let mut command = Command::new(smolvm);
+    command.args(["machine", "start", "--name", name, "--forkable"]);
+    world_protocol::status(Operation::Start, &mut command)
 }
 
 /// Capture one forkable world machine into a checkpoint-owned subdirectory.
 pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Result<()> {
-    status_result(
-        &format!("checkpoint machine {name}"),
-        Command::new(smolvm)
-            .args(["machine", "checkpoint", "--name", name, "--output"])
-            .arg(output)
-            .status()
-            .map_err(|error| format!("run smolvm machine checkpoint: {error}"))?,
-    )
+    let mut command = Command::new(smolvm);
+    command
+        .args(["machine", "checkpoint", "--name", name, "--output"])
+        .arg(output);
+    world_protocol::status(Operation::Checkpoint, &mut command)
 }
 
 /// Restore one stopped world machine from its receipt with fresh host handles.
 pub(crate) fn restore_machine(smolvm: &Path, name: &str, checkpoint: &Path) -> Result<()> {
-    status_result(
-        &format!("restore machine {name}"),
-        Command::new(smolvm)
-            .args(["machine", "restore", "--name", name, "--checkpoint"])
-            .arg(checkpoint)
-            .status()
-            .map_err(|error| format!("run smolvm machine restore: {error}"))?,
-    )
+    let mut command = Command::new(smolvm);
+    command
+        .args(["machine", "restore", "--name", name, "--checkpoint"])
+        .arg(checkpoint);
+    world_protocol::status(Operation::Restore, &mut command)
 }
 
 pub(crate) fn status_result(action: &str, status: ExitStatus) -> Result<()> {
@@ -669,11 +698,12 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationStat
         // `machine stop` separately and ignoring its result can race the
         // delete, leaving an orphaned _boot-vm process after the world lock
         // has been released.
-        let _ = Command::new(smolvm)
+        let mut command = Command::new(smolvm);
+        command
             .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        let _ = world_protocol::status(Operation::Delete, &mut command);
     }
 }
 
@@ -682,11 +712,12 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationStat
 /// never deletes any smolvm configuration or another world's machine.
 pub(crate) fn stop_machines(smolvm: &Path, state: &WorldAllocationState) {
     for assignment in state.assignments.values() {
-        let _ = Command::new(smolvm)
+        let mut command = Command::new(smolvm);
+        command
             .args(["machine", "stop", "--name", &assignment.smolvm_name])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+            .stderr(Stdio::null());
+        let _ = world_protocol::status(Operation::Stop, &mut command);
     }
 }
 
@@ -696,29 +727,12 @@ pub(crate) fn stop_machines(smolvm: &Path, state: &WorldAllocationState) {
 /// of silently broadening or abandoning the requested cleanup.
 pub(crate) fn release_machines(smolvm: &Path, state: &WorldAllocationState) -> Result<()> {
     for assignment in state.assignments.values() {
-        let stop = Command::new(smolvm)
-            .args(["machine", "stop", "--name", &assignment.smolvm_name])
-            .status()
-            .map_err(|error| {
-                format!(
-                    "run smolvm machine stop {}: {error}",
-                    assignment.smolvm_name
-                )
-            })?;
-        status_result(&format!("stop machine {}", assignment.smolvm_name), stop)?;
-        let delete = Command::new(smolvm)
-            .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
-            .status()
-            .map_err(|error| {
-                format!(
-                    "run smolvm machine delete {}: {error}",
-                    assignment.smolvm_name
-                )
-            })?;
-        status_result(
-            &format!("delete machine {}", assignment.smolvm_name),
-            delete,
-        )?;
+        let mut stop = Command::new(smolvm);
+        stop.args(["machine", "stop", "--name", &assignment.smolvm_name]);
+        world_protocol::status(Operation::Stop, &mut stop)?;
+        let mut delete = Command::new(smolvm);
+        delete.args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"]);
+        world_protocol::status(Operation::Delete, &mut delete)?;
     }
     Ok(())
 }

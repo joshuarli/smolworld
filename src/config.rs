@@ -593,4 +593,21 @@ machines:
         ))
         .is_err());
     }
+
+    #[test]
+    fn rejects_semantically_invalid_network_and_dependency_boundaries() {
+        let base = |network: &str, machine: &str| {
+            format!(
+                "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: {network}\nmachines:\n  {machine}:\n    smolfile: ./{machine}.Smolfile\n"
+            )
+        };
+        assert!(parse_config(&base("10.89.0.0/24\n  gateway: 10.90.0.1", "api")).is_err());
+        assert!(parse_config(&base("10.89.0.0/24\n  domain: Demo.TEST", "api")).is_err());
+        assert!(parse_config(&base("10.89.0.0/24", "API")).is_err());
+        assert!(parse_config(
+            "format: 2\nworld:\n  name: demo\nnetwork:\n  subnet: 10.89.0.0/24\nmachines:\n  api:\n    smolfile: ./api.Smolfile\n    depends_on: [missing]\n"
+        )
+        .unwrap_err()
+        .contains("unknown machine"));
+    }
 }

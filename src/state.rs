@@ -1046,6 +1046,8 @@ fn load_state_version(
     let mut version = None;
     let mut seed = None;
     let mut assignments = BTreeMap::new();
+    let mut assigned_ips = HashSet::new();
+    let mut assigned_macs = HashSet::new();
     for line in content.lines() {
         if line.is_empty() {
             continue;
@@ -1053,29 +1055,46 @@ fn load_state_version(
         let fields: Vec<&str> = line.split('\t').collect();
         match fields.as_slice() {
             ["version", value] => {
-                version = Some(
+                let parsed =
                     value
                         .parse::<u8>()
-                        .map_err(|_| format!("{label} has invalid version"))?,
-                )
+                        .map_err(|_| format!("{label} has invalid version"))?;
+                if version.replace(parsed).is_some() {
+                    return Err(format!("{label} repeats version"));
+                }
             }
             ["seed", value] => {
-                seed = Some(
+                let parsed =
                     u64::from_str_radix(value, 16)
-                        .map_err(|_| format!("{label} has invalid seed"))?,
-                )
+                        .map_err(|_| format!("{label} has invalid seed"))?;
+                if seed.replace(parsed).is_some() {
+                    return Err(format!("{label} repeats seed"));
+                }
             }
             ["machine", name, ip, mac, smolvm_name] => {
                 validate_label(name)
                     .map_err(|reason| format!("{label} machine '{name}': {reason}"))?;
+                let ip = ip
+                    .parse()
+                    .map_err(|_| format!("{label} machine '{name}' has invalid IP"))?;
+                let mac = parse_mac(mac)
+                    .map_err(|reason| format!("{label} machine '{name}': {reason}"))?;
+                if smolvm_name.is_empty()
+                    || !smolvm_name.starts_with("smw-v2-")
+                    || smolvm_name.contains(['\t', '\r', '\n'])
+                    || mac[0] & 3 != 2
+                    || !assigned_ips.insert(ip)
+                    || !assigned_macs.insert(mac)
+                {
+                    return Err(format!(
+                        "{label} machine '{name}' has an unsafe or repeated allocation"
+                    ));
+                }
                 let previous = assignments.insert(
                     (*name).to_string(),
                     Assignment {
-                        ip: ip
-                            .parse()
-                            .map_err(|_| format!("{label} machine '{name}' has invalid IP"))?,
-                        mac: parse_mac(mac)
-                            .map_err(|reason| format!("{label} machine '{name}': {reason}"))?,
+                        ip,
+                        mac,
                         smolvm_name: (*smolvm_name).to_string(),
                     },
                 );
@@ -1921,6 +1940,39 @@ mod tests {
                 .next(),
             Some("version\t2")
         );
+    }
+
+    #[test]
+    fn v2_state_rejects_duplicate_scalars_and_unsafe_allocations() {
+        let world = TemporaryWorld::new();
+        let paths = v2_paths_for(&world);
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let state = |body: &str| {
+            fs::write(&paths.state_file, body).unwrap();
+            load_v2_allocation_state(&paths.state_file)
+                .expect_err("tampered v2 state must fail closed")
+        };
+
+        assert!(state("version\t2\nversion\t2\nseed\t0000000000000001\n")
+            .contains("repeats version"));
+        assert!(state("version\t2\nseed\t0000000000000001\nseed\t0000000000000002\n")
+            .contains("repeats seed"));
+        assert!(state(concat!(
+            "version\t2\nseed\t0000000000000001\n",
+            "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tsmw-v2-demo-api\n",
+            "machine\tworker\t10.89.0.2\t02:00:00:00:00:03\tsmw-v2-demo-worker\n",
+        ))
+        .contains("unsafe or repeated allocation"));
+        assert!(state(concat!(
+            "version\t2\nseed\t0000000000000001\n",
+            "machine\tapi\t10.89.0.2\t00:00:00:00:00:02\tsmw-v2-demo-api\n",
+        ))
+        .contains("unsafe or repeated allocation"));
+        assert!(state(concat!(
+            "version\t2\nseed\t0000000000000001\n",
+            "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tnot-a-world-machine\n",
+        ))
+        .contains("unsafe or repeated allocation"));
     }
 
     #[test]
