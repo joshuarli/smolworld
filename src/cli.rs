@@ -1,7 +1,25 @@
 use crate::Result;
+use lexopt::{Arg, Parser};
 use std::fmt;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::str::FromStr;
+
+mod check;
+mod checkpoint;
+mod cp;
+mod down;
+mod exec;
+mod metrics;
+mod prepare;
+mod ps;
+mod release;
+mod restore;
+mod up;
+
+pub(crate) use ps::PsFormat;
+#[cfg(test)]
+pub(crate) use ps::parse_ps_options;
 
 /// The machine lifecycle states exposed by `ps`.
 ///
@@ -80,24 +98,9 @@ impl MachineStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PsFormat {
-    Table,
-    Json,
-}
-
-/// Parsed options for machine visibility.
-///
-/// The parser keeps the format choice together with the selected config so
-/// `Cli::Ps` and `runtime::ps` cannot silently disagree about output mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PsOptions {
-    pub(crate) config: PathBuf,
-    pub(crate) format: PsFormat,
-}
-
 pub(crate) enum Cli {
-    Help,
+    Help { command: Option<String> },
+    Version,
     Up {
         config: PathBuf,
     },
@@ -138,8 +141,8 @@ pub(crate) enum Cli {
     Exec {
         config: PathBuf,
         machine: String,
-        secret_env: Vec<String>,
-        command: Vec<String>,
+        secret_env: Vec<OsString>,
+        command: Vec<OsString>,
     },
     Cp {
         config: PathBuf,
@@ -148,283 +151,491 @@ pub(crate) enum Cli {
     },
 }
 
-pub(crate) fn parse_cli(args: Vec<String>) -> Result<Cli> {
+/// Metadata shared by the parser and every help view. Command modules expose
+/// one `SPEC`; the renderer walks those values recursively, so the top-level
+/// help cannot accidentally omit a command's options or positionals.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OptionSpec {
+    pub(crate) short: Option<char>,
+    pub(crate) long: &'static str,
+    pub(crate) value_name: Option<&'static str>,
+    pub(crate) required: bool,
+    pub(crate) repeatable: bool,
+    pub(crate) default: Option<&'static str>,
+    pub(crate) help: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PositionalSpec {
+    pub(crate) name: &'static str,
+    pub(crate) required: bool,
+    pub(crate) repeatable: bool,
+    pub(crate) help: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommandSpec {
+    pub(crate) name: &'static str,
+    pub(crate) about: &'static str,
+    pub(crate) options: &'static [OptionSpec],
+    pub(crate) positionals: &'static [PositionalSpec],
+    pub(crate) examples: &'static [&'static str],
+    pub(crate) subcommands: &'static [&'static CommandSpec],
+}
+
+pub(crate) const FILE_OPTION: OptionSpec = OptionSpec {
+    short: Some('f'),
+    long: "file",
+    value_name: Some("PATH"),
+    required: false,
+    repeatable: false,
+    default: Some(".smolworld"),
+    help: "Select the authored .smolworld file",
+};
+
+pub(crate) const JSON_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "json",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Use the stable JSON presentation",
+};
+
+pub(crate) const METRICS_JSON_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "json",
+    value_name: None,
+    required: true,
+    repeatable: false,
+    default: None,
+    help: "Use the stable JSON presentation",
+};
+
+pub(crate) const OUTPUT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "output",
+    value_name: Some("DIR"),
+    required: true,
+    repeatable: false,
+    default: None,
+    help: "Write the new checkpoint into this directory",
+};
+
+pub(crate) const CHECKPOINT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "checkpoint",
+    value_name: Some("DIR"),
+    required: true,
+    repeatable: false,
+    default: None,
+    help: "Use this retained checkpoint directory",
+};
+
+pub(crate) const SECRET_ENV_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "secret-env",
+    value_name: Some("GUEST=HOST_ENV"),
+    required: false,
+    repeatable: true,
+    default: None,
+    help: "Pass one selected host environment variable to the guest command",
+};
+
+pub(crate) const HELP_OPTION: OptionSpec = OptionSpec {
+    short: Some('h'),
+    long: "help",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print this complete command help",
+};
+
+pub(crate) const VERSION_OPTION: OptionSpec = OptionSpec {
+    short: Some('v'),
+    long: "version",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print the package version and embedded Git commit",
+};
+
+pub(crate) static COMMANDS: &[&CommandSpec] = &[
+    &check::SPEC,
+    &prepare::SPEC,
+    &up::SPEC,
+    &checkpoint::SPEC,
+    &restore::SPEC,
+    &release::SPEC,
+    &down::SPEC,
+    &ps::SPEC,
+    &metrics::SPEC,
+    &exec::SPEC,
+    &cp::SPEC,
+];
+
+pub(crate) static ROOT_SPEC: CommandSpec = CommandSpec {
+    name: "smolworld",
+    about: "Run small, statically provisioned local worlds for smolvm.",
+    options: &[FILE_OPTION, HELP_OPTION, VERSION_OPTION],
+    positionals: &[],
+    examples: &[],
+    subcommands: COMMANDS,
+};
+
+#[cfg(test)]
+pub(crate) fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
+    parse_cli_os(args)
+}
+
+pub(crate) fn parse_cli_os<I, T>(args: I) -> Result<Cli>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let mut parser = Parser::from_args(args);
     let mut config = PathBuf::from(".smolworld");
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "-f" | "--file" => {
-                let Some(value) = args.get(index + 1) else {
-                    return Err("-f/--file requires a path".into());
-                };
-                config = PathBuf::from(value);
-                index += 2;
-            }
-            "up" => {
-                return command_config("up", config, &args[index + 1..])
-                    .map(|config| Cli::Up { config })
-            }
-            "check" => {
-                return command_config("check", config, &args[index + 1..])
-                    .map(|config| Cli::Check { config })
-            }
-            "prepare" => {
-                return command_config("prepare", config, &args[index + 1..])
-                    .map(|config| Cli::Prepare { config })
-            }
-            "checkpoint" => {
-                let (config, output) = parse_checkpoint_options(config, &args[index + 1..])?;
-                return Ok(Cli::Checkpoint { config, output });
-            }
-            "restore" => {
-                let (config, checkpoint) = parse_restore_options(config, &args[index + 1..])?;
-                return Ok(Cli::Restore { config, checkpoint });
-            }
-            "release" => {
-                let (config, checkpoint) = parse_release_options(config, &args[index + 1..])?;
-                return Ok(Cli::Release { config, checkpoint });
-            }
-            "down" => {
-                return command_config("down", config, &args[index + 1..])
-                    .map(|config| Cli::Down { config })
-            }
-            "ps" => {
-                let options = parse_ps_options(config, &args[index + 1..])?;
-                return Ok(Cli::Ps {
-                    config: options.config,
-                    format: options.format,
-                });
-            }
-            "metrics" => {
-                let config = parse_metrics_options(config, &args[index + 1..])?;
-                return Ok(Cli::Metrics { config });
-            }
-            "exec" => {
-                let mut rest = &args[index + 1..];
-                if rest.first().map(String::as_str) == Some("-f")
-                    || rest.first().map(String::as_str) == Some("--file")
-                {
-                    let Some(path) = rest.get(1) else {
-                        return Err("-f/--file requires a path".into());
-                    };
-                    config = PathBuf::from(path);
-                    rest = &rest[2..];
-                }
-                let Some(machine) = rest.first() else {
-                    return Err(
-                        "usage: smolworld exec [-f PATH] MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]".into(),
-                    );
-                };
-                rest = &rest[1..];
-                let mut secret_env = Vec::new();
-                while rest.first().map(String::as_str) != Some("--") {
-                    if rest.first().map(String::as_str) != Some("--secret-env") {
-                        return Err(
-                            "smolworld exec accepts only --secret-env before -- COMMAND".into()
-                        );
-                    }
-                    let Some(value) = rest.get(1) else {
-                        return Err("smolworld exec --secret-env requires GUEST=HOST_ENV".into());
-                    };
-                    secret_env.push(value.clone());
-                    rest = &rest[2..];
-                    if rest.is_empty() {
-                        return Err("smolworld exec requires -- before COMMAND".into());
-                    }
-                }
-                let command = rest[1..].to_vec();
-                if command.is_empty() {
-                    return Err("smolworld exec requires a command".into());
-                }
-                return Ok(Cli::Exec {
-                    config,
-                    machine: machine.clone(),
-                    secret_env,
-                    command,
-                });
-            }
-            "cp" => {
-                let (config, source, destination) = parse_cp_options(config, &args[index + 1..])?;
-                return Ok(Cli::Cp {
-                    config,
-                    source,
-                    destination,
-                });
-            }
-            "-h" | "--help" => return Ok(Cli::Help),
-            other => return Err(format!("unknown command or option '{other}'\n{}", usage())),
-        }
-    }
-    Err(usage().into())
-}
-
-/// Parse one explicit file transfer. A `machine:/absolute/path` endpoint is
-/// interpreted by the runtime only after the world state has resolved that
-/// logical machine to its recorded smolvm name.
-fn parse_cp_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, String, String)> {
-    match rest {
-        [flag, path, source, destination] if flag == "-f" || flag == "--file" => {
-            Ok((PathBuf::from(path), source.clone(), destination.clone()))
-        }
-        [source, destination] => Ok((config, source.clone(), destination.clone())),
-        _ => Err("usage: smolworld cp [-f PATH] SRC DST".into()),
-    }
-}
-
-fn parse_checkpoint_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
-    parse_world_path_option("checkpoint", config, rest, "--output")
-}
-
-fn parse_restore_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
-    parse_world_path_option("restore", config, rest, "--checkpoint")
-}
-
-fn parse_release_options(config: PathBuf, rest: &[String]) -> Result<(PathBuf, PathBuf)> {
-    parse_world_path_option("release", config, rest, "--checkpoint")
-}
-
-fn parse_world_path_option(
-    command: &str,
-    mut config: PathBuf,
-    rest: &[String],
-    path_flag: &str,
-) -> Result<(PathBuf, PathBuf)> {
-    let mut path = None;
     let mut file_seen = false;
-    let mut index = 0;
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "-f" | "--file" if !file_seen => {
-                let Some(value) = rest.get(index + 1) else {
-                    return Err(format!("{command} -f/--file requires a path"));
-                };
-                config = PathBuf::from(value);
+
+    loop {
+        let Some(arg) = parser.next().map_err(|error| format!("smolworld: {error}"))? else {
+            return Err(format!("missing command\n\n{}", render_help(None)));
+        };
+        match arg {
+            arg if option_matches(&arg, &FILE_OPTION) => {
+                if file_seen {
+                    return Err(format!(
+                        "smolworld: {} may be specified only once before the command",
+                        option_display(&FILE_OPTION)
+                    ));
+                }
+                config = PathBuf::from(parser.value().map_err(|error| format!("smolworld: {error}"))?);
                 file_seen = true;
-                index += 2;
             }
-            flag if flag == path_flag && path.is_none() => {
-                let Some(value) = rest.get(index + 1) else {
-                    return Err(format!("{command} {path_flag} requires a directory"));
-                };
-                path = Some(PathBuf::from(value));
-                index += 2;
+            arg if option_matches(&arg, &HELP_OPTION) => return Ok(Cli::Help { command: None }),
+            arg if option_matches(&arg, &VERSION_OPTION) => return Ok(Cli::Version),
+            Arg::Value(command) => {
+                let command_name = command.to_string_lossy();
+                if command_name == check::SPEC.name {
+                    return check::parse(&mut parser, config);
+                }
+                if command_name == prepare::SPEC.name {
+                    return prepare::parse(&mut parser, config);
+                }
+                if command_name == up::SPEC.name {
+                    return up::parse(&mut parser, config);
+                }
+                if command_name == checkpoint::SPEC.name {
+                    return checkpoint::parse(&mut parser, config);
+                }
+                if command_name == restore::SPEC.name {
+                    return restore::parse(&mut parser, config);
+                }
+                if command_name == release::SPEC.name {
+                    return release::parse(&mut parser, config);
+                }
+                if command_name == down::SPEC.name {
+                    return down::parse(&mut parser, config);
+                }
+                if command_name == ps::SPEC.name {
+                    return ps::parse(&mut parser, config);
+                }
+                if command_name == metrics::SPEC.name {
+                    return metrics::parse(&mut parser, config);
+                }
+                if command_name == exec::SPEC.name {
+                    return exec::parse(&mut parser, config);
+                }
+                if command_name == cp::SPEC.name {
+                    return cp::parse(&mut parser, config);
+                }
+                return Err(format!(
+                    "unknown command '{}'\n\n{}",
+                    command.to_string_lossy(),
+                    render_help(None)
+                ));
             }
             other => {
                 return Err(format!(
-                    "unknown {command} option '{other}'\n{}",
-                    world_path_usage(command, path_flag)
+                    "unexpected top-level argument {:?}\n\n{}",
+                    other,
+                    render_help(None)
                 ));
             }
         }
     }
-    path.map(|path| (config, path))
-        .ok_or_else(|| world_path_usage(command, path_flag))
 }
 
-fn world_path_usage(command: &str, path_flag: &str) -> String {
-    format!("usage: smolworld {command} [-f PATH] {path_flag} DIR")
-}
-
-pub(crate) fn command_config(command: &str, config: PathBuf, rest: &[String]) -> Result<PathBuf> {
-    if rest.is_empty() {
-        return Ok(config);
-    } else {
-        let file = rest
-            .first()
-            .is_some_and(|value| value == "-f" || value == "--file");
-        if file && rest.len() == 2 {
-            return Ok(PathBuf::from(&rest[1]));
-        }
+pub(crate) fn option_matches(arg: &Arg<'_>, option: &OptionSpec) -> bool {
+    match arg {
+        Arg::Short(short) => option.short == Some(*short),
+        Arg::Long(long) => *long == option.long,
+        Arg::Value(_) => false,
     }
-    Err(format!("usage: smolworld {command} [-f PATH]"))
 }
 
-/// Parse the options following `ps` while retaining the format choice for the
-/// future runtime status adapter.
-pub(crate) fn parse_ps_options(config: PathBuf, rest: &[String]) -> Result<PsOptions> {
-    let mut config = config;
-    let mut format = PsFormat::Table;
-    let mut file_seen = false;
-    let mut index = 0;
-
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "-f" | "--file" => {
-                if file_seen {
-                    return Err("ps accepts -f/--file at most once".into());
-                }
-                let Some(path) = rest.get(index + 1) else {
-                    return Err("ps -f/--file requires a path".into());
-                };
-                config = PathBuf::from(path);
-                file_seen = true;
-                index += 2;
-            }
-            "--json" => {
-                if format == PsFormat::Json {
-                    return Err("ps accepts --json at most once".into());
-                }
-                format = PsFormat::Json;
-                index += 1;
-            }
-            other => return Err(format!("unknown ps option '{other}'\n{}", ps_usage())),
-        }
+pub(crate) fn option_display(option: &OptionSpec) -> String {
+    let mut display = String::new();
+    if let Some(short) = option.short {
+        display.push('-');
+        display.push(short);
+        display.push_str("/");
     }
-
-    Ok(PsOptions { config, format })
+    display.push_str("--");
+    display.push_str(option.long);
+    display
 }
 
-pub(crate) fn ps_usage() -> &'static str {
-    "usage: smolworld ps [-f PATH] [--json]"
+pub(crate) fn version() -> &'static str {
+    concat!("smolworld ", env!("CARGO_PKG_VERSION"), " (git ", env!("SMOLWORLD_GIT_SHA"), ")")
 }
 
-/// Parse the closed metrics command. The JSON flag is explicit so callers do
-/// not accidentally consume a future human-readable presentation as a stable
-/// machine contract.
-pub(crate) fn parse_metrics_options(config: PathBuf, rest: &[String]) -> Result<PathBuf> {
-    let mut config = config;
-    let mut file_seen = false;
-    let mut json_seen = false;
-    let mut index = 0;
-
-    while index < rest.len() {
-        match rest[index].as_str() {
-            "-f" | "--file" => {
-                if file_seen {
-                    return Err("metrics accepts -f/--file at most once".into());
-                }
-                let Some(path) = rest.get(index + 1) else {
-                    return Err("metrics -f/--file requires a path".into());
-                };
-                config = PathBuf::from(path);
-                file_seen = true;
-                index += 2;
-            }
-            "--json" => {
-                if json_seen {
-                    return Err("metrics accepts --json at most once".into());
-                }
-                json_seen = true;
-                index += 1;
-            }
-            other => {
-                return Err(format!(
-                    "unknown metrics option '{other}'\n{}",
-                    metrics_usage()
-                ))
+pub(crate) fn render_help(command: Option<&str>) -> String {
+    let mut output = String::new();
+    match command {
+        None => {
+            write_help_header(
+                &mut output,
+                ROOT_SPEC.name,
+                ROOT_SPEC.about,
+                &command_usage(&ROOT_SPEC, ROOT_SPEC.name),
+            );
+            output.push_str("Common options (shown once; command pages show placement):\n");
+            write_options_at(&mut output, ROOT_SPEC.options, 2);
+            output.push_str("\nEvery command also accepts -h/--help and -v/--version; command-specific options are shown below.\n");
+            output.push_str("\nCommand reference:\n");
+            for spec in ROOT_SPEC.subcommands {
+                write_compact_command(&mut output, spec, ROOT_SPEC.name, 2);
             }
         }
+        Some(name) => {
+            let Some(spec) = find_spec(ROOT_SPEC.subcommands, name) else {
+                return render_help(None);
+            };
+            write_command_details(&mut output, spec, ROOT_SPEC.name);
+        }
     }
+    output
+}
 
-    if json_seen {
-        Ok(config)
-    } else {
-        Err(metrics_usage().into())
+fn find_spec(
+    specs: &'static [&'static CommandSpec],
+    name: &str,
+) -> Option<&'static CommandSpec> {
+    for spec in specs {
+        if spec.name == name {
+            return Some(spec);
+        }
+        if let Some(found) = find_spec(spec.subcommands, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn write_help_header(output: &mut String, name: &str, about: &str, usage: &str) {
+    output.push_str(&format!("{name}: {about}\n\nUsage: {usage}\n\n"));
+}
+
+fn write_options(output: &mut String, options: &[OptionSpec]) {
+    output.push_str("Options:\n");
+    write_options_at(output, options, 2);
+}
+
+fn write_options_at(output: &mut String, options: &[OptionSpec], indent: usize) {
+    let padding = " ".repeat(indent);
+    for option in options {
+        let mut spelling = String::new();
+        if let Some(short) = option.short {
+            spelling.push('-');
+            spelling.push(short);
+            if option.long.is_empty() {
+                spelling.push(' ');
+            } else {
+                spelling.push_str(", ");
+            }
+        }
+        if !option.long.is_empty() {
+            spelling.push_str("--");
+            spelling.push_str(option.long);
+        }
+        if let Some(value_name) = option.value_name {
+            spelling.push(' ');
+            spelling.push_str(value_name);
+        }
+        let mut qualifiers = Vec::new();
+        if option.required {
+            qualifiers.push("required");
+        }
+        if option.repeatable {
+            qualifiers.push("repeatable");
+        }
+        let mut description = option.help.to_owned();
+        if let Some(default) = option.default {
+            description.push_str(" (default: ");
+            description.push_str(default);
+            description.push(')');
+        }
+        if qualifiers.is_empty() {
+            output.push_str(&format!("{padding}{:<28} {description}\n", spelling));
+        } else {
+            output.push_str(&format!(
+                "{padding}{:<28} {description} ({})\n",
+                spelling,
+                qualifiers.join(", ")
+            ));
+        }
     }
 }
 
-pub(crate) fn metrics_usage() -> &'static str {
-    "usage: smolworld metrics [-f PATH] --json"
+fn write_compact_command(output: &mut String, spec: &CommandSpec, parent: &str, indent: usize) {
+    let padding = " ".repeat(indent);
+    let command_name = format!("{parent} {}", spec.name);
+    let usage = command_usage(spec, &command_name);
+    output.push_str(&format!("\n{padding}{usage}\n{padding}  {}\n", spec.about));
+    let options: Vec<_> = spec
+        .options
+        .iter()
+        .copied()
+        .filter(|option| !common_option(option))
+        .collect();
+    if !options.is_empty() {
+        output.push_str(&format!("{padding}  Options:\n"));
+        write_options_at(output, &options, indent + 4);
+    }
+    if !spec.positionals.is_empty() {
+        output.push_str(&format!("{padding}  Arguments:\n"));
+        for positional in spec.positionals {
+            output.push_str(&format!(
+                "{padding}    {:<20} {}\n",
+                positional.name, positional.help
+            ));
+        }
+    }
+    for child in spec.subcommands {
+        write_compact_command(output, child, &command_name, indent + 2);
+    }
+}
+
+fn common_option(option: &OptionSpec) -> bool {
+    option.long == FILE_OPTION.long
+}
+
+fn command_usage(spec: &CommandSpec, command_name: &str) -> String {
+    let mut usage = format!("{command_name} [OPTIONS]");
+    if !spec.subcommands.is_empty() {
+        usage.push_str(" <COMMAND>");
+    }
+    for positional in spec.positionals {
+        usage.push(' ');
+        if !positional.required {
+            usage.push('[');
+        }
+        usage.push_str(positional.name);
+        if positional.repeatable {
+            usage.push_str("...");
+        }
+        if !positional.required {
+            usage.push(']');
+        }
+    }
+    usage
+}
+
+fn write_command_details(output: &mut String, spec: &CommandSpec, parent: &str) {
+    let command_name = format!("{parent} {}", spec.name);
+    let usage = command_usage(spec, &command_name);
+    output.push_str(&format!("{command_name}\n{about}\n\nUsage: {usage}\n\n", about = spec.about));
+    let mut options = spec.options.to_vec();
+    options.push(HELP_OPTION);
+    options.push(VERSION_OPTION);
+    write_options(output, &options);
+    if !spec.positionals.is_empty() {
+        output.push_str("\nArguments:\n");
+        for positional in spec.positionals {
+            output.push_str(&format!("  {:<20} {}\n", positional.name, positional.help));
+        }
+    }
+    if !spec.examples.is_empty() {
+        output.push_str("\nExamples:\n");
+        for example in spec.examples {
+            output.push_str("  ");
+            output.push_str(example);
+            output.push('\n');
+        }
+    }
+    if !spec.subcommands.is_empty() {
+        output.push_str("\nCommands:\n");
+        for child in spec.subcommands {
+            output.push_str(&format!("  {:<14} {}\n", child.name, child.about));
+        }
+    }
+}
+
+pub(crate) fn command_help(command: &'static str) -> Cli {
+    Cli::Help {
+        command: Some(command.to_owned()),
+    }
+}
+
+pub(crate) fn parse_value(parser: &mut Parser, command: &str, option: &OptionSpec) -> Result<OsString> {
+    parser
+        .value()
+        .map_err(|error| {
+            format!(
+                "{command}: --{} requires {} ({error})\n\n{}",
+                option.long,
+                option.value_name.unwrap_or("a value"),
+                render_help(Some(command)),
+            )
+        })
+}
+
+pub(crate) fn parse_file(
+    parser: &mut Parser,
+    command: &str,
+    config: &mut PathBuf,
+    seen: &mut bool,
+) -> Result<()> {
+    if *seen {
+        return Err(format!(
+            "{command} accepts {} at most once",
+            option_display(&FILE_OPTION)
+        ));
+    }
+    *config = PathBuf::from(parse_value(parser, command, &FILE_OPTION)?);
+    *seen = true;
+    Ok(())
+}
+
+pub(crate) fn unexpected(command: &str, arg: Arg<'_>) -> String {
+    let label = match arg {
+        Arg::Short(short) => format!("-{short}"),
+        Arg::Long(long) => format!("--{long}"),
+        Arg::Value(value) => format!("positional {:?}", value),
+    };
+    format!("unknown {command} argument {label}\n\n{}", render_help(Some(command)))
+}
+
+pub(crate) fn missing(command: &str) -> String {
+    format!("missing arguments for {command}\n\n{}", render_help(Some(command)))
+}
+
+pub(crate) fn parse_error(command: &str, error: lexopt::Error) -> String {
+    format!("{command}: {error}\n\n{}", render_help(Some(command)))
+}
+
+pub(crate) fn os_string(value: OsString, command: &str, positional: &str) -> Result<String> {
+    value.into_string().map_err(|_| {
+        format!("{command}: {positional} must be valid UTF-8")
+    })
+}
+
+pub(crate) fn path_argument(value: OsString) -> PathBuf {
+    PathBuf::from(value)
 }
 
 /// Format machine rows without adding a trailing newline.
@@ -570,13 +781,57 @@ fn push_json_string(output: &mut String, value: &str) {
     output.push('"');
 }
 
-pub(crate) fn usage() -> &'static str {
-    "usage: smolworld [-f .smolworld] <check|prepare|up|checkpoint|restore|release|down|ps|metrics>\n       smolworld checkpoint [-f PATH] --output DIR\n       smolworld restore [-f PATH] --checkpoint DIR\n       smolworld release [-f PATH] --checkpoint DIR\n       smolworld ps [-f PATH] [--json]\n       smolworld metrics [-f PATH] --json\n       smolworld [-f .smolworld] exec MACHINE [--secret-env GUEST=HOST_ENV]... -- COMMAND [ARG ...]\n       smolworld cp [-f PATH] SRC DST"
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        format_metrics_json, format_ps, format_ps_json, format_ps_table, parse_cli,
+        parse_ps_options, render_help, version, Cli, CommandSpec, COMMANDS, LifecycleState,
+        MachineMetrics, MachineStatus, PsFormat, ROOT_SPEC,
+    };
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn assert_spec_is_described(spec: &CommandSpec) {
+        assert!(!spec.name.is_empty());
+        assert!(!spec.about.is_empty());
+        for option in spec.options {
+            assert!(!option.long.is_empty());
+            assert!(!option.help.is_empty(), "--{} has no explanation", option.long);
+        }
+        for positional in spec.positionals {
+            assert!(!positional.name.is_empty());
+            assert!(!positional.help.is_empty(), "{} has no explanation", positional.name);
+        }
+        for child in spec.subcommands {
+            assert_spec_is_described(child);
+        }
+    }
+
+    #[test]
+    fn command_schema_is_complete_and_top_level_help_is_a_readable_reference() {
+        assert_spec_is_described(&ROOT_SPEC);
+        let help = render_help(None);
+        assert!(help.contains("Common options"));
+        assert!(help.contains("Command reference:"));
+        assert!(!help.contains("Command details:"));
+        assert!(!help.contains("\nCommands:\n"));
+        assert_eq!(help.matches("--file").count(), 1);
+        for spec in COMMANDS {
+            assert!(help.contains(&format!("smolworld {}", spec.name)));
+            for option in spec.options {
+                assert!(help.contains(&format!("--{}", option.long)));
+            }
+            for positional in spec.positionals {
+                assert!(help.contains(positional.name));
+            }
+        }
+    }
+
+    #[test]
+    fn version_contains_the_compile_time_git_sha() {
+        assert!(version().contains(env!("SMOLWORLD_GIT_SHA")));
+        assert!(version().contains(env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn accepts_file_flag_before_or_after_command() {
@@ -627,11 +882,11 @@ mod tests {
                 command,
             } if config == PathBuf::from(".smolworld")
                 && machine == "agent"
-                && secret_env == vec!["OPENROUTER_API_KEY=OPENROUTER_API_KEY"]
+                && secret_env == vec![OsString::from("OPENROUTER_API_KEY=OPENROUTER_API_KEY")]
                 && command == vec![
-                    "/usr/local/bin/runebench-pi-agent",
-                    "--model",
-                    "openrouter/example",
+                    OsString::from("/usr/local/bin/runebench-pi-agent"),
+                    OsString::from("--model"),
+                    OsString::from("openrouter/example"),
                 ]
         ));
     }
@@ -681,18 +936,14 @@ mod tests {
 
     #[test]
     fn rejects_invalid_prepare_options() {
-        assert_eq!(
-            parse_cli(vec!["prepare".into(), "--file".into()])
-                .err()
-                .unwrap(),
-            "usage: smolworld prepare [-f PATH]"
-        );
-        assert_eq!(
-            parse_cli(vec!["prepare".into(), "extra".into()])
-                .err()
-                .unwrap(),
-            "usage: smolworld prepare [-f PATH]"
-        );
+        let missing_file = parse_cli(vec!["prepare".into(), "--file".into()])
+            .err()
+            .unwrap();
+        assert!(missing_file.contains("prepare: --file requires PATH"));
+        let extra = parse_cli(vec!["prepare".into(), "extra".into()])
+            .err()
+            .unwrap();
+        assert!(extra.contains("Usage: smolworld prepare [OPTIONS]"));
     }
 
     #[test]
@@ -723,12 +974,10 @@ mod tests {
                     && source == "runner:/workspace/result.txt"
                     && destination == "host-result.txt"
         ));
-        assert_eq!(
-            parse_cli(vec!["cp".into(), "only-one-operand".into()])
-                .err()
-                .expect("copy invocation is invalid"),
-            "usage: smolworld cp [-f PATH] SRC DST"
-        );
+        let error = parse_cli(vec!["cp".into(), "only-one-operand".into()])
+            .err()
+            .expect("copy invocation is invalid");
+        assert!(error.contains("Usage: smolworld cp [OPTIONS] SRC DST"));
     }
 
     #[test]
@@ -772,10 +1021,7 @@ mod tests {
             .unwrap(),
             Cli::Metrics { config } if config == PathBuf::from("world.smolworld")
         ));
-        assert_eq!(
-            parse_cli(vec!["metrics".into()]).err().as_deref(),
-            Some(metrics_usage())
-        );
+        assert!(parse_cli(vec!["metrics".into()]).is_err());
         assert!(parse_cli(vec!["metrics".into(), "--json".into(), "--json".into(),]).is_err());
     }
 
@@ -786,13 +1032,12 @@ mod tests {
                 .unwrap_err(),
             "ps accepts --json at most once"
         );
-        assert_eq!(
-            parse_ps_options(PathBuf::from("world"), &["--file".into()]).unwrap_err(),
-            "ps -f/--file requires a path"
-        );
+        assert!(parse_ps_options(PathBuf::from("world"), &["--file".into()])
+            .unwrap_err()
+            .contains("--file requires PATH"));
         assert!(parse_ps_options(PathBuf::from("world"), &["--wat".into()])
             .unwrap_err()
-            .contains("unknown ps option '--wat'"));
+            .contains("unknown ps argument"));
     }
 
     #[test]

@@ -76,6 +76,9 @@ fn install_signal_handlers() {
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     match cli {
+        Cli::Help { .. } | Cli::Version => {
+            Err("help and version must be handled by the CLI entrypoint".into())
+        }
         Cli::Up { config } => up(&config),
         Cli::Check { config } => check(&config),
         Cli::Prepare { config } => prepare(&config),
@@ -85,10 +88,6 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Cli::Down { config } => down(&config),
         Cli::Ps { config, format } => ps(&config, format),
         Cli::Metrics { config } => metrics(&config),
-        Cli::Help => {
-            println!("{}", crate::cli::usage());
-            Ok(())
-        }
         Cli::Exec {
             config,
             machine,
@@ -826,8 +825,8 @@ fn display_lifecycle_state(
 pub(crate) fn exec(
     config_path: &Path,
     machine: &str,
-    secret_env: &[String],
-    command: &[String],
+    secret_env: &[std::ffi::OsString],
+    command: &[std::ffi::OsString],
 ) -> Result<()> {
     let config = load_config(config_path)?;
     if !config.machines.contains_key(machine) {

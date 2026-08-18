@@ -135,13 +135,13 @@ pub(crate) fn machine_status(
 pub(crate) fn exec_machine(
     smolvm: &Path,
     name: &str,
-    secret_env: &[String],
-    command: &[String],
+    secret_env: &[std::ffi::OsString],
+    command: &[std::ffi::OsString],
 ) -> Result<()> {
     let mut invocation = Command::new(smolvm);
     invocation.args(["machine", "exec", "--name", name]);
     for value in secret_env {
-        invocation.args(["--secret-env", value]);
+        invocation.arg("--secret-env").arg(value);
     }
     invocation.arg("--").args(command);
     companion_adapter::status(Operation::Exec, &mut invocation)

@@ -20,6 +20,20 @@ mod switch;
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
 /// Parse the command line and run the selected local-world operation.
-pub fn run() -> Result<()> {
-    runtime::run(cli::parse_cli(std::env::args().skip(1).collect())?)
+pub fn run<I, T>(args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    match cli::parse_cli_os(args)? {
+        cli::Cli::Help { command } => {
+            println!("{}", cli::render_help(command.as_deref()));
+            Ok(())
+        }
+        cli::Cli::Version => {
+            println!("{}", cli::version());
+            Ok(())
+        }
+        command => runtime::run(command),
+    }
 }

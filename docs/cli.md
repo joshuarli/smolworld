@@ -18,7 +18,9 @@ smolworld <command> -f PATH
 
 The default authored file is `.smolworld`. `-f` and `--file` select another
 path and are accepted before or after the command (in the position supported
-by that command). `--help` prints the top-level usage form.
+by that command). `--help` prints a complete, generated command reference;
+`<command> --help` prints the detailed page for one command. `--version`
+prints the package version together with the embedded Git short SHA.
 
 The normal first-run sequence is:
 
