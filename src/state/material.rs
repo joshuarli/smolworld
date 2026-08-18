@@ -9,7 +9,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const MATERIAL_LOCK_VERSION: u8 = 5;
-const MATERIAL_LOCK_RESOLVER_ABI: &str = "smolvm-external-world/v3";
 pub(crate) const MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 /// A content digest observation for one machine's Smolfile.
@@ -20,8 +19,8 @@ pub(crate) struct SmolfileObservation {
     /// sealed source tree into an immutable run snapshot.
     pub(crate) authored_relative_path: PathBuf,
     pub(crate) authored_digest: String,
-    /// Local-only Smolfile produced by smolvm's host materializer. It is the
-    /// exact machine declaration passed to `smolvm machine create`.
+    /// Local-only Smolfile produced by smolworld material preparation. It is
+    /// the exact machine declaration passed to `smolvm machine create`.
     pub(crate) prepared_path: PathBuf,
     pub(crate) prepared_digest: String,
 }
@@ -184,11 +183,6 @@ impl MaterialLock {
     }
 }
 
-/// The default ABI used by the external-world materializer.
-pub(crate) fn material_lock_resolver_abi() -> &'static str {
-    MATERIAL_LOCK_RESOLVER_ABI
-}
-
 /// Compute the stable BLAKE3 representation used for world declarations and
 /// static host inputs. OCI descriptor verification stays SHA-256 at smolvm's
 /// registry boundary; it is never conflated with this local identity.
@@ -197,8 +191,19 @@ pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn digest_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    Ok(digest_bytes(&bytes))
+    let mut file = File::open(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 /// Hash the small receipt that smolvm publishes beside each durable machine

@@ -167,9 +167,11 @@ into private machine state; a seed is not a host mount.
 
 ### Smolfile boundary and material preparation
 
-Smolfiles are TOML interpreted by smolvm. The restricted world-facing profile
-permits local or immutable image material, command fields, environment,
-working directory, and positive machine resources:
+Smolfiles are TOML world material. smolworld validates the restricted
+world-facing profile, seals its image input, and passes the resulting
+local-only machine declaration to smolvm. The profile permits local or
+immutable image material, command fields, environment, working directory, and
+positive machine resources:
 
 ```toml
 image = "../redis.tar"
@@ -196,9 +198,9 @@ in `.smolworld.lock`; changing any input requires another explicit `prepare`.
 `prepare` is the only preparation mutation. It validates all referenced
 Smolfiles and local image archives, computes BLAKE3 identities, and writes the
 lock beside the authored world. It does not allocate runtime state, bind a
-listener, or create a machine. `check` repeats host/runtime and external-NIC
-validation and compares all inputs with the lock; it is read-only and must run
-after `prepare`. `up` refuses unprepared or changed material.
+listener, or create a machine. `check` repeats host/runtime prerequisite and
+material-lock validation; it is read-only and must run after `prepare`. `up`
+refuses unprepared or changed material.
 
 ## Network and lifecycle invariants
 

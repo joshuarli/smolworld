@@ -12,7 +12,6 @@ use std::process::{Command, ExitStatus, Output};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Operation {
     Prepare,
-    Validate,
     Create,
     Start,
     Stop,
@@ -29,7 +28,6 @@ impl Operation {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Prepare => "prepare",
-            Self::Validate => "validate",
             Self::Create => "create",
             Self::Start => "start",
             Self::Stop => "stop",

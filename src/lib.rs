@@ -16,6 +16,7 @@ mod runtime;
 mod smolvm;
 mod state;
 mod switch;
+mod world_smolfile;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
 

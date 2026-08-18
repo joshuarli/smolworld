@@ -6,22 +6,22 @@ use crate::cli::{
 use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
 use crate::model::{
-    format_mac, Assignment, LifecycleState, MachineCheckpointReceipt, MachineLaunch, SeedFile,
+    format_mac, LifecycleState, MachineCheckpointReceipt, MachineLaunch, SeedFile,
     WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
     checkpoint_machine, cleanup_machines, copy_machine, create_machine, delete_machine,
     delete_recorded_machines,
     exec_machine, install_seed_files as install_machine_seed_files, machine_stats,
-    machine_status as upstream_machine_status, materialize_external_world, preflight,
-    release_machines, restore_machine, smolvm_program, start_machine, stop_machine, stop_machines,
-    validate_external_world, CompanionMachineState, MachineStats,
+    machine_status as upstream_machine_status, preflight, release_machines, restore_machine,
+    smolvm_program, start_machine, stop_machine, stop_machines, CompanionMachineState,
+    MachineStats,
 };
 use crate::state::{
     allocate_allocation_state, digest_file, digest_machine_checkpoint_receipt, inspect_recovery,
     load_allocation_state, load_lifecycle, load_material_lock, load_world_checkpoint_receipt,
     mark_absent, mark_attached, mark_capture_rolled_back, mark_captured, mark_capturing,
-    mark_created, mark_created_detached, mark_running, mark_starting, material_lock_resolver_abi,
+    mark_created, mark_created_detached, mark_running, mark_starting,
     normalize_relative_path, prepare_runtime_dir, remove_runtime_dir, remove_stale_temporary_files,
     world_paths, write_allocation_state, write_material_lock, write_world_checkpoint_receipt,
     ImageMaterial, MaterialLock, SeedObservation, SmolfileObservation, WorldLock, WorldPaths,

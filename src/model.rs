@@ -26,8 +26,9 @@ pub(crate) struct NetworkConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachineConfig {
-    /// Path to the machine's Smolfile. The contents belong to smolvm; the
-    /// world parser deliberately treats this as an opaque reference.
+    /// Path to the machine's world-profile Smolfile. Smolworld validates and
+    /// seals the restricted profile before passing the prepared file to
+    /// smolvm's generic machine creator.
     pub(crate) smolfile: PathBuf,
     pub(crate) depends_on: Vec<String>,
     pub(crate) seed_files: Vec<SeedFile>,
@@ -72,10 +73,10 @@ impl ImageSourceKind {
     }
 }
 
-/// The host inputs for one smolvm external-world launch. Keeping this
-/// separate from `MachineConfig` makes the configuration-to-host boundary
-/// explicit: static network identity and the opaque Smolfile reference are
-/// passed to smolvm only after configuration validation.
+/// The host inputs for one smolvm machine launch. Keeping this separate from
+/// `MachineConfig` makes the world-to-machine boundary explicit: static
+/// network identity and the prepared Smolfile are passed to smolvm only after
+/// world material validation.
 pub(crate) struct MachineLaunch<'a> {
     pub(crate) assignment: &'a Assignment,
     pub(crate) socket: &'a Path,

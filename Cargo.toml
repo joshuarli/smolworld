@@ -7,6 +7,7 @@ description = "Minimal local L2 worlds for smolvm"
 [dependencies]
 blake3 = "1"
 lexopt = "0.3"
+toml = "0.8"
 yaml-rust2 = "0.11"
 
 [[bin]]

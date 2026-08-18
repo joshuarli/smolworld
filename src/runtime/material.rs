@@ -1,6 +1,7 @@
 //! Sealing and read-only verification of world-owned host material.
 
 use super::*;
+use crate::world_smolfile::{prepare_world_smolfile, resolver_abi, verify_prepared_world_smolfile};
 
 pub(super) fn verify_prepared_world(
     config: &WorldConfig,
@@ -14,7 +15,7 @@ pub(super) fn verify_prepared_world(
             paths.material_lock_path().display()
         )
     })?;
-    verify_material_lock(config, paths, smolvm, &prepared)?;
+    verify_material_lock(config, paths, &prepared)?;
     Ok(prepared)
 }
 
@@ -27,16 +28,10 @@ pub(super) fn prepare_world_material(
     paths: &WorldPaths,
     smolvm: &Path,
 ) -> Result<MaterialLock> {
-    let mut lock =
-        MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
+    let mut lock = MaterialLock::from_config(&paths.canonical_config, resolver_abi())?;
     let names: Vec<_> = config.machines.keys().cloned().collect();
-    let indices: BTreeMap<_, _> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect();
     let prepared = parallel_machine_map(&names, "prepare material", |name| {
-        prepare_one_machine_material(config, paths, smolvm, name, indices[name])
+        prepare_one_machine_material(config, paths, smolvm, name)
     })?;
     for (name, prepared) in names.into_iter().zip(prepared) {
         if lock
@@ -68,28 +63,18 @@ fn prepare_one_machine_material(
     paths: &WorldPaths,
     smolvm: &Path,
     name: &str,
-    index: usize,
 ) -> Result<PreparedMachineMaterial> {
     let machine = config
         .machines
         .get(name)
         .expect("prepared machine is configured");
-    let assignment = validation_assignment(paths, config, name, index)?;
-    let socket = validation_socket_path(paths, name);
     let authored_relative_path =
         normalize_relative_path(&machine.smolfile, "configured Smolfile path")?;
     let authored_smolfile =
         sealed_relative_file(&paths.config_dir, &authored_relative_path, "Smolfile")?;
-    let preparation = materialize_external_world(smolvm, &authored_smolfile)?;
-    let material = validate_external_world(
-        smolvm,
-        &preparation.prepared_smolfile,
-        &assignment,
-        &socket,
-        &config.network,
-    )?;
+    let preparation = prepare_world_smolfile(smolvm, paths, &authored_smolfile)?;
     let authored_digest = digest_file(&preparation.authored_smolfile)?;
-    let prepared_digest = digest_file(&material.smolfile)?;
+    let prepared_digest = digest_file(&preparation.prepared_smolfile)?;
     let seeds = machine
         .seed_files
         .iter()
@@ -113,7 +98,7 @@ fn prepare_one_machine_material(
         smolfile: SmolfileObservation {
             authored_relative_path,
             authored_digest,
-            prepared_path: material.smolfile,
+            prepared_path: preparation.prepared_smolfile,
             prepared_digest,
         },
         image: ImageMaterial {
@@ -121,8 +106,8 @@ fn prepare_one_machine_material(
             source_kind: preparation.source_kind,
             source_reference: preparation.source_reference,
             source_digest: preparation.source_digest,
-            local_path: material.local_archive,
-            image_digest: material.image_digest,
+            local_path: preparation.local_archive,
+            image_digest: preparation.image_digest,
         },
         seeds,
     })
@@ -133,18 +118,17 @@ fn prepare_one_machine_material(
 fn verify_material_lock(
     config: &WorldConfig,
     paths: &WorldPaths,
-    smolvm: &Path,
     prepared: &MaterialLock,
 ) -> Result<()> {
     prepared.validate()?;
-    if prepared.resolver_abi != material_lock_resolver_abi() {
+    if prepared.resolver_abi != resolver_abi() {
         return Err(format!(
             "world material uses resolver ABI '{}', but this smolworld requires '{}'; run `smolworld prepare` again",
             prepared.resolver_abi,
-            material_lock_resolver_abi()
+            resolver_abi()
         ));
     }
-    let current = MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
+    let current = MaterialLock::from_config(&paths.canonical_config, resolver_abi())?;
     if prepared.world != current.world {
         return Err(format!(
             "world declaration no longer matches {}; run `smolworld prepare` again",
@@ -160,13 +144,8 @@ fn verify_material_lock(
     }
 
     let names: Vec<_> = config.machines.keys().cloned().collect();
-    let indices: BTreeMap<_, _> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (name.as_str(), index))
-        .collect();
     let mut expected_seeds = parallel_machine_map(&names, "verify material", |name| {
-        verify_one_machine_material(config, paths, smolvm, prepared, name, indices[name])
+        verify_one_machine_material(config, paths, prepared, name)
     })?
     .into_iter()
     .flatten()
@@ -186,10 +165,8 @@ fn verify_material_lock(
 fn verify_one_machine_material(
     config: &WorldConfig,
     paths: &WorldPaths,
-    smolvm: &Path,
     prepared: &MaterialLock,
     name: &str,
-    index: usize,
 ) -> Result<Vec<SeedObservation>> {
     let machine = config
         .machines
@@ -222,21 +199,12 @@ fn verify_one_machine_material(
             "prepared Smolfile for machine '{name}' no longer matches the material lock; run smolworld prepare again"
         ));
     }
-    let assignment = validation_assignment(paths, config, name, index)?;
-    let socket = validation_socket_path(paths, name);
-    let material = validate_external_world(
-        smolvm,
-        &observation.prepared_path,
-        &assignment,
-        &socket,
-        &config.network,
-    )?;
+    let material = verify_prepared_world_smolfile(&observation.prepared_path)?;
     let image = prepared
         .images
         .get(name)
         .ok_or_else(|| format!("world material is missing the image for machine '{name}'"))?;
-    if material.smolfile != observation.prepared_path
-        || material.local_archive != image.local_path
+    if material.local_archive != image.local_path
         || material.image_digest != image.image_digest
     {
         return Err(format!(
@@ -279,37 +247,6 @@ fn seed_identity(left: &SeedObservation, right: &SeedObservation) -> std::cmp::O
             right.mode,
             &right.digest,
         ))
-}
-
-/// Create a deterministic, non-persisted NIC identity for smolvm's read-only
-/// resolver. Runtime allocation remains separate and is written only by `up`.
-fn validation_assignment(
-    paths: &WorldPaths,
-    config: &WorldConfig,
-    machine: &str,
-    index: usize,
-) -> Result<Assignment> {
-    let host = u8::try_from(index + 2)
-        .ok()
-        .filter(|host| *host <= 254)
-        .ok_or_else(|| "world has more machines than its /24 can validate".to_string())?;
-    let mut mac = [0x02, 0, 0, 0, 0, host];
-    let hash = paths.hash.to_be_bytes();
-    mac[1..5].copy_from_slice(&hash[4..8]);
-    Ok(Assignment {
-        ip: std::net::Ipv4Addr::new(
-            config.network.subnet[0],
-            config.network.subnet[1],
-            config.network.subnet[2],
-            host,
-        ),
-        mac,
-        smolvm_name: format!("smw-validate-{machine}"),
-    })
-}
-
-fn validation_socket_path(paths: &WorldPaths, machine: &str) -> PathBuf {
-    paths.runtime_dir.join(format!("validate-{machine}.sock"))
 }
 
 fn sealed_relative_file(config_dir: &Path, relative_path: &Path, label: &str) -> Result<PathBuf> {

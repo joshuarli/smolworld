@@ -28,6 +28,12 @@ impl WorldPaths {
         self.config_dir.join(".smolworld.lock")
     }
 
+    /// Generated local-only Smolfiles are private world material, distinct
+    /// from runtime allocation and safe to retain across `down`/`up` cycles.
+    pub(crate) fn material_dir(&self) -> PathBuf {
+        self.state_dir.join("material")
+    }
+
     pub(crate) fn lifecycle_path(&self) -> PathBuf {
         self.state_dir.join("lifecycle")
     }

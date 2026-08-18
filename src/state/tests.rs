@@ -70,7 +70,7 @@ fn paths_for(world: &TemporaryWorld) -> WorldPaths {
 
 fn material_lock() -> MaterialLock {
     MaterialLock {
-        resolver_abi: material_lock_resolver_abi().to_string(),
+        resolver_abi: crate::world_smolfile::resolver_abi().to_string(),
         world: WorldIdentity {
             config_digest: digest_bytes(b"world: sentry-backend\n"),
         },
@@ -127,7 +127,7 @@ fn material_lock_round_trips_all_material_identity() {
     write_material_lock(&paths, &record).unwrap();
 
     let serialized = fs::read_to_string(paths.material_lock_path()).unwrap();
-    assert!(serialized.starts_with("version\t5\nresolver_abi\tsmolvm-external-world/v3\n"));
+    assert!(serialized.starts_with("version\t5\nresolver_abi\tsmolworld-world-smolfile/v1\n"));
     assert!(!serialized.contains(&world.root.display().to_string()));
     assert!(!paths.state_dir.exists());
     assert_eq!(
@@ -549,7 +549,8 @@ fn identity_from_config_records_portable_content_digest() {
     fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
     fs::write(world.config_path(), b"format: 2\n").unwrap();
     let record =
-        MaterialLock::from_config(&world.config_path(), material_lock_resolver_abi()).unwrap();
+        MaterialLock::from_config(&world.config_path(), crate::world_smolfile::resolver_abi())
+            .unwrap();
     assert_eq!(record.world.config_digest, digest_bytes(b"format: 2\n"));
 }
 
