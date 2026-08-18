@@ -15,5 +15,5 @@ smolworld.
 
 The adapter never lists or discovers unrelated smolvm machines. Upstream flag,
 TSV-position, and ABI changes belong at the narrow adapter boundary described
-in [`docs/smolvm-world-protocol.md`](smolvm-world-protocol.md), with the
-user-facing consequences recorded in the [world contract](world-contract.md).
+in the [companion adapter boundary](world-contract.md#companion-adapter-boundary),
+with the user-facing consequences recorded there as well.

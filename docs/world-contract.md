@@ -12,6 +12,24 @@ Smolfile format, and libkrun are upstream contracts. This document records the
 boundary at which smolworld consumes them. It does not redefine or authorize
 changes to those upstream projects.
 
+## Companion adapter boundary
+
+Smolworld has one narrow internal boundary for operations against the selected
+smolvm binary. The adapter maps typed smolworld operations—preparation,
+validation, lifecycle, statistics, command execution, copy, checkpoint, and
+restore—to the existing upstream surface, then verifies versioned replies
+before they enter world state. This is an implementation boundary, not a new
+smolvm CLI protocol, Smolfile format, or parallel lifecycle specification.
+
+The boundary is implemented by `src/companion_adapter.rs` and
+`src/smolvm.rs`. Only `src/smolvm.rs` may name upstream command flags, TSV
+field positions, or ABI literals. The rest of smolworld speaks in domain
+operations and typed records. An upstream ABI change is handled at this
+adapter boundary; it is never papered over with a fallback parser or a
+Smolfile compatibility layer. Smolfiles and the smolvm command surface remain
+upstream contracts. Public labels and schemas affected by an upstream change
+remain owned by this world contract.
+
 ## Purpose and ownership
 
 `smolworld` is a local macOS/Apple-Silicon runner for a small, statically
@@ -220,6 +238,10 @@ not duplicate or override them in `.smolworld`.
 
 ## Commands and observations
 
+The exact command forms and stable observation labels below are normative. The
+[CLI guide](cli.md) is the separate operational reference for invocation,
+sequencing, and examples; it does not create another contract.
+
 The command surface is:
 
 ```text
@@ -237,15 +259,10 @@ smolworld release [-f PATH] --checkpoint DIR        Delete exactly a retained wo
 smolworld down [-f PATH]                            Stop and delete this world's machines.
 ```
 
-`Ctrl-C` stops and deletes the exact foreground world. `down` is safe after an
-interrupted foreground process. `exec --secret-env GUEST=HOST_ENV` resolves a
-caller-owned host environment variable for that command only. The value is
-not stored in world state, the Smolfile, or the material lock. `cp` is scoped
-to one recorded world machine and one regular file.
-
 `ps` reports host lifecycle observations, not service health or readiness. Its
 closed states are `created`, `attached`, `running`, `capturing`, `captured`,
-and `absent`. `ps --json` emits the same rows as a JSON array.
+and `absent`. The CLI guide defines the human and JSON presentations without
+changing those labels.
 
 ### Metrics schema
 
