@@ -1,4 +1,7 @@
-use super::{command_help, missing, option_matches, os_string, parse_error, parse_file, unexpected, Cli, CommandSpec, FILE_OPTION, HELP_OPTION, PositionalSpec, VERSION_OPTION};
+use super::{
+    command_help, missing, option_matches, os_string, parse_error, parse_file, unexpected, Cli,
+    CommandSpec, PositionalSpec, FILE_OPTION, HELP_OPTION, VERSION_OPTION,
+};
 use crate::Result;
 use lexopt::{Arg, Parser};
 use std::path::PathBuf;
@@ -31,9 +34,14 @@ pub(crate) static SPEC: CommandSpec = CommandSpec {
 pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
     let mut file_seen = false;
     let mut operands = Vec::new();
-    while let Some(arg) = parser.next().map_err(|error| parse_error(SPEC.name, error))? {
+    while let Some(arg) = parser
+        .next()
+        .map_err(|error| parse_error(SPEC.name, error))?
+    {
         match arg {
-            arg if option_matches(&arg, &FILE_OPTION) => parse_file(parser, SPEC.name, &mut config, &mut file_seen)?,
+            arg if option_matches(&arg, &FILE_OPTION) => {
+                parse_file(parser, SPEC.name, &mut config, &mut file_seen)?
+            }
             arg if option_matches(&arg, &HELP_OPTION) => return Ok(command_help(SPEC.name)),
             arg if option_matches(&arg, &VERSION_OPTION) => return Ok(Cli::Version),
             Arg::Value(value) => operands.push(os_string(value, SPEC.name, "SRC/DST")?),

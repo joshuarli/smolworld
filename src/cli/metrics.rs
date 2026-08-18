@@ -1,4 +1,7 @@
-use super::{command_help, option_display, option_matches, parse_error, parse_file, missing, unexpected, Cli, CommandSpec, FILE_OPTION, HELP_OPTION, METRICS_JSON_OPTION, VERSION_OPTION};
+use super::{
+    command_help, missing, option_display, option_matches, parse_error, parse_file, unexpected,
+    Cli, CommandSpec, FILE_OPTION, HELP_OPTION, METRICS_JSON_OPTION, VERSION_OPTION,
+};
 use crate::Result;
 use lexopt::Parser;
 use std::path::PathBuf;
@@ -15,9 +18,14 @@ pub(crate) static SPEC: CommandSpec = CommandSpec {
 pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
     let mut file_seen = false;
     let mut json_seen = false;
-    while let Some(arg) = parser.next().map_err(|error| parse_error(SPEC.name, error))? {
+    while let Some(arg) = parser
+        .next()
+        .map_err(|error| parse_error(SPEC.name, error))?
+    {
         match arg {
-            arg if option_matches(&arg, &FILE_OPTION) => parse_file(parser, SPEC.name, &mut config, &mut file_seen)?,
+            arg if option_matches(&arg, &FILE_OPTION) => {
+                parse_file(parser, SPEC.name, &mut config, &mut file_seen)?
+            }
             arg if option_matches(&arg, &METRICS_JSON_OPTION) && !json_seen => json_seen = true,
             arg if option_matches(&arg, &METRICS_JSON_OPTION) => {
                 return Err(format!(

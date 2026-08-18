@@ -421,13 +421,19 @@ machines:
             ))
             .unwrap();
         let dns_start = 14 + 20 + 8;
-        assert_eq!(u16::from_be_bytes([unknown[dns_start + 2], unknown[dns_start + 3]]) & 0x000f, 3);
+        assert_eq!(
+            u16::from_be_bytes([unknown[dns_start + 2], unknown[dns_start + 3]]) & 0x000f,
+            3
+        );
 
         let mut known_aaaa = dns_request(client_mac, client_ip, gateway.mac, gateway.ip, "redis");
         let query_type = known_aaaa.len() - 4;
         known_aaaa[query_type..query_type + 2].copy_from_slice(&28_u16.to_be_bytes());
         let reply = gateway.handle(&known_aaaa).unwrap();
-        assert_eq!(&reply[dns_start + 2..dns_start + 4], &0x8180_u16.to_be_bytes());
+        assert_eq!(
+            &reply[dns_start + 2..dns_start + 4],
+            &0x8180_u16.to_be_bytes()
+        );
         assert_eq!(&reply[dns_start + 6..dns_start + 8], &0_u16.to_be_bytes());
     }
 

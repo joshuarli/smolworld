@@ -11,20 +11,19 @@ use crate::model::{
 use crate::smolvm::{
     checkpoint_machine, cleanup_machines, copy_machine, create_machine, exec_machine,
     install_seed_files as install_machine_seed_files, machine_stats,
-    machine_status as upstream_machine_status,
-    materialize_external_world, preflight, release_machines, restore_machine, smolvm_program,
-    start_machine, stop_machines, validate_external_world, CompanionMachineState, MachineStats,
+    machine_status as upstream_machine_status, materialize_external_world, preflight,
+    release_machines, restore_machine, smolvm_program, start_machine, stop_machines,
+    validate_external_world, CompanionMachineState, MachineStats,
 };
 use crate::state::{
-    allocate_allocation_state, digest_file, digest_machine_checkpoint_receipt,
-    inspect_recovery, load_allocation_state, load_lifecycle, load_material_lock,
-    load_world_checkpoint_receipt, mark_absent, mark_attached, mark_capture_rolled_back,
-    mark_captured, mark_capturing, mark_created, mark_running, mark_starting,
-    material_lock_resolver_abi, normalize_relative_path, prepare_runtime_dir,
-    remove_runtime_dir, remove_stale_temporary_files, world_paths,
-    write_allocation_state, write_material_lock, write_world_checkpoint_receipt,
-    ImageMaterial, MaterialLock, SeedObservation, SmolfileObservation, WorldPaths,
-    WorldLock, MACHINE_CHECKPOINT_RECEIPT_NAME,
+    allocate_allocation_state, digest_file, digest_machine_checkpoint_receipt, inspect_recovery,
+    load_allocation_state, load_lifecycle, load_material_lock, load_world_checkpoint_receipt,
+    mark_absent, mark_attached, mark_capture_rolled_back, mark_captured, mark_capturing,
+    mark_created, mark_running, mark_starting, material_lock_resolver_abi, normalize_relative_path,
+    prepare_runtime_dir, remove_runtime_dir, remove_stale_temporary_files, world_paths,
+    write_allocation_state, write_material_lock, write_world_checkpoint_receipt, ImageMaterial,
+    MaterialLock, SeedObservation, SmolfileObservation, WorldLock, WorldPaths,
+    MACHINE_CHECKPOINT_RECEIPT_NAME,
 };
 use crate::switch::{
     port_socket_path, print_allocations, run_switch, spawn_port_acceptor, wait_for_attachments,
@@ -44,12 +43,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod checkpoint;
 mod material;
 
-use checkpoint::{
-    checkpoint_running_world, verify_world_checkpoint_receipt,
-};
-use material::{
-    prepare_world_material, prepared_seed_files, verify_prepared_world,
-};
+use checkpoint::{checkpoint_running_world, verify_world_checkpoint_receipt};
+use material::{prepare_world_material, prepared_seed_files, verify_prepared_world};
 
 #[cfg(test)]
 use checkpoint::create_world_checkpoint_staging;
@@ -839,7 +834,12 @@ pub(crate) fn exec(
         .assignments
         .get(machine)
         .ok_or_else(|| format!("machine '{machine}' has no allocation"))?;
-    exec_machine(&smolvm_program(), &assignment.smolvm_name, secret_env, command)
+    exec_machine(
+        &smolvm_program(),
+        &assignment.smolvm_name,
+        secret_env,
+        command,
+    )
 }
 
 /// Copy one regular host file to or from exactly one recorded world machine.
@@ -1007,7 +1007,10 @@ mod tests {
             "restore\t/private/tmp/world\n",
             "checkpoint\t/private/tmp/world\r\n",
         ] {
-            assert!(parse(invalid).is_err(), "expected invalid control request {invalid:?}");
+            assert!(
+                parse(invalid).is_err(),
+                "expected invalid control request {invalid:?}"
+            );
         }
     }
 
@@ -1016,7 +1019,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "smolworld-checkpoint-staging-test-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         fs::create_dir_all(&root).unwrap();
         let output = root.join("world");
@@ -1034,7 +1040,11 @@ mod tests {
 
     #[test]
     fn parallel_operations_wait_for_every_machine_before_returning_the_first_error() {
-        let names = vec!["first".to_string(), "second".to_string(), "third".to_string()];
+        let names = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
         let completed = std::sync::atomic::AtomicUsize::new(0);
         let error = parallel_machine_operations(&names, "test", |name| {
             completed.fetch_add(1, Ordering::SeqCst);

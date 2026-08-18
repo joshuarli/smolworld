@@ -412,10 +412,7 @@ mod tests {
     #[test]
     fn detach_removes_the_port_and_every_learned_address() {
         let (writer, _peer) = UnixStream::pair().unwrap();
-        let mut ports = BTreeMap::from([(
-            "runner".to_string(),
-            Arc::new(Mutex::new(writer)),
-        )]);
+        let mut ports = BTreeMap::from([("runner".to_string(), Arc::new(Mutex::new(writer)))]);
         let mut active = BTreeMap::from([("runner".to_string(), 7)]);
         let mut fdb = HashMap::from([
             ([0x02, 0, 0, 0, 0, 2], "runner".to_string()),

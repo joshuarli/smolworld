@@ -144,8 +144,7 @@ fn verify_material_lock(
             material_lock_resolver_abi()
         ));
     }
-    let current =
-        MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
+    let current = MaterialLock::from_config(&paths.canonical_config, material_lock_resolver_abi())?;
     if prepared.world != current.world {
         return Err(format!(
             "world declaration no longer matches {}; run `smolworld prepare` again",
@@ -393,7 +392,8 @@ pub(super) fn prepared_seed_files(
         .iter()
         .filter(|seed| seed.machine == machine)
         .map(|seed| {
-            let source = sealed_relative_file(config_dir, &seed.source_relative_path, "seed source")?;
+            let source =
+                sealed_relative_file(config_dir, &seed.source_relative_path, "seed source")?;
             validate_seed_source_for_copy(&source)?;
             Ok(SeedFile {
                 source,

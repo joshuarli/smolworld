@@ -1,4 +1,7 @@
-use super::{command_help, option_display, option_matches, parse_error, parse_file, unexpected, Cli, CommandSpec, FILE_OPTION, HELP_OPTION, JSON_OPTION, VERSION_OPTION};
+use super::{
+    command_help, option_display, option_matches, parse_error, parse_file, unexpected, Cli,
+    CommandSpec, FILE_OPTION, HELP_OPTION, JSON_OPTION, VERSION_OPTION,
+};
 use crate::Result;
 use lexopt::Parser;
 #[cfg(test)]
@@ -31,12 +34,23 @@ pub(crate) static SPEC: CommandSpec = CommandSpec {
 pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
     let mut file_seen = false;
     let mut format = PsFormat::Table;
-    while let Some(arg) = parser.next().map_err(|error| parse_error(SPEC.name, error))? {
+    while let Some(arg) = parser
+        .next()
+        .map_err(|error| parse_error(SPEC.name, error))?
+    {
         match arg {
-            arg if option_matches(&arg, &FILE_OPTION) => parse_file(parser, SPEC.name, &mut config, &mut file_seen)?,
-            arg if option_matches(&arg, &JSON_OPTION) && format == PsFormat::Table => format = PsFormat::Json,
+            arg if option_matches(&arg, &FILE_OPTION) => {
+                parse_file(parser, SPEC.name, &mut config, &mut file_seen)?
+            }
+            arg if option_matches(&arg, &JSON_OPTION) && format == PsFormat::Table => {
+                format = PsFormat::Json
+            }
             arg if option_matches(&arg, &JSON_OPTION) => {
-                return Err(format!("{} accepts {} at most once", SPEC.name, option_display(&JSON_OPTION)))
+                return Err(format!(
+                    "{} accepts {} at most once",
+                    SPEC.name,
+                    option_display(&JSON_OPTION)
+                ))
             }
             arg if option_matches(&arg, &HELP_OPTION) => return Ok(command_help(SPEC.name)),
             arg if option_matches(&arg, &VERSION_OPTION) => return Ok(Cli::Version),

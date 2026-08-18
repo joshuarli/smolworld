@@ -167,10 +167,7 @@ fn world_checkpoint_receipt_round_trips_stable_world_identity() {
             epoch: 7,
             queued_frames: 0,
             active_ports: BTreeMap::from([("runner".to_string(), 3)]),
-            learned_macs: BTreeMap::from([(
-                "02:00:00:00:00:02".to_string(),
-                "runner".to_string(),
-            )]),
+            learned_macs: BTreeMap::from([("02:00:00:00:00:02".to_string(), "runner".to_string())]),
         },
     };
 
@@ -224,12 +221,19 @@ fn world_paths_do_not_adopt_legacy_state() {
     fs::write(world.config_path(), b"format: 2\n").unwrap();
     let canonical_config = fs::canonicalize(world.config_path()).unwrap();
     ensure_private_dir(&world.legacy_state_dir()).unwrap();
-    fs::write(world.legacy_state_file(), b"legacy allocation remains untouched\n").unwrap();
+    fs::write(
+        world.legacy_state_file(),
+        b"legacy allocation remains untouched\n",
+    )
+    .unwrap();
     let mut paths = paths_for(&world);
     paths.canonical_config = canonical_config;
 
     assert_ne!(world.legacy_state_dir(), paths.state_dir);
-    assert_eq!(paths.state_dir.parent().unwrap().file_name().unwrap(), ".smolworld");
+    assert_eq!(
+        paths.state_dir.parent().unwrap().file_name().unwrap(),
+        ".smolworld"
+    );
     assert_eq!(
         load_material_lock(&paths.material_lock_path()).unwrap(),
         None
@@ -281,14 +285,14 @@ fn state_rejects_duplicate_scalars_and_unsafe_allocations() {
     fs::create_dir_all(&paths.state_dir).unwrap();
     let state = |body: &str| {
         fs::write(&paths.state_file, body).unwrap();
-        load_allocation_state(&paths.state_file)
-            .expect_err("tampered world state must fail closed")
+        load_allocation_state(&paths.state_file).expect_err("tampered world state must fail closed")
     };
 
-    assert!(state("version\t2\nversion\t2\nseed\t0000000000000001\n")
-        .contains("repeats version"));
-    assert!(state("version\t2\nseed\t0000000000000001\nseed\t0000000000000002\n")
-        .contains("repeats seed"));
+    assert!(state("version\t2\nversion\t2\nseed\t0000000000000001\n").contains("repeats version"));
+    assert!(
+        state("version\t2\nseed\t0000000000000001\nseed\t0000000000000002\n")
+            .contains("repeats seed")
+    );
     assert!(state(concat!(
         "version\t2\nseed\t0000000000000001\n",
         "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tsmw-demo-api\n",
@@ -451,10 +455,7 @@ fn restored_world_can_attach_without_a_synthetic_create_transition() {
     mark_starting(&paths).unwrap();
     let attached = mark_attached(&paths).unwrap();
     assert_eq!(attached.state, LifecycleState::Attached);
-    assert_eq!(
-        mark_running(&paths).unwrap().state,
-        LifecycleState::Running
-    );
+    assert_eq!(mark_running(&paths).unwrap().state, LifecycleState::Running);
 }
 
 #[test]

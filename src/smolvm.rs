@@ -1,8 +1,8 @@
+use crate::companion_adapter::{self, Operation};
 use crate::model::{
     format_mac, Assignment, ImageSourceKind, MachineLaunch, NetworkConfig, SeedFile,
     WorldAllocationState, WorldConfig,
 };
-use crate::companion_adapter::{self, Operation};
 use crate::Result;
 use std::env;
 use std::fs;
@@ -116,10 +116,7 @@ pub(crate) fn machine_stats(smolvm: &Path, name: &str) -> Result<MachineStats> {
 
 /// Query an exact recorded identity through the upstream status command. This
 /// keeps its human-oriented response parsing contained in the adapter.
-pub(crate) fn machine_status(
-    smolvm: &Path,
-    name: &str,
-) -> Result<Option<CompanionMachineState>> {
+pub(crate) fn machine_status(smolvm: &Path, name: &str) -> Result<Option<CompanionMachineState>> {
     let mut command = Command::new(smolvm);
     command.args(["machine", "status", "--name", name]);
     let output = companion_adapter::output(Operation::Status, &mut command)?;
@@ -280,7 +277,8 @@ pub(crate) fn materialize_external_world(
     smolfile: &Path,
 ) -> Result<PreparedExternalWorldSmolfile> {
     let mut command = Command::new(smolvm);
-    command.args([
+    command
+        .args([
             "smolfile",
             "materialize-external",
             "--format",
@@ -1178,7 +1176,9 @@ mod tests {
         assert!(calls.contains("/bin/chmod 0640 /etc/demo/seed"));
         assert!(calls.contains("machine checkpoint --name smw-runner"));
         assert!(calls.contains("machine restore --name smw-runner"));
-        assert!(calls.contains("machine exec --name smw-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"));
+        assert!(calls.contains(
+            "machine exec --name smw-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"
+        ));
         assert!(calls.contains("machine stop --name smw-fail"));
         assert!(!calls.contains("machine delete --name smw-fail -f"));
         fs::remove_dir_all(root).unwrap();

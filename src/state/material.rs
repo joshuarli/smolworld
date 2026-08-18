@@ -365,8 +365,9 @@ fn parse_material_lock(content: &str) -> Result<MaterialLock> {
                         (*machine).to_string(),
                         ImageMaterial {
                             machine: (*machine).to_string(),
-                            source_kind: ImageSourceKind::parse(source_kind)
-                                .map_err(|error| format!("material lock image '{machine}': {error}"))?,
+                            source_kind: ImageSourceKind::parse(source_kind).map_err(|error| {
+                                format!("material lock image '{machine}': {error}")
+                            })?,
                             source_reference: (*source_reference).to_string(),
                             source_digest: (*source_digest).to_string(),
                             local_path: PathBuf::from(local_path),

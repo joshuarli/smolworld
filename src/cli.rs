@@ -1,7 +1,7 @@
 use crate::Result;
 use lexopt::{Arg, Parser};
-use std::fmt;
 use std::ffi::OsString;
+use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -17,9 +17,9 @@ mod release;
 mod restore;
 mod up;
 
-pub(crate) use ps::PsFormat;
 #[cfg(test)]
 pub(crate) use ps::parse_ps_options;
+pub(crate) use ps::PsFormat;
 
 /// The machine lifecycle states exposed by `ps`.
 ///
@@ -99,7 +99,9 @@ impl MachineStatus {
 }
 
 pub(crate) enum Cli {
-    Help { command: Option<String> },
+    Help {
+        command: Option<String>,
+    },
     Version,
     Up {
         config: PathBuf,
@@ -301,7 +303,10 @@ where
     let mut file_seen = false;
 
     loop {
-        let Some(arg) = parser.next().map_err(|error| format!("smolworld: {error}"))? else {
+        let Some(arg) = parser
+            .next()
+            .map_err(|error| format!("smolworld: {error}"))?
+        else {
             return Err(format!("missing command\n\n{}", render_help(None)));
         };
         match arg {
@@ -312,7 +317,11 @@ where
                         option_display(&FILE_OPTION)
                     ));
                 }
-                config = PathBuf::from(parser.value().map_err(|error| format!("smolworld: {error}"))?);
+                config = PathBuf::from(
+                    parser
+                        .value()
+                        .map_err(|error| format!("smolworld: {error}"))?,
+                );
                 file_seen = true;
             }
             arg if option_matches(&arg, &HELP_OPTION) => return Ok(Cli::Help { command: None }),
@@ -382,7 +391,7 @@ pub(crate) fn option_display(option: &OptionSpec) -> String {
     if let Some(short) = option.short {
         display.push('-');
         display.push(short);
-        display.push_str("/");
+        display.push('/');
     }
     display.push_str("--");
     display.push_str(option.long);
@@ -390,7 +399,13 @@ pub(crate) fn option_display(option: &OptionSpec) -> String {
 }
 
 pub(crate) fn version() -> &'static str {
-    concat!("smolworld ", env!("CARGO_PKG_VERSION"), " (git ", env!("SMOLWORLD_GIT_SHA"), ")")
+    concat!(
+        "smolworld ",
+        env!("CARGO_PKG_VERSION"),
+        " (git ",
+        env!("SMOLWORLD_GIT_SHA"),
+        ")"
+    )
 }
 
 pub(crate) fn render_help(command: Option<&str>) -> String {
@@ -421,10 +436,7 @@ pub(crate) fn render_help(command: Option<&str>) -> String {
     output
 }
 
-fn find_spec(
-    specs: &'static [&'static CommandSpec],
-    name: &str,
-) -> Option<&'static CommandSpec> {
+fn find_spec(specs: &'static [&'static CommandSpec], name: &str) -> Option<&'static CommandSpec> {
     for spec in specs {
         if spec.name == name {
             return Some(spec);
@@ -548,7 +560,10 @@ fn command_usage(spec: &CommandSpec, command_name: &str) -> String {
 fn write_command_details(output: &mut String, spec: &CommandSpec, parent: &str) {
     let command_name = format!("{parent} {}", spec.name);
     let usage = command_usage(spec, &command_name);
-    output.push_str(&format!("{command_name}\n{about}\n\nUsage: {usage}\n\n", about = spec.about));
+    output.push_str(&format!(
+        "{command_name}\n{about}\n\nUsage: {usage}\n\n",
+        about = spec.about
+    ));
     let mut options = spec.options.to_vec();
     options.push(HELP_OPTION);
     options.push(VERSION_OPTION);
@@ -581,17 +596,19 @@ pub(crate) fn command_help(command: &'static str) -> Cli {
     }
 }
 
-pub(crate) fn parse_value(parser: &mut Parser, command: &str, option: &OptionSpec) -> Result<OsString> {
-    parser
-        .value()
-        .map_err(|error| {
-            format!(
-                "{command}: --{} requires {} ({error})\n\n{}",
-                option.long,
-                option.value_name.unwrap_or("a value"),
-                render_help(Some(command)),
-            )
-        })
+pub(crate) fn parse_value(
+    parser: &mut Parser,
+    command: &str,
+    option: &OptionSpec,
+) -> Result<OsString> {
+    parser.value().map_err(|error| {
+        format!(
+            "{command}: --{} requires {} ({error})\n\n{}",
+            option.long,
+            option.value_name.unwrap_or("a value"),
+            render_help(Some(command)),
+        )
+    })
 }
 
 pub(crate) fn parse_file(
@@ -617,11 +634,17 @@ pub(crate) fn unexpected(command: &str, arg: Arg<'_>) -> String {
         Arg::Long(long) => format!("--{long}"),
         Arg::Value(value) => format!("positional {:?}", value),
     };
-    format!("unknown {command} argument {label}\n\n{}", render_help(Some(command)))
+    format!(
+        "unknown {command} argument {label}\n\n{}",
+        render_help(Some(command))
+    )
 }
 
 pub(crate) fn missing(command: &str) -> String {
-    format!("missing arguments for {command}\n\n{}", render_help(Some(command)))
+    format!(
+        "missing arguments for {command}\n\n{}",
+        render_help(Some(command))
+    )
 }
 
 pub(crate) fn parse_error(command: &str, error: lexopt::Error) -> String {
@@ -629,9 +652,9 @@ pub(crate) fn parse_error(command: &str, error: lexopt::Error) -> String {
 }
 
 pub(crate) fn os_string(value: OsString, command: &str, positional: &str) -> Result<String> {
-    value.into_string().map_err(|_| {
-        format!("{command}: {positional} must be valid UTF-8")
-    })
+    value
+        .into_string()
+        .map_err(|_| format!("{command}: {positional} must be valid UTF-8"))
 }
 
 pub(crate) fn path_argument(value: OsString) -> PathBuf {
@@ -785,8 +808,8 @@ fn push_json_string(output: &mut String, value: &str) {
 mod tests {
     use super::{
         format_metrics_json, format_ps, format_ps_json, format_ps_table, parse_cli,
-        parse_ps_options, render_help, version, Cli, CommandSpec, COMMANDS, LifecycleState,
-        MachineMetrics, MachineStatus, PsFormat, ROOT_SPEC,
+        parse_ps_options, render_help, version, Cli, CommandSpec, LifecycleState, MachineMetrics,
+        MachineStatus, PsFormat, COMMANDS, ROOT_SPEC,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -796,11 +819,19 @@ mod tests {
         assert!(!spec.about.is_empty());
         for option in spec.options {
             assert!(!option.long.is_empty());
-            assert!(!option.help.is_empty(), "--{} has no explanation", option.long);
+            assert!(
+                !option.help.is_empty(),
+                "--{} has no explanation",
+                option.long
+            );
         }
         for positional in spec.positionals {
             assert!(!positional.name.is_empty());
-            assert!(!positional.help.is_empty(), "{} has no explanation", positional.name);
+            assert!(
+                !positional.help.is_empty(),
+                "{} has no explanation",
+                positional.name
+            );
         }
         for child in spec.subcommands {
             assert_spec_is_described(child);
@@ -837,11 +868,11 @@ mod tests {
     fn accepts_file_flag_before_or_after_command() {
         assert!(matches!(
             parse_cli(vec!["-f".into(), "demo".into(), "ps".into()]).unwrap(),
-            Cli::Ps { config, format: PsFormat::Table } if config == PathBuf::from("demo")
+            Cli::Ps { config, format: PsFormat::Table } if config == *"demo"
         ));
         assert!(matches!(
             parse_cli(vec!["ps".into(), "--file".into(), "demo".into()]).unwrap(),
-            Cli::Ps { config, format: PsFormat::Table } if config == PathBuf::from("demo")
+            Cli::Ps { config, format: PsFormat::Table } if config == *"demo"
         ));
     }
 
@@ -849,15 +880,15 @@ mod tests {
     fn parses_prepare_with_file_flag_before_or_after_command() {
         assert!(matches!(
             parse_cli(vec!["-f".into(), "demo".into(), "prepare".into()]).unwrap(),
-            Cli::Prepare { config } if config == PathBuf::from("demo")
+            Cli::Prepare { config } if config == *"demo"
         ));
         assert!(matches!(
             parse_cli(vec!["prepare".into(), "--file".into(), "demo".into()]).unwrap(),
-            Cli::Prepare { config } if config == PathBuf::from("demo")
+            Cli::Prepare { config } if config == *"demo"
         ));
         assert!(matches!(
             parse_cli(vec!["prepare".into()]).unwrap(),
-            Cli::Prepare { config } if config == PathBuf::from(".smolworld")
+            Cli::Prepare { config } if config == *".smolworld"
         ));
     }
 
@@ -880,7 +911,7 @@ mod tests {
                 machine,
                 secret_env,
                 command,
-            } if config == PathBuf::from(".smolworld")
+            } if config == *".smolworld"
                 && machine == "agent"
                 && secret_env == vec![OsString::from("OPENROUTER_API_KEY=OPENROUTER_API_KEY")]
                 && command == vec![
@@ -903,8 +934,8 @@ mod tests {
             ])
             .unwrap(),
             Cli::Checkpoint { config, output }
-                if config == PathBuf::from("world.smolworld")
-                    && output == PathBuf::from("/private/tmp/w1")
+                if config == *"world.smolworld"
+                    && output == *"/private/tmp/w1"
         ));
         assert!(matches!(
             parse_cli(vec![
@@ -916,8 +947,8 @@ mod tests {
             ])
             .unwrap(),
             Cli::Restore { config, checkpoint }
-                if config == PathBuf::from("world.smolworld")
-                    && checkpoint == PathBuf::from("/private/tmp/w1")
+                if config == *"world.smolworld"
+                    && checkpoint == *"/private/tmp/w1"
         ));
         assert!(matches!(
             parse_cli(vec![
@@ -927,8 +958,8 @@ mod tests {
             ])
             .unwrap(),
             Cli::Release { config, checkpoint }
-                if config == PathBuf::from(".smolworld")
-                    && checkpoint == PathBuf::from("/private/tmp/w1")
+                if config == *".smolworld"
+                    && checkpoint == *"/private/tmp/w1"
         ));
         assert!(parse_cli(vec!["checkpoint".into(), "--output".into()]).is_err());
         assert!(parse_cli(vec!["restore".into(), "--checkpoint".into()]).is_err());
@@ -956,7 +987,7 @@ mod tests {
             ])
             .unwrap(),
             Cli::Cp { config, source, destination }
-                if config == PathBuf::from(".smolworld")
+                if config == *".smolworld"
                     && source == "host-input.tar"
                     && destination == "runner:/workspace/input.tar"
         ));
@@ -970,7 +1001,7 @@ mod tests {
             ])
             .unwrap(),
             Cli::Cp { config, source, destination }
-                if config == PathBuf::from("world.smolworld")
+                if config == *"world.smolworld"
                     && source == "runner:/workspace/result.txt"
                     && destination == "host-result.txt"
         ));
@@ -1009,7 +1040,7 @@ mod tests {
                 "world.smolworld".into(),
             ])
             .unwrap(),
-            Cli::Metrics { config } if config == PathBuf::from("world.smolworld")
+            Cli::Metrics { config } if config == *"world.smolworld"
         ));
         assert!(matches!(
             parse_cli(vec![
@@ -1019,7 +1050,7 @@ mod tests {
                 "--json".into(),
             ])
             .unwrap(),
-            Cli::Metrics { config } if config == PathBuf::from("world.smolworld")
+            Cli::Metrics { config } if config == *"world.smolworld"
         ));
         assert!(parse_cli(vec!["metrics".into()]).is_err());
         assert!(parse_cli(vec!["metrics".into(), "--json".into(), "--json".into(),]).is_err());

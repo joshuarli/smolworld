@@ -1,4 +1,8 @@
-use super::{command_help, missing, option_matches, os_string, parse_error, parse_file, parse_value, render_help, unexpected, Cli, CommandSpec, FILE_OPTION, HELP_OPTION, PositionalSpec, SECRET_ENV_OPTION, VERSION_OPTION};
+use super::{
+    command_help, missing, option_matches, os_string, parse_error, parse_file, parse_value,
+    render_help, unexpected, Cli, CommandSpec, PositionalSpec, FILE_OPTION, HELP_OPTION,
+    SECRET_ENV_OPTION, VERSION_OPTION,
+};
 use crate::Result;
 use lexopt::{Arg, Parser};
 use std::ffi::{OsStr, OsString};
@@ -37,16 +41,25 @@ pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
         .map_err(|error| parse_error(SPEC.name, error))?
         .collect();
     let Some(separator) = raw.iter().position(|value| value == OsStr::new("--")) else {
-        return Err(format!("{} requires -- before COMMAND\n\n{}", SPEC.name, render_help(Some(SPEC.name))));
+        return Err(format!(
+            "{} requires -- before COMMAND\n\n{}",
+            SPEC.name,
+            render_help(Some(SPEC.name))
+        ));
     };
 
     let mut options = Parser::from_args(raw[..separator].iter().cloned());
     let machine = loop {
-        let Some(arg) = options.next().map_err(|error| parse_error(SPEC.name, error))? else {
+        let Some(arg) = options
+            .next()
+            .map_err(|error| parse_error(SPEC.name, error))?
+        else {
             return Err(missing(SPEC.name));
         };
         match arg {
-            arg if option_matches(&arg, &FILE_OPTION) => parse_file(&mut options, SPEC.name, &mut config, &mut file_seen)?,
+            arg if option_matches(&arg, &FILE_OPTION) => {
+                parse_file(&mut options, SPEC.name, &mut config, &mut file_seen)?
+            }
             arg if option_matches(&arg, &HELP_OPTION) => return Ok(command_help(SPEC.name)),
             arg if option_matches(&arg, &VERSION_OPTION) => return Ok(Cli::Version),
             Arg::Value(value) => break os_string(value, SPEC.name, "MACHINE")?,
@@ -55,7 +68,10 @@ pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
     };
 
     let mut secret_env = Vec::new();
-    while let Some(arg) = options.next().map_err(|error| parse_error(SPEC.name, error))? {
+    while let Some(arg) = options
+        .next()
+        .map_err(|error| parse_error(SPEC.name, error))?
+    {
         match arg {
             arg if option_matches(&arg, &SECRET_ENV_OPTION) => {
                 secret_env.push(parse_value(&mut options, SPEC.name, &SECRET_ENV_OPTION)?);
