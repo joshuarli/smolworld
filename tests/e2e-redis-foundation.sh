@@ -287,58 +287,58 @@ import json
 import sys
 
 assignments = json.load(open(sys.argv[1], encoding="utf-8"))
-rows = json.load(open(sys.argv[2], encoding="utf-8"))
+rows = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
 if not isinstance(rows, list) or len(rows) != len(assignments):
-    raise SystemExit("ps --json must contain exactly one row per configured machine")
+    raise SystemExit("ps --format json must contain exactly one row per configured machine")
 seen = set()
 for row in rows:
-    if set(row) != {"machine", "ip", "mac", "status"}:
-        raise SystemExit(f"ps --json has a non-closed row schema: {row!r}")
-    machine = row["machine"]
+    if set(row) != {"service", "ip", "mac", "status"}:
+        raise SystemExit(f"ps --format json has a non-closed row schema: {row!r}")
+    machine = row["service"]
     if machine not in assignments or machine in seen:
-        raise SystemExit(f"ps --json has an unexpected or duplicate machine {machine!r}")
+        raise SystemExit(f"ps --format json has an unexpected or duplicate machine {machine!r}")
     expected = assignments[machine]
     if row["ip"] != expected["ip"] or row["mac"] != expected["mac"] or row["status"] != "running":
-        raise SystemExit(f"ps --json does not match the running recorded allocation for {machine}: {row!r}")
+        raise SystemExit(f"ps --format json does not match the running recorded allocation for {machine}: {row!r}")
     seen.add(machine)
 if seen != set(assignments):
-    raise SystemExit("ps --json omitted a configured machine")
+    raise SystemExit("ps --format json omitted a configured machine")
 PY
 }
 
-assert_metrics_json() {
+assert_stats_json() {
     local source="$1"
     python3 - "$state_assignments" "$source" <<'PY'
 import json
 import sys
 
 assignments = json.load(open(sys.argv[1], encoding="utf-8"))
-metrics = json.load(open(sys.argv[2], encoding="utf-8"))
-if set(metrics) != {"schemaVersion", "world", "machines"} or metrics["schemaVersion"] != 1 or metrics["world"] != "redis-foundation":
-    raise SystemExit(f"metrics --json has an unexpected closed envelope: {metrics!r}")
-rows = metrics["machines"]
+stats = json.load(open(sys.argv[2], encoding="utf-8"))
+if set(stats) != {"schemaVersion", "world", "machines"} or stats["schemaVersion"] != 1 or stats["world"] != "redis-foundation":
+        raise SystemExit(f"stats --format json has an unexpected closed envelope: {stats!r}")
+rows = stats["machines"]
 keys = {"machine", "smolvmName", "state", "pid", "cpus", "memoryMb", "storageGb", "overlayGb", "cpuSeconds", "cpuMillis", "rssMb", "diskUsedMb"}
 if not isinstance(rows, list) or len(rows) != len(assignments):
-    raise SystemExit("metrics --json must contain exactly one row per configured machine")
+    raise SystemExit("stats --format json must contain exactly one row per configured machine")
 seen = set()
 for row in rows:
     if not isinstance(row, dict) or set(row) != keys:
-        raise SystemExit(f"metrics --json has a non-closed row schema: {row!r}")
+        raise SystemExit(f"stats --format json has a non-closed row schema: {row!r}")
     machine = row["machine"]
     if machine not in assignments or machine in seen:
-        raise SystemExit(f"metrics --json has an unexpected or duplicate machine {machine!r}")
+        raise SystemExit(f"stats --format json has an unexpected or duplicate machine {machine!r}")
     if row["smolvmName"] != assignments[machine]["smolvmName"] or row["state"] != "running":
-        raise SystemExit(f"metrics --json does not identify the running recorded machine {machine}: {row!r}")
+        raise SystemExit(f"stats --format json does not identify the running recorded machine {machine}: {row!r}")
     if (row["cpus"], row["memoryMb"], row["storageGb"], row["overlayGb"]) != (1, 256, 1, 1):
-        raise SystemExit(f"metrics --json does not preserve the Smolfile resource envelope for {machine}: {row!r}")
+        raise SystemExit(f"stats --format json does not preserve the Smolfile resource envelope for {machine}: {row!r}")
     if not isinstance(row["pid"], int) or row["pid"] <= 0:
-        raise SystemExit(f"metrics --json has no running host PID for {machine}: {row!r}")
+        raise SystemExit(f"stats --format json has no running host PID for {machine}: {row!r}")
     for field in ("cpuSeconds", "cpuMillis", "rssMb", "diskUsedMb"):
         if row[field] is not None and (not isinstance(row[field], int) or row[field] < 0):
-            raise SystemExit(f"metrics --json has invalid {field} for {machine}: {row!r}")
+            raise SystemExit(f"stats --format json has invalid {field} for {machine}: {row!r}")
     seen.add(machine)
 if seen != set(assignments):
-    raise SystemExit("metrics --json omitted a configured machine")
+    raise SystemExit("stats --format json omitted a configured machine")
 PY
 }
 
@@ -491,10 +491,10 @@ start_world() {
 }
 
 assert_live_world_contract() {
-    "$binary" -f "$world_file" ps --json >"$temporary_dir/ps.json"
+    "$binary" -f "$world_file" ps --format json >"$temporary_dir/ps.json"
     assert_ps_json "$temporary_dir/ps.json"
-    "$binary" -f "$world_file" metrics --json >"$temporary_dir/metrics.json"
-    assert_metrics_json "$temporary_dir/metrics.json"
+    "$binary" -f "$world_file" stats --no-stream --format json >"$temporary_dir/stats.json"
+    assert_stats_json "$temporary_dir/stats.json"
 
     assert_guest_network_tuple redis
     assert_guest_network_tuple runner
@@ -529,8 +529,8 @@ assert_live_world_contract() {
     cmp "$host_payload" "$returned_payload"
 
     SMOLWORLD_E2E_SECRET_VALUE='foundation-secret-value' \
-        "$binary" -f "$world_file" exec runner \
-        --secret-env SMOLWORLD_E2E_SECRET=SMOLWORLD_E2E_SECRET_VALUE -- \
+    "$binary" -f "$world_file" exec \
+        --secret-env SMOLWORLD_E2E_SECRET=SMOLWORLD_E2E_SECRET_VALUE runner \
         /bin/sh -ceu 'test "$SMOLWORLD_E2E_SECRET" = "foundation-secret-value"'
     "$binary" -f "$world_file" exec runner -- /bin/sh -ceu 'test "${SMOLWORLD_E2E_SECRET+x}" != x'
 }

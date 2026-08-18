@@ -271,6 +271,26 @@ pub(crate) fn mark_created(paths: &WorldPaths) -> Result<LifecycleMetadata> {
     transition_lifecycle(paths, LifecycleState::Created, &[LifecycleState::Starting])
 }
 
+/// Publish an intentionally stopped set of created machine records. It has no
+/// runtime owner because no switch or listener exists until `start`/`up`
+/// launches the supervisor; retaining a stale creator PID would misrepresent
+/// that boundary to recovery tooling.
+pub(crate) fn mark_created_detached(paths: &WorldPaths) -> Result<LifecycleMetadata> {
+    let previous = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    if !matches!(
+        previous.state,
+        LifecycleState::Starting | LifecycleState::Created
+    ) {
+        return Err(format!(
+            "cannot transition world lifecycle from {} to created",
+            previous.state.as_str()
+        ));
+    }
+    let lifecycle = LifecycleMetadata::new(LifecycleState::Created, None, previous.generation)?;
+    write_lifecycle(paths, lifecycle)?;
+    Ok(lifecycle)
+}
+
 pub(crate) fn mark_attached(paths: &WorldPaths) -> Result<LifecycleMetadata> {
     transition_lifecycle(
         paths,

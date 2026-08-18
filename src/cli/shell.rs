@@ -7,33 +7,22 @@ use lexopt::{Arg, Parser};
 use std::path::PathBuf;
 
 pub(crate) static SPEC: CommandSpec = CommandSpec {
-    name: "cp",
-    about: "Copy one regular file between the host and one running world service.",
+    name: "shell",
+    about: "Open an interactive /bin/sh in one running recorded service.",
     options: &[FILE_OPTION],
-    positionals: &[
-        PositionalSpec {
-            name: "SRC",
-            required: true,
-            repeatable: false,
-            help: "Host path or SERVICE:/absolute/path source endpoint",
-        },
-        PositionalSpec {
-            name: "DST",
-            required: true,
-            repeatable: false,
-            help: "Host path or SERVICE:/absolute/path destination endpoint",
-        },
-    ],
-    examples: &[
-        "smolworld cp ./input.txt runner:/workspace/input.txt",
-        "smolworld cp runner:/workspace/result.txt ./result.txt",
-    ],
+    positionals: &[PositionalSpec {
+        name: "SERVICE",
+        required: true,
+        repeatable: false,
+        help: "Declared running service",
+    }],
+    examples: &["smolworld shell runner"],
     subcommands: &[],
 };
 
 pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
     let mut file_seen = false;
-    let mut operands = Vec::new();
+    let mut service = None;
     while let Some(arg) = parser
         .next()
         .map_err(|error| parse_error(SPEC.name, error))?
@@ -44,16 +33,14 @@ pub(crate) fn parse(parser: &mut Parser, mut config: PathBuf) -> Result<Cli> {
             }
             arg if option_matches(&arg, &HELP_OPTION) => return Ok(command_help(SPEC.name)),
             arg if option_matches(&arg, &VERSION_OPTION) => return Ok(Cli::Version),
-            Arg::Value(value) => operands.push(os_string(value, SPEC.name, "SRC/DST")?),
+            Arg::Value(value) if service.is_none() => {
+                service = Some(os_string(value, SPEC.name, "SERVICE")?)
+            }
             other => return Err(unexpected(SPEC.name, other)),
         }
     }
-    if operands.len() != 2 {
-        return Err(missing(SPEC.name));
-    }
-    Ok(Cli::Cp {
+    Ok(Cli::Shell {
         config,
-        source: operands.remove(0),
-        destination: operands.remove(0),
+        service: service.ok_or_else(|| missing(SPEC.name))?,
     })
 }

@@ -202,7 +202,7 @@ pub(crate) fn wait_for_expected_attachments(
 
 pub(crate) fn print_allocations(config: &WorldConfig, state: &WorldAllocationState) {
     println!("WORLD\t{}", config.name);
-    println!("MACHINE\tIP\tMAC");
+    println!("SERVICE\tIP\tMAC");
     for name in config.machines.keys() {
         let assignment = state.assignments.get(name).expect("allocated machine");
         println!("{name}\t{}\t{}", assignment.ip, format_mac(assignment.mac));

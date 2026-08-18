@@ -1,8 +1,10 @@
+use crate::cli::ExecOptions;
 use crate::companion_adapter::{self, Operation};
 use crate::model::{
     format_mac, Assignment, ImageSourceKind, MachineLaunch, NetworkConfig, SeedFile,
     WorldAllocationState, WorldConfig,
 };
+use crate::state::validate_recorded_smolvm_name;
 use crate::Result;
 use std::env;
 use std::fs;
@@ -33,7 +35,7 @@ pub(crate) struct PreparedExternalWorldSmolfile {
     pub(crate) source_digest: String,
 }
 
-/// Closed metrics record returned by the companion smolvm subprocess.
+/// Closed resource-observation record returned by the companion smolvm subprocess.
 ///
 /// The public `smolvm machine stats --json` command is intended for operators;
 /// smolworld consumes the same record through the versioned TSV form so this
@@ -132,13 +134,37 @@ pub(crate) fn machine_status(smolvm: &Path, name: &str) -> Result<Option<Compani
 pub(crate) fn exec_machine(
     smolvm: &Path,
     name: &str,
-    secret_env: &[std::ffi::OsString],
+    options: &ExecOptions,
     command: &[std::ffi::OsString],
 ) -> Result<()> {
     let mut invocation = Command::new(smolvm);
     invocation.args(["machine", "exec", "--name", name]);
-    for value in secret_env {
+    for value in &options.env {
+        invocation.arg("--env").arg(value);
+    }
+    if let Some(workdir) = &options.workdir {
+        invocation.arg("--workdir").arg(workdir);
+    }
+    if options.interactive {
+        invocation.arg("--interactive");
+    }
+    if options.tty {
+        invocation.arg("--tty");
+    }
+    if options.stream {
+        invocation.arg("--stream");
+    }
+    if options.detach {
+        invocation.arg("--detach");
+    }
+    if let Some(timeout) = &options.timeout {
+        invocation.arg("--timeout").arg(timeout);
+    }
+    for value in &options.secret_env {
         invocation.arg("--secret-env").arg(value);
+    }
+    for value in &options.secret_file {
+        invocation.arg("--secret-file").arg(value);
     }
     invocation.arg("--").args(command);
     companion_adapter::status(Operation::Exec, &mut invocation)
@@ -175,7 +201,7 @@ pub(crate) fn install_seed_files(smolvm: &Path, name: &str, seeds: &[SeedFile]) 
             .ok_or_else(|| format!("seed source {} is not valid UTF-8", seed.source.display()))?;
         if source.contains(':') {
             return Err(format!(
-                "seed source {} cannot contain ':' because smolvm machine cp uses MACHINE:/path endpoints",
+                "seed source {} cannot contain ':' because smolvm machine cp uses NAME:/path endpoints",
                 seed.source.display()
             ));
         }
@@ -754,18 +780,34 @@ pub(crate) fn cleanup_machines(smolvm: &Path, state: Option<&WorldAllocationStat
     let Some(state) = state else {
         return;
     };
-    for assignment in state.assignments.values() {
-        // `machine delete -f` owns the stop-then-remove sequence. Calling
-        // `machine stop` separately and ignoring its result can race the
-        // delete, leaving an orphaned _boot-vm process after the world lock
-        // has been released.
-        let mut command = Command::new(smolvm);
-        command
-            .args(["machine", "delete", "--name", &assignment.smolvm_name, "-f"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let _ = companion_adapter::status(Operation::Delete, &mut command);
+    // `machine delete -f` owns the stop-then-remove sequence. Calling
+    // `machine stop` separately and ignoring its result can race deletion
+    // and leave an orphaned boot process. This is signal/failure cleanup, so
+    // retain best-effort behavior; explicit `down` calls the checked helper.
+    let _ = delete_recorded_machines(smolvm, state);
+}
+
+/// Delete only exact, validated, currently recorded companion machines.
+///
+/// It never lists or discovers machines beyond the durable world allocation;
+/// an explicit caller receives every upstream delete failure for reconciliation.
+pub(crate) fn delete_recorded_machines(
+    smolvm: &Path,
+    state: &WorldAllocationState,
+) -> Result<()> {
+    for (service, assignment) in &state.assignments {
+        validate_recorded_smolvm_name(&assignment.smolvm_name).map_err(|reason| {
+            format!(
+                "world machine '{service}' has an unsafe recorded smolvm identity '{}': {reason}",
+                assignment.smolvm_name
+            )
+        })?;
     }
+    for (service, assignment) in &state.assignments {
+        delete_machine(smolvm, &assignment.smolvm_name)
+            .map_err(|error| format!("delete recorded service '{service}': {error}"))?;
+    }
+    Ok(())
 }
 
 /// Stop exactly the recorded world machines while retaining their names and
@@ -782,11 +824,39 @@ pub(crate) fn stop_machines(smolvm: &Path, state: &WorldAllocationState) {
     }
 }
 
+/// Stop one exact recorded machine and preserve its configuration/disks for a
+/// later world-supervised start. Unlike the checkpoint best-effort helper,
+/// this user-requested transition reports the upstream failure to the caller.
+pub(crate) fn stop_machine(smolvm: &Path, name: &str) -> Result<()> {
+    let mut command = Command::new(smolvm);
+    command.args(["machine", "stop", "--name", name]);
+    companion_adapter::status(Operation::Stop, &mut command)
+}
+
+/// Delete one exact recorded stopped machine. The caller must prove lifecycle
+/// eligibility before this operation so the upstream force flag cannot widen
+/// cleanup beyond the world identity boundary.
+pub(crate) fn delete_machine(smolvm: &Path, name: &str) -> Result<()> {
+    validate_recorded_smolvm_name(name)
+        .map_err(|reason| format!("unsafe recorded smolvm identity '{name}': {reason}"))?;
+    let mut command = Command::new(smolvm);
+    command.args(["machine", "delete", "--name", name, "-f"]);
+    companion_adapter::status(Operation::Delete, &mut command)
+}
+
 /// Release only the exact machine records named by a retained world receipt.
 /// Unlike best-effort signal cleanup, this is an explicit user-facing durable
 /// state transition and therefore returns the first subprocess failure instead
 /// of silently broadening or abandoning the requested cleanup.
 pub(crate) fn release_machines(smolvm: &Path, state: &WorldAllocationState) -> Result<()> {
+    for (service, assignment) in &state.assignments {
+        validate_recorded_smolvm_name(&assignment.smolvm_name).map_err(|reason| {
+            format!(
+                "world machine '{service}' has an unsafe recorded smolvm identity '{}': {reason}",
+                assignment.smolvm_name
+            )
+        })?;
+    }
     for assignment in state.assignments.values() {
         let mut stop = Command::new(smolvm);
         stop.args(["machine", "stop", "--name", &assignment.smolvm_name]);
@@ -1089,6 +1159,7 @@ mod tests {
              fi\n\
              if [ \"$1\" = machine ] && [ \"$2\" = start ]; then exit 23; fi\n\
              if [ \"$1\" = machine ] && [ \"$2\" = stop ] && [ \"$4\" = smw-fail ]; then exit 24; fi\n\
+             if [ \"$1\" = machine ] && [ \"$2\" = delete ] && [ \"$4\" = smw-delete-fail ]; then exit 25; fi\n\
              exit 0\n",
             log = log.display(),
         );
@@ -1138,7 +1209,10 @@ mod tests {
         exec_machine(
             &fake,
             "smw-runner",
-            &["TOKEN=HOST_TOKEN".into()],
+            &ExecOptions {
+                secret_env: vec!["TOKEN=HOST_TOKEN".into()],
+                ..ExecOptions::default()
+            },
             &["/bin/sh".into(), "-c".into(), "true".into()],
         )
         .unwrap();
@@ -1166,6 +1240,20 @@ mod tests {
         assert!(release_machines(&fake, &failing_state)
             .unwrap_err()
             .contains("stop"));
+        let delete_failing_state = WorldAllocationState {
+            seed: 2,
+            assignments: BTreeMap::from([(
+                "runner".into(),
+                Assignment {
+                    ip: "10.89.0.19".parse().unwrap(),
+                    mac: [0x02, 0, 0, 0, 0, 0x19],
+                    smolvm_name: "smw-delete-fail".into(),
+                },
+            )]),
+        };
+        assert!(delete_recorded_machines(&fake, &delete_failing_state)
+            .unwrap_err()
+            .contains("delete"));
 
         let calls = fs::read_to_string(&log).unwrap();
         assert!(calls.contains("machine create --name smw-runner"));
@@ -1181,6 +1269,7 @@ mod tests {
         ));
         assert!(calls.contains("machine stop --name smw-fail"));
         assert!(!calls.contains("machine delete --name smw-fail -f"));
+        assert!(calls.contains("machine delete --name smw-delete-fail -f"));
         fs::remove_dir_all(root).unwrap();
     }
 

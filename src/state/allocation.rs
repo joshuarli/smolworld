@@ -59,12 +59,13 @@ fn load_state_version(
                     .map_err(|_| format!("{label} machine '{name}' has invalid IP"))?;
                 let mac = parse_mac(mac)
                     .map_err(|reason| format!("{label} machine '{name}': {reason}"))?;
-                if smolvm_name.is_empty()
-                    || !smolvm_name.starts_with("smw-")
-                    || smolvm_name.contains(['\t', '\r', '\n'])
+                if validate_recorded_smolvm_name(smolvm_name).is_err()
                     || mac[0] & 3 != 2
                     || !assigned_ips.insert(ip)
                     || !assigned_macs.insert(mac)
+                    || assignments
+                        .values()
+                        .any(|assignment: &Assignment| assignment.smolvm_name == *smolvm_name)
                 {
                     return Err(format!(
                         "{label} machine '{name}' has an unsafe or repeated allocation"
@@ -92,6 +93,20 @@ fn load_state_version(
         seed: seed.ok_or_else(|| format!("{label} is missing seed"))?,
         assignments,
     }))
+}
+
+/// Validate the generated companion identity recorded in durable world state.
+///
+/// Every companion invocation must be constrained to this same narrow grammar:
+/// a lower-case DNS label in the private `smw-` namespace. Parsing this at the
+/// durable boundary prevents a tampered record from becoming a command target
+/// during recovery or exact cleanup.
+pub(crate) fn validate_recorded_smolvm_name(value: &str) -> Result<()> {
+    if !value.starts_with("smw-") {
+        return Err("must use the smw- namespace".into());
+    }
+    validate_label(value)
+        .map_err(|reason| format!("must be a lower-case smw DNS label: {reason}"))
 }
 
 pub(crate) fn write_allocation_state(

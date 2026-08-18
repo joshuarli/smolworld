@@ -7,19 +7,29 @@ use std::str::FromStr;
 
 mod check;
 mod checkpoint;
+mod config;
+mod convert;
 mod cp;
 mod down;
 mod exec;
-mod metrics;
+mod images;
+mod lifecycle;
 mod prepare;
 mod ps;
 mod release;
 mod restore;
+mod shell;
+mod stats;
 mod up;
+mod version;
 
+pub(crate) use config::ConfigFormat;
+pub(crate) use exec::ExecOptions;
+pub(crate) use images::ImagesFormat;
 #[cfg(test)]
 pub(crate) use ps::parse_ps_options;
 pub(crate) use ps::PsFormat;
+pub(crate) use stats::StatsFormat;
 
 /// The machine lifecycle states exposed by `ps`.
 ///
@@ -30,6 +40,7 @@ pub(crate) enum LifecycleState {
     Created,
     Attached,
     Running,
+    Stopped,
     Capturing,
     Captured,
     Absent,
@@ -41,6 +52,7 @@ impl LifecycleState {
             Self::Created => "created",
             Self::Attached => "attached",
             Self::Running => "running",
+            Self::Stopped => "stopped",
             Self::Capturing => "capturing",
             Self::Captured => "captured",
             Self::Absent => "absent",
@@ -62,6 +74,7 @@ impl FromStr for LifecycleState {
             "created" => Ok(Self::Created),
             "attached" => Ok(Self::Attached),
             "running" => Ok(Self::Running),
+            "stopped" => Ok(Self::Stopped),
             "capturing" => Ok(Self::Capturing),
             "captured" => Ok(Self::Captured),
             "absent" => Ok(Self::Absent),
@@ -103,8 +116,39 @@ pub(crate) enum Cli {
         command: Option<String>,
     },
     Version,
+    VersionCommand {
+        short: bool,
+        format: Option<String>,
+    },
     Up {
         config: PathBuf,
+        services: Vec<String>,
+        detach: bool,
+    },
+    Create {
+        config: PathBuf,
+        services: Vec<String>,
+    },
+    Start {
+        config: PathBuf,
+        services: Vec<String>,
+    },
+    Stop {
+        config: PathBuf,
+        services: Vec<String>,
+    },
+    Restart {
+        config: PathBuf,
+        services: Vec<String>,
+    },
+    Rm {
+        config: PathBuf,
+        services: Vec<String>,
+    },
+    Images {
+        config: PathBuf,
+        services: Vec<String>,
+        format: ImagesFormat,
     },
     Check {
         config: PathBuf,
@@ -134,23 +178,60 @@ pub(crate) enum Cli {
     },
     Ps {
         config: PathBuf,
+        services: Vec<String>,
+        all: bool,
+        status: Option<LifecycleState>,
+        quiet: bool,
+        services_only: bool,
         format: PsFormat,
     },
-    /// Collect host-side metrics for the recorded world machines.
-    Metrics {
+    /// Collect host-side resource observations for recorded world machines.
+    Stats {
         config: PathBuf,
+        services: Vec<String>,
+        all: bool,
+        no_stream: bool,
+        format: StatsFormat,
+    },
+    Config {
+        config: PathBuf,
+        format: config::ConfigFormat,
+        quiet: bool,
     },
     Exec {
         config: PathBuf,
-        machine: String,
-        secret_env: Vec<OsString>,
+        service: String,
+        options: exec::ExecOptions,
         command: Vec<OsString>,
     },
+    Shell {
+        config: PathBuf,
+        service: String,
+    },
+    /// `cp` remains constrained by the companion's regular-file protocol.
     Cp {
         config: PathBuf,
         source: String,
         destination: String,
     },
+}
+
+pub(crate) enum LifecycleCommand {
+    Start,
+    Stop,
+    Restart,
+    Rm,
+}
+
+impl LifecycleCommand {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+            Self::Rm => "rm",
+        }
+    }
 }
 
 /// Metadata shared by the parser and every help view. Command modules expose
@@ -205,14 +286,144 @@ pub(crate) const JSON_OPTION: OptionSpec = OptionSpec {
     help: "Use the stable JSON presentation",
 };
 
-pub(crate) const METRICS_JSON_OPTION: OptionSpec = OptionSpec {
+pub(crate) const FORMAT_OPTION: OptionSpec = OptionSpec {
     short: None,
-    long: "json",
-    value_name: None,
-    required: true,
+    long: "format",
+    value_name: Some("FORMAT"),
+    required: false,
     repeatable: false,
     default: None,
-    help: "Use the stable JSON presentation",
+    help: "Use table, json, or a row template",
+};
+
+pub(crate) const CONFIG_FORMAT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "format",
+    value_name: Some("FORMAT"),
+    required: false,
+    repeatable: false,
+    default: Some("yaml"),
+    help: "Render yaml or json",
+};
+
+pub(crate) const CONFIG_QUIET_OPTION: OptionSpec = OptionSpec {
+    short: Some('q'),
+    long: "quiet",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Validate without rendering configuration",
+};
+
+pub(crate) const VERSION_FORMAT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "format",
+    value_name: Some("FORMAT"),
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Render json version information",
+};
+
+pub(crate) const IMAGES_FORMAT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "format",
+    value_name: Some("FORMAT"),
+    required: false,
+    repeatable: false,
+    default: Some("table"),
+    help: "Render table or json",
+};
+
+pub(crate) const ALL_OPTION: OptionSpec = OptionSpec {
+    short: Some('a'),
+    long: "all",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Include declared services without a running machine",
+};
+
+pub(crate) const NO_STREAM_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "no-stream",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print one resource observation instead of streaming",
+};
+
+pub(crate) const STATUS_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "status",
+    value_name: Some("STATE"),
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Filter by one host lifecycle state",
+};
+
+pub(crate) const FILTER_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "filter",
+    value_name: Some("KEY=VALUE"),
+    required: false,
+    repeatable: true,
+    default: None,
+    help: "Filter rows; only status=STATE is supported",
+};
+
+pub(crate) const QUIET_OPTION: OptionSpec = OptionSpec {
+    short: Some('q'),
+    long: "quiet",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print only service names",
+};
+
+pub(crate) const SERVICES_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "services",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print only service names",
+};
+
+pub(crate) const DETACH_OPTION: OptionSpec = OptionSpec {
+    short: Some('d'),
+    long: "detach",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Run the supervisor in the background",
+};
+
+pub(crate) const EXEC_DETACH_OPTION: OptionSpec = OptionSpec {
+    short: Some('d'),
+    long: "detach",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Run the guest command in the background",
+};
+
+pub(crate) const SHORT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "short",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Print only the smolworld version number",
 };
 
 pub(crate) const OUTPUT_OPTION: OptionSpec = OptionSpec {
@@ -245,6 +456,76 @@ pub(crate) const SECRET_ENV_OPTION: OptionSpec = OptionSpec {
     help: "Pass one selected host environment variable to the guest command",
 };
 
+pub(crate) const SECRET_FILE_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "secret-file",
+    value_name: Some("GUEST=PATH"),
+    required: false,
+    repeatable: true,
+    default: None,
+    help: "Pass one selected host secret file to the guest command",
+};
+
+pub(crate) const ENV_OPTION: OptionSpec = OptionSpec {
+    short: Some('e'),
+    long: "env",
+    value_name: Some("KEY=VALUE"),
+    required: false,
+    repeatable: true,
+    default: None,
+    help: "Set one environment value for the guest command",
+};
+
+pub(crate) const WORKDIR_OPTION: OptionSpec = OptionSpec {
+    short: Some('w'),
+    long: "workdir",
+    value_name: Some("DIR"),
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Set the guest working directory",
+};
+
+pub(crate) const INTERACTIVE_OPTION: OptionSpec = OptionSpec {
+    short: Some('i'),
+    long: "interactive",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Keep stdin open for the guest command",
+};
+
+pub(crate) const TTY_OPTION: OptionSpec = OptionSpec {
+    short: Some('t'),
+    long: "tty",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Allocate a pseudo-TTY for the guest command",
+};
+
+pub(crate) const STREAM_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "stream",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Stream guest command output as it arrives",
+};
+
+pub(crate) const TIMEOUT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "timeout",
+    value_name: Some("DURATION"),
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Limit guest command execution time",
+};
+
 pub(crate) const HELP_OPTION: OptionSpec = OptionSpec {
     short: Some('h'),
     long: "help",
@@ -266,16 +547,26 @@ pub(crate) const VERSION_OPTION: OptionSpec = OptionSpec {
 };
 
 pub(crate) static COMMANDS: &[&CommandSpec] = &[
+    &config::SPEC,
+    &convert::SPEC,
     &check::SPEC,
     &prepare::SPEC,
     &up::SPEC,
+    &lifecycle::CREATE_SPEC,
+    &lifecycle::START_SPEC,
+    &lifecycle::STOP_SPEC,
+    &lifecycle::RESTART_SPEC,
+    &lifecycle::RM_SPEC,
     &checkpoint::SPEC,
     &restore::SPEC,
     &release::SPEC,
     &down::SPEC,
     &ps::SPEC,
-    &metrics::SPEC,
+    &stats::SPEC,
+    &images::SPEC,
+    &version::SPEC,
     &exec::SPEC,
+    &shell::SPEC,
     &cp::SPEC,
 ];
 
@@ -331,11 +622,32 @@ where
                 if command_name == check::SPEC.name {
                     return check::parse(&mut parser, config);
                 }
+                if command_name == config::SPEC.name {
+                    return config::parse(&mut parser, config);
+                }
+                if command_name == convert::SPEC.name {
+                    return convert::parse(&mut parser, config);
+                }
                 if command_name == prepare::SPEC.name {
                     return prepare::parse(&mut parser, config);
                 }
                 if command_name == up::SPEC.name {
                     return up::parse(&mut parser, config);
+                }
+                if command_name == lifecycle::CREATE_SPEC.name {
+                    return lifecycle::parse_create(&mut parser, config);
+                }
+                if command_name == lifecycle::START_SPEC.name {
+                    return lifecycle::parse_start(&mut parser, config);
+                }
+                if command_name == lifecycle::STOP_SPEC.name {
+                    return lifecycle::parse_stop(&mut parser, config);
+                }
+                if command_name == lifecycle::RESTART_SPEC.name {
+                    return lifecycle::parse_restart(&mut parser, config);
+                }
+                if command_name == lifecycle::RM_SPEC.name {
+                    return lifecycle::parse_rm(&mut parser, config);
                 }
                 if command_name == checkpoint::SPEC.name {
                     return checkpoint::parse(&mut parser, config);
@@ -352,11 +664,20 @@ where
                 if command_name == ps::SPEC.name {
                     return ps::parse(&mut parser, config);
                 }
-                if command_name == metrics::SPEC.name {
-                    return metrics::parse(&mut parser, config);
+                if command_name == stats::SPEC.name {
+                    return stats::parse(&mut parser, config);
+                }
+                if command_name == images::SPEC.name {
+                    return images::parse(&mut parser, config);
+                }
+                if command_name == version::SPEC.name {
+                    return version::parse(&mut parser, config);
                 }
                 if command_name == exec::SPEC.name {
                     return exec::parse(&mut parser, config);
+                }
+                if command_name == shell::SPEC.name {
+                    return shell::parse(&mut parser, config);
                 }
                 if command_name == cp::SPEC.name {
                     return cp::parse(&mut parser, config);
@@ -662,15 +983,16 @@ pub(crate) fn path_argument(value: OsString) -> PathBuf {
 }
 
 /// Format machine rows without adding a trailing newline.
-pub(crate) fn format_ps(format: PsFormat, machines: &[MachineStatus]) -> String {
+pub(crate) fn format_ps(format: &PsFormat, machines: &[MachineStatus]) -> String {
     match format {
         PsFormat::Table => format_ps_table(machines),
         PsFormat::Json => format_ps_json(machines),
+        PsFormat::Template(template) => format_ps_template(template, machines),
     }
 }
 
 pub(crate) fn format_ps_table(machines: &[MachineStatus]) -> String {
-    let mut output = String::from("MACHINE\tIP\tMAC\tSTATUS");
+    let mut output = String::from("SERVICE\tIP\tMAC\tSTATUS");
     for machine in machines {
         output.push('\n');
         output.push_str(&machine.machine);
@@ -685,12 +1007,12 @@ pub(crate) fn format_ps_table(machines: &[MachineStatus]) -> String {
 }
 
 pub(crate) fn format_ps_json(machines: &[MachineStatus]) -> String {
-    let mut output = String::from("[");
+    let mut output = String::new();
     for (index, machine) in machines.iter().enumerate() {
         if index != 0 {
-            output.push(',');
+            output.push('\n');
         }
-        output.push_str("{\"machine\":");
+        output.push_str("{\"service\":");
         push_json_string(&mut output, &machine.machine);
         output.push_str(",\"ip\":");
         push_json_string(&mut output, &machine.ip);
@@ -700,17 +1022,30 @@ pub(crate) fn format_ps_json(machines: &[MachineStatus]) -> String {
         push_json_string(&mut output, machine.state.as_str());
         output.push('}');
     }
-    output.push(']');
     output
 }
 
-/// One row in the closed `metrics --json` world schema.
+fn format_ps_template(template: &str, machines: &[MachineStatus]) -> String {
+    machines
+        .iter()
+        .map(|machine| {
+            template
+                .replace("{{.Service}}", &machine.machine)
+                .replace("{{.IP}}", &machine.ip)
+                .replace("{{.MAC}}", &machine.mac)
+                .replace("{{.Status}}", machine.state.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One row in the closed `stats --format json` world schema.
 ///
 /// `None` is rendered as JSON `null`; the field set is intentionally fixed so
 /// consumers can distinguish an absent/unallocated machine from a machine
 /// whose observation is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MachineMetrics {
+pub(crate) struct ServiceStats {
     pub(crate) machine: String,
     pub(crate) smolvm_name: Option<String>,
     pub(crate) state: String,
@@ -725,7 +1060,7 @@ pub(crate) struct MachineMetrics {
     pub(crate) disk_used_mb: Option<u64>,
 }
 
-pub(crate) fn format_metrics_json(world: &str, machines: &[MachineMetrics]) -> String {
+pub(crate) fn format_stats_json(world: &str, machines: &[ServiceStats]) -> String {
     let mut output = String::from("{\"schemaVersion\":1,\"world\":");
     push_json_string(&mut output, world);
     output.push_str(",\"machines\":[");
@@ -763,6 +1098,51 @@ pub(crate) fn format_metrics_json(world: &str, machines: &[MachineMetrics]) -> S
     output
 }
 
+/// Compose-shaped `stats` table presentation. Resource values come from the
+/// closed upstream `machine-stats-v1` record and are deliberately not guest
+/// process measurements.
+pub(crate) fn format_stats_table(machines: &[ServiceStats]) -> String {
+    let mut output = String::from("SERVICE\tSTATUS\tCPU_SECONDS\tRSS_MB\tDISK_USED_MB");
+    for machine in machines {
+        output.push('\n');
+        output.push_str(&machine.machine);
+        output.push('\t');
+        output.push_str(&machine.state);
+        output.push('\t');
+        push_optional_display(&mut output, machine.cpu_seconds);
+        output.push('\t');
+        push_optional_display(&mut output, machine.rss_mb);
+        output.push('\t');
+        push_optional_display(&mut output, machine.disk_used_mb);
+    }
+    output
+}
+
+pub(crate) fn format_stats_template(template: &str, machines: &[ServiceStats]) -> String {
+    machines
+        .iter()
+        .map(|machine| {
+            template
+                .replace("{{.Service}}", &machine.machine)
+                .replace("{{.Status}}", &machine.state)
+                .replace("{{.CPUSeconds}}", &optional_display(machine.cpu_seconds))
+                .replace("{{.RSSMb}}", &optional_display(machine.rss_mb))
+                .replace("{{.DiskUsedMb}}", &optional_display(machine.disk_used_mb))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn push_optional_display(output: &mut String, value: Option<u64>) {
+    output.push_str(&optional_display(value));
+}
+
+fn optional_display(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
 fn push_json_optional_string(output: &mut String, value: Option<&str>) {
     match value {
         Some(value) => push_json_string(output, value),
@@ -784,7 +1164,7 @@ fn push_json_optional_u64(output: &mut String, value: Option<u64>) {
     }
 }
 
-fn push_json_string(output: &mut String, value: &str) {
+pub(crate) fn push_json_string(output: &mut String, value: &str) {
     output.push('"');
     for character in value.chars() {
         match character {
@@ -807,9 +1187,9 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_metrics_json, format_ps, format_ps_json, format_ps_table, parse_cli,
-        parse_ps_options, render_help, version, Cli, CommandSpec, LifecycleState, MachineMetrics,
-        MachineStatus, PsFormat, COMMANDS, ROOT_SPEC,
+        format_ps, format_ps_json, format_ps_table, format_stats_json, parse_cli, parse_ps_options,
+        render_help, version, Cli, CommandSpec, LifecycleState, MachineStatus, PsFormat,
+        ServiceStats, StatsFormat, COMMANDS, ROOT_SPEC,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -868,11 +1248,11 @@ mod tests {
     fn accepts_file_flag_before_or_after_command() {
         assert!(matches!(
             parse_cli(vec!["-f".into(), "demo".into(), "ps".into()]).unwrap(),
-            Cli::Ps { config, format: PsFormat::Table } if config == *"demo"
+            Cli::Ps { config, format: PsFormat::Table, .. } if config == *"demo"
         ));
         assert!(matches!(
             parse_cli(vec!["ps".into(), "--file".into(), "demo".into()]).unwrap(),
-            Cli::Ps { config, format: PsFormat::Table } if config == *"demo"
+            Cli::Ps { config, format: PsFormat::Table, .. } if config == *"demo"
         ));
     }
 
@@ -893,14 +1273,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_exec_secret_env_before_command_separator() {
+    fn parses_compose_shaped_exec_options_before_service() {
         assert!(matches!(
             parse_cli(vec![
                 "exec".into(),
-                "agent".into(),
                 "--secret-env".into(),
                 "OPENROUTER_API_KEY=OPENROUTER_API_KEY".into(),
-                "--".into(),
+                "--env".into(),
+                "MODE=live".into(),
+                "agent".into(),
                 "/usr/local/bin/runebench-pi-agent".into(),
                 "--model".into(),
                 "openrouter/example".into(),
@@ -908,12 +1289,13 @@ mod tests {
             .unwrap(),
             Cli::Exec {
                 config,
-                machine,
-                secret_env,
+                service,
+                options,
                 command,
             } if config == *".smolworld"
-                && machine == "agent"
-                && secret_env == vec![OsString::from("OPENROUTER_API_KEY=OPENROUTER_API_KEY")]
+                && service == "agent"
+                && options.secret_env == vec![OsString::from("OPENROUTER_API_KEY=OPENROUTER_API_KEY")]
+                && options.env == vec![OsString::from("MODE=live")]
                 && command == vec![
                     OsString::from("/usr/local/bin/runebench-pi-agent"),
                     OsString::from("--model"),
@@ -1031,29 +1413,79 @@ mod tests {
     }
 
     #[test]
-    fn parses_metrics_json_and_file_in_either_order() {
+    fn parses_stats_format_and_file_in_either_order() {
         assert!(matches!(
             parse_cli(vec![
-                "metrics".into(),
-                "--json".into(),
+                "stats".into(),
+                "--format".into(),
+                "json".into(),
+                "--no-stream".into(),
                 "--file".into(),
                 "world.smolworld".into(),
             ])
             .unwrap(),
-            Cli::Metrics { config } if config == *"world.smolworld"
+            Cli::Stats { config, format: StatsFormat::Json, no_stream: true, .. }
+                if config == *"world.smolworld"
         ));
         assert!(matches!(
             parse_cli(vec![
                 "-f".into(),
                 "world.smolworld".into(),
-                "metrics".into(),
+                "stats".into(),
                 "--json".into(),
+                "--no-stream".into(),
             ])
             .unwrap(),
-            Cli::Metrics { config } if config == *"world.smolworld"
+            Cli::Stats { config, format: StatsFormat::Json, no_stream: true, .. }
+                if config == *"world.smolworld"
         ));
-        assert!(parse_cli(vec!["metrics".into()]).is_err());
-        assert!(parse_cli(vec!["metrics".into(), "--json".into(), "--json".into(),]).is_err());
+        assert!(matches!(
+            parse_cli(vec!["stats".into()]).unwrap(),
+            Cli::Stats {
+                no_stream: false,
+                ..
+            }
+        ));
+        assert!(parse_cli(vec!["stats".into(), "--json".into(), "--json".into(),]).is_err());
+    }
+
+    #[test]
+    fn parses_compose_service_selection_and_config_alias() {
+        assert!(matches!(
+            parse_cli(vec![
+                "up".into(),
+                "--detach".into(),
+                "runner".into(),
+            ])
+            .unwrap(),
+            Cli::Up { services, detach: true, .. } if services == ["runner"]
+        ));
+        assert!(matches!(
+            parse_cli(vec![
+                "ps".into(),
+                "--all".into(),
+                "--status".into(),
+                "stopped".into(),
+                "runner".into(),
+            ])
+            .unwrap(),
+            Cli::Ps { services, all: true, status: Some(LifecycleState::Stopped), .. }
+                if services == ["runner"]
+        ));
+        assert!(matches!(
+            parse_cli(vec!["convert".into(), "--format".into(), "json".into()]).unwrap(),
+            Cli::Config {
+                format: super::ConfigFormat::Json,
+                quiet: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cli(vec!["images".into(), "--format".into(), "json".into(), "runner".into()])
+                .unwrap(),
+            Cli::Images { services, format: super::ImagesFormat::Json, .. }
+                if services == ["runner"]
+        ));
     }
 
     #[test]
@@ -1061,7 +1493,7 @@ mod tests {
         assert_eq!(
             parse_ps_options(PathBuf::from("world"), &["--json".into(), "--json".into()])
                 .unwrap_err(),
-            "ps accepts --json at most once"
+            "ps --json cannot be combined with --format or repeated"
         );
         assert!(parse_ps_options(PathBuf::from("world"), &["--file".into()])
             .unwrap_err()
@@ -1077,6 +1509,7 @@ mod tests {
             LifecycleState::Created,
             LifecycleState::Attached,
             LifecycleState::Running,
+            LifecycleState::Stopped,
             LifecycleState::Capturing,
             LifecycleState::Captured,
             LifecycleState::Absent,
@@ -1088,6 +1521,7 @@ mod tests {
                 "created",
                 "attached",
                 "running",
+                "stopped",
                 "capturing",
                 "captured",
                 "absent"
@@ -1123,15 +1557,15 @@ mod tests {
     fn formats_table_with_lifecycle_labels() {
         assert_eq!(
             format_ps_table(&machines()),
-            "MACHINE\tIP\tMAC\tSTATUS\napi\t10.77.0.2\t02:00:00:00:00:02\tattached\nworker\t10.77.0.3\t02:00:00:00:00:03\tabsent"
+            "SERVICE\tIP\tMAC\tSTATUS\napi\t10.77.0.2\t02:00:00:00:00:02\tattached\nworker\t10.77.0.3\t02:00:00:00:00:03\tabsent"
         );
     }
 
     #[test]
-    fn formats_json_as_a_deterministic_array_and_escapes_strings() {
+    fn formats_json_lines_and_escapes_strings() {
         assert_eq!(
             format_ps_json(&machines()),
-            "[{\"machine\":\"api\",\"ip\":\"10.77.0.2\",\"mac\":\"02:00:00:00:00:02\",\"status\":\"attached\"},{\"machine\":\"worker\",\"ip\":\"10.77.0.3\",\"mac\":\"02:00:00:00:00:03\",\"status\":\"absent\"}]"
+            "{\"service\":\"api\",\"ip\":\"10.77.0.2\",\"mac\":\"02:00:00:00:00:02\",\"status\":\"attached\"}\n{\"service\":\"worker\",\"ip\":\"10.77.0.3\",\"mac\":\"02:00:00:00:00:03\",\"status\":\"absent\"}"
         );
         let escaped = [MachineStatus::new(
             "a\"b",
@@ -1140,14 +1574,14 @@ mod tests {
             LifecycleState::Created,
         )];
         assert_eq!(
-            format_ps(PsFormat::Json, &escaped),
-            "[{\"machine\":\"a\\\"b\",\"ip\":\"line\\nvalue\",\"mac\":\"slash\\\\value\",\"status\":\"created\"}]"
+            format_ps(&PsFormat::Json, &escaped),
+            "{\"service\":\"a\\\"b\",\"ip\":\"line\\nvalue\",\"mac\":\"slash\\\\value\",\"status\":\"created\"}"
         );
     }
 
     #[test]
-    fn formats_metrics_as_a_closed_schema_with_nulls() {
-        let machines = vec![MachineMetrics {
+    fn formats_stats_as_a_closed_schema_with_nulls() {
+        let machines = vec![ServiceStats {
             machine: "runner".into(),
             smolvm_name: Some("smw-demo-runner".into()),
             state: "running".into(),
@@ -1162,7 +1596,7 @@ mod tests {
             disk_used_mb: None,
         }];
         assert_eq!(
-            format_metrics_json("demo", &machines),
+            format_stats_json("demo", &machines),
             "{\"schemaVersion\":1,\"world\":\"demo\",\"machines\":[{\"machine\":\"runner\",\"smolvmName\":\"smw-demo-runner\",\"state\":\"running\",\"pid\":42,\"cpus\":4,\"memoryMb\":4096,\"storageGb\":20,\"overlayGb\":4,\"cpuSeconds\":2,\"cpuMillis\":2345,\"rssMb\":128,\"diskUsedMb\":null}]}"
         );
     }

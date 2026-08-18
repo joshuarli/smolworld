@@ -309,6 +309,18 @@ fn state_rejects_duplicate_scalars_and_unsafe_allocations() {
         "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tnot-a-world-machine\n",
     ))
     .contains("unsafe or repeated allocation"));
+    for unsafe_name in ["smw-../other", "smw-api/other"] {
+        assert!(state(&format!(
+            "version\t2\nseed\t0000000000000001\nmachine\tapi\t10.89.0.2\t02:00:00:00:00:02\t{unsafe_name}\n"
+        ))
+        .contains("unsafe or repeated allocation"));
+    }
+    assert!(state(concat!(
+        "version\t2\nseed\t0000000000000001\n",
+        "machine\tapi\t10.89.0.2\t02:00:00:00:00:02\tsmw-demo-api\n",
+        "machine\tworker\t10.89.0.3\t02:00:00:00:00:03\tsmw-demo-api\n",
+    ))
+    .contains("unsafe or repeated allocation"));
 }
 
 #[test]
@@ -456,6 +468,26 @@ fn restored_world_can_attach_without_a_synthetic_create_transition() {
     let attached = mark_attached(&paths).unwrap();
     assert_eq!(attached.state, LifecycleState::Attached);
     assert_eq!(mark_running(&paths).unwrap().state, LifecycleState::Running);
+}
+
+#[test]
+fn detached_created_state_has_no_stale_supervisor_owner() {
+    let world = TemporaryWorld::new();
+    let paths = paths_for(&world);
+
+    mark_starting(&paths).unwrap();
+    let created = mark_created_detached(&paths).unwrap();
+    assert_eq!(created.state, LifecycleState::Created);
+    assert_eq!(created.owner_pid, None);
+
+    // A failed re-start can first write `Created` with an owner; returning to
+    // detached Created clears that stale diagnostic PID without changing the
+    // durable state label.
+    mark_starting(&paths).unwrap();
+    mark_created(&paths).unwrap();
+    let recovered = mark_created_detached(&paths).unwrap();
+    assert_eq!(recovered.state, LifecycleState::Created);
+    assert_eq!(recovered.owner_pid, None);
 }
 
 #[test]

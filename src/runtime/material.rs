@@ -337,9 +337,9 @@ fn sealed_relative_file(config_dir: &Path, relative_path: &Path, label: &str) ->
     Ok(canonical)
 }
 
-/// `smolvm machine cp` uses `MACHINE:/guest/path` endpoint syntax. Keep that
-/// delimiter out of sealed host inputs at preparation time instead of allowing
-/// a later launch to reinterpret a local source as a guest endpoint.
+/// The companion `machine cp` uses a namespaced `NAME:/guest/path` endpoint.
+/// Keep that delimiter out of sealed host inputs at preparation time instead
+/// of allowing a later launch to reinterpret a local source as a guest endpoint.
 pub(super) fn validate_seed_source_for_copy(source: &Path) -> Result<()> {
     let source_text = source
         .to_str()

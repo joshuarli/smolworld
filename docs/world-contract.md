@@ -232,6 +232,9 @@ before creating state, listeners, or machines. `up` owns only deterministic
 `smw-...` machine names recorded in world state. `down`, signal cleanup,
 restore-failure cleanup, and `release` never affect unrelated smolvm machines
 or legacy state. Cleanup is always constrained by exact recorded identities.
+An explicit `down` or `release` keeps those records when a companion deletion
+fails; it never reports success or marks the world absent before exact cleanup
+has completed.
 
 Machine resources belong to the restricted Smolfile profile; smolworld does
 not duplicate or override them in `.smolworld`.
@@ -245,30 +248,62 @@ sequencing, and examples; it does not create another contract.
 The command surface is:
 
 ```text
+smolworld config [-f PATH] [--format yaml|json]     Validate and render resolved configuration.
+smolworld convert [-f PATH] [--format yaml|json]    Alias for config.
 smolworld prepare [-f PATH]                         Resolve and seal local material.
 smolworld check [-f PATH]                           Validate prepared material read-only.
-smolworld up [-f PATH]                              Start the foreground supervisor.
-smolworld ps [-f PATH] [--json]                     Show host lifecycle observations.
-smolworld metrics [-f PATH] --json                  Show recorded-machine host metrics.
-smolworld exec [-f PATH] MACHINE [--secret-env GUEST=HOST_ENV]... -- CMD
-                                                     Delegate one command to a machine.
+smolworld up [-f PATH] [-d] [SERVICE...]            Create/start services under the supervisor.
+smolworld create [-f PATH] [SERVICE...]             Create recorded service configurations only.
+smolworld start [-f PATH] [SERVICE...]              Start recorded services without deleting them.
+smolworld stop [-f PATH] [SERVICE...]               Stop services without deleting their records.
+smolworld restart [-f PATH] [SERVICE...]            Restart services through the supervisor.
+smolworld rm [-f PATH] SERVICE...                   Delete stopped recorded service configurations.
+smolworld ps [-f PATH] [OPTIONS] [SERVICE...]       Show host lifecycle observations.
+smolworld stats [-f PATH] [OPTIONS] [SERVICE...]    Stream recorded-service host resource observations.
+smolworld images [-f PATH] [--format table|json]    Show sealed service image material read-only.
+smolworld exec [-f PATH] [OPTIONS] SERVICE CMD...   Delegate one command to a running service.
+smolworld shell [-f PATH] SERVICE                    Open /bin/sh in a running service.
 smolworld cp [-f PATH] SOURCE DEST                  Copy one regular file through the agent.
-smolworld checkpoint [-f PATH] --output DIR          Capture and retain the running world.
+smolworld checkpoint [-f PATH] --output DIR         Capture and retain the running world.
 smolworld restore [-f PATH] --checkpoint DIR        Restore a retained same-lineage world.
 smolworld release [-f PATH] --checkpoint DIR        Delete exactly a retained world.
 smolworld down [-f PATH]                            Stop and delete this world's machines.
+smolworld version [--short|--format json]           Print smolworld version information.
 ```
 
+CLI service names are logical keys from `machines`; they do not expose or
+broaden the internal recorded `smw-...` machine identity. A service selection
+is validated against that declaration before the runtime resolves exact state.
+`up SERVICE...` includes each selected service's declared dependencies. It
+does not add health checks or readiness waiting. `create` persists only
+machine configurations; a later `start` from that stopped state launches the
+same selected records under a detached supervisor. `stop`, `restart`, `rm`,
+and a live `down` are delivered only through the process that owns the exact
+world switch. `stop` retains machine records, `rm` accepts only stopped
+services, and `down` still deletes the full world. A restored checkpoint
+continues to require `release`, not `down` or `rm`.
+
 `ps` reports host lifecycle observations, not service health or readiness. Its
-closed states are `created`, `attached`, `running`, `capturing`, `captured`,
-and `absent`. The CLI guide defines the human and JSON presentations without
-changing those labels.
+closed states are `created`, `attached`, `running`, `stopped`, `capturing`,
+`captured`, and `absent`. `ps --format table|json|TEMPLATE` accepts declared
+service arguments; `--all` includes stopped/absent declarations, `--status`
+or `--filter status=STATE` narrows by the closed label, and `--quiet` /
+`--services` print names only. `--format json` emits one JSON row per line;
+`--json` remains its spelling-compatible alias. Table columns deliberately
+describe only world-owned observations: `SERVICE`, `IP`, `MAC`, and `STATUS`.
 
-### Metrics schema
+### Stats schema
 
-`metrics --json` is read-only. It reads only world allocation records and
-never lists or discovers unrelated smolvm machines. It emits a closed object
-with exactly this top-level shape and literal schema value:
+`stats` is read-only. It reads only world allocation records and never lists
+or discovers unrelated smolvm machines. It streams an observation every
+second by default; `--no-stream` prints one observation. `--all` includes
+declared services with no current machine record. `--format table` is the
+human presentation and templates may use `.Service`, `.Status`,
+`.CPUSeconds`, `.RSSMb`, and `.DiskUsedMb`.
+
+`stats --format json` (and `stats --json`) preserves the closed world snapshot
+schema. Every streaming update is one complete newline-delimited object with
+exactly this top-level shape and literal schema value:
 
 ```json
 {
@@ -293,6 +328,23 @@ subprocess record is the literal upstream ABI label `machine-stats-v1`.
 smolworld verifies that record's identity and lifecycle state before rendering
 its own JSON. The label and the closed JSON schema are hard boundaries, not
 best-effort parser hints or compatibility fallbacks.
+
+`images` reads only `.smolworld.lock`; it does not call the upstream image
+inspection command because that operation may start a stopped VM. Its table
+and JSON Lines presentations identify the service, authored source, source
+kind/digest, and sealed image digest.
+
+`exec` accepts companion-supported `-e`/`--env`, `-w`/`--workdir`,
+`-i`/`--interactive`, `-t`/`--tty`, `--stream`, `-d`/`--detach`, `--timeout`,
+`--secret-env`, and `--secret-file` before `SERVICE`. The `--` separator is
+accepted but not required. The service must already be running under this
+world's supervisor; `exec` does not let the companion implicitly start a VM
+without its switch listener. `shell` is exactly interactive `exec` of
+`/bin/sh`. `cp` also requires its selected service to be running under this
+world's live supervisor before it calls the companion, so a copy can never
+implicitly boot or use an unswitched VM. It uses `SERVICE:/absolute/path`
+endpoints and remains limited to one regular host file and one traversal-free
+guest path because that is the selected companion's transfer capability.
 
 ## Checkpoint, restore, and release
 
@@ -379,10 +431,19 @@ declared dependency waves preserve deterministic order.
 
 ## Explicit non-goals and deferrals
 
-smolworld does not provide Docker/Compose compatibility, workflow
+smolworld provides a deliberately small Compose-shaped command vocabulary; it
+does not implement Docker/Compose configuration, project merging, profiles,
+environment interpolation, replica/index/scale semantics, workflow
 orchestration, generic service readiness, health checks, restart policies, log
-aggregation, host networking, port publishing, smolworld-owned NAT, TAP/vmnet,
-DHCP, IPv6, guest SSH, registry pulls from guests, or workflow/executor policy.
+aggregation, primary-workload attachment, event streams, guest process `top`,
+wait/exit-event semantics, pause/kill controls, host networking, port
+publishing, volumes, smolworld-owned NAT, TAP/vmnet, DHCP, IPv6, guest SSH,
+registry pulls from guests, or workflow/executor policy. The unavailable
+`logs`, `events`, `attach`, `top`, `wait`, `pause`, `unpause`, `kill`, `run`,
+`scale`, `watch`, `ls`, `port`, `volumes`, `build`, `pull`, `push`, `publish`,
+`commit`, and `export` commands are intentionally not compatibility shells:
+the selected upstream CLI has no safe primitive or the world model has no
+matching contract.
 
 It also does not define distributed scheduling, multi-world merge semantics,
 GPU fabrics, a universal state codec, persistent agent personalities, or a
