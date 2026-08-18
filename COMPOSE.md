@@ -1,5 +1,9 @@
 I compared the current CLI with the current Docker Compose surface. Docker Compose has substantially more than lifecycle commands: its root options include file merging, project naming, profiles, progress controls, dry-run, parallelism, and environment-file handling; its command set includes `attach`, `build`, `config`, `create`, `events`, `logs`, `run`, `start`, `stop`, `restart`, `stats`, `top`, `wait`, and more. [Compose CLI reference](https://docs.docker.com/reference/cli/docker/compose/)
 
+This is an implementation inventory and planning note, not a second
+user-facing contract. The normative behavior remains in
+[`docs/world-contract.md`](docs/world-contract.md).
+
 ## Immediate renames
 
 | Current | Recommended | Reason |
@@ -10,6 +14,105 @@ I compared the current CLI with the current Docker Compose surface. Docker Compo
 | `smolworld cp SRC DST` | Compose-style endpoint placeholders | Use `SERVICE:SRC_PATH DEST_PATH` and `SRC_PATH SERVICE:DEST_PATH`, even though our current endpoint shape is already close. |
 
 `prepare`, `check`, `checkpoint`, `restore`, and `release` should remain smolworld-specific commands. They do not have faithful Compose equivalents.
+
+## Delegation inventory: reuse smolvm commands
+
+The selected smolvm checkout already owns most single-machine lifecycle and
+agent operations. A Compose-shaped smolworld command should be a thin adapter
+where possible: validate the logical service against this world's declaration,
+resolve its exact recorded `smw-*` identity, forward the supported options, and
+translate the result. It must not rediscover machines with an unrestricted
+`smolvm machine ls` call; that would cross the world's identity and cleanup
+boundary.
+
+The existing adapter in [`src/smolvm.rs`](src/smolvm.rs) already demonstrates
+this pattern for `machine create`, `start`, `status`, `stats`, `exec`, `cp`,
+`checkpoint`, `restore`, and exact `delete`/`stop` cleanup. The companion CLI
+also provides `machine run`, `machine update`, `machine images`, `machine
+monitor`, `machine shell`, `machine fork`, and `machine delete`/`rm`.
+
+### Thin forwarding layers
+
+These should reuse the upstream operation rather than reimplement VM, agent,
+file-transfer, or resource-sampling behavior:
+
+| Compose-facing command | Existing upstream call | Smolworld-owned work |
+| --- | --- | --- |
+| `stats` | `smolvm machine stats --name NAME --format tsv` | Select recorded machines, implement the Compose stream/format presentation, and retain identity checks. The measurement itself already comes from smolvm. |
+| `ps` | `smolvm machine status --name NAME` (or `--json`) | Query only declared identities and format Compose-shaped rows. Do not replace this with an unrestricted `machine ls`. |
+| `exec` | `smolvm machine exec --name NAME ...` | Forward native `-e`, `-w`, `-i`, `-t`, `--stream`, `-d`, `--timeout`, `--secret-env`, and `--secret-file` options; smolvm already owns guest execution and exit status. |
+| `cp` | `smolvm machine cp SRC DST` | Keep world endpoint validation and identity resolution; reuse smolvm's streaming transfer and progress behavior. Directory/stdin/stdout support is not present upstream, so do not recreate it in smolworld without an upstream capability. |
+| `version` | `smolvm --version` | Add a small presentation wrapper if a Compose-style version command is desired. |
+| `shell` (optional convenience) | `smolvm machine shell --name NAME` | Forward to smolvm's interactive `exec -it /bin/sh` behavior. This is closer to a shell convenience command than Compose `attach`. |
+
+`prepare` and `check` are also mostly existing upstream adapters: they call
+`smolvm smolfile materialize-external` and `smolvm smolfile validate-external`
+for each declaration. The world-level lock, dependency validation, and
+all-or-nothing material transaction remain smolworld responsibilities.
+
+### Upstream primitive exists, but world coordination is required
+
+These are still thin at the VM boundary, but cannot safely become a direct
+subprocess passthrough:
+
+| Proposed command | Existing primitive | Why coordination remains |
+| --- | --- | --- |
+| `start` | `smolvm machine start --name NAME` | The world must keep or recreate the external NIC listener, switch port, gateway, and lifecycle record consistently. |
+| `stop` | `smolvm machine stop --name NAME` | The world must detach the port and update state without deleting the recorded allocation or affecting another world. |
+| `restart` | `stop` followed by `start` | smolvm has no `machine restart`; ordering, NIC reconnect, and failure rollback belong to the world supervisor. |
+| `create` | `smolvm machine create --name NAME ...` | smolworld already supplies the exact name, Smolfile, static network tuple, Unix-stream socket, material lock, dependency wave, and allocation record. |
+| `rm` / selected `down` | `smolvm machine delete --name NAME -f` | Reuse the upstream stop-then-delete implementation. Keep exact recorded identities, state transitions, and checkpoint guards in smolworld; do not hand-roll stop plus delete. |
+| `checkpoint` | `smolvm machine checkpoint --name NAME --output DIR` | The primitive is already used, but a world checkpoint must quiesce the switch and capture every machine into one receipt/transaction. |
+| `restore` | `smolvm machine restore --name NAME --checkpoint DIR` | The primitive is already used, but smolworld verifies same-lineage configuration/material/allocation identity and recreates the multi-machine switch. |
+| `images` | `smolvm machine images --name NAME` | The upstream command owns image/storage inspection, but it may start a stopped machine to query the agent; that conflicts with a strictly read-only world observation contract and needs an explicit policy. |
+| `monitor` / health behavior | `smolvm machine monitor --name NAME` | The upstream monitor owns health checks/restarts, but health and restart policy are currently explicit smolworld non-goals. |
+
+The current `down` cleanup already follows the important upstream rule:
+`machine delete -f` owns stop-then-remove. Calling `machine stop` separately
+and ignoring its result can race deletion and leave an orphaned VM process.
+
+### No direct CLI primitive in smolvm
+
+These cannot currently be thin wrappers over `smolvm machine ...`:
+
+```text
+logs       # smolvm's machine CLI has no logs command
+events     # no machine event-stream CLI
+attach     # shell/exec is not primary workload-stream attachment
+top        # no structured machine top command; `exec ps` is only an approximation
+wait       # no machine wait command or stable exit-event CLI
+kill       # no machine kill command; stop is graceful
+pause      # no machine pause command
+unpause    # no machine unpause command
+```
+
+The smolvm HTTP API has a log-stream endpoint, but using it would be a new
+transport boundary rather than a thin wrapper over the selected CLI. If these
+commands become requirements, the cleanest path is to add a versioned upstream
+CLI/API operation first and keep smolworld as the identity/format adapter.
+
+### Existing upstream commands that do not map directly
+
+`smolvm machine run` supports one-shot and detached ephemeral machines, but it
+does not represent a declared world service. It bypasses the world's durable
+allocation, dependency waves, and coordinated switch lifecycle; use it only if
+we deliberately define a separate `run` contract. Similarly, smolvm's
+`machine fork` is a powerful CoW clone primitive, but it is not Compose
+replica/scale semantics without world-level allocation, naming, networking,
+and cleanup rules.
+
+The companion also has image/artifact commands (`pack pull`, `pack push`,
+`pack create`, `pack prune`) and machine resource commands (`machine update`,
+`machine images`, `machine prune`). They should not be exposed as ad-hoc
+Compose aliases that bypass the `.smolworld.lock`: material preparation and
+world identity are the controlling boundaries. `build`, `pull`, `push`,
+`publish`, `commit`, and `export` need an explicit artifact contract before
+they can be added safely.
+
+Finally, upstream `machine create`/`update` support volumes and host port
+publishing, but the current smolworld contract intentionally rejects those
+capabilities for external-world machines. `port` and `volumes` therefore are
+not thin wrappers until that contract changes.
 
 ## Existing commands with major Compose deviations
 
