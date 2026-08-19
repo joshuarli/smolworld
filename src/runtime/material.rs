@@ -7,6 +7,7 @@ pub(super) fn verify_prepared_world(
     config: &WorldConfig,
     paths: &WorldPaths,
     smolvm: &Path,
+    deep: bool,
 ) -> Result<MaterialLock> {
     preflight(config, &paths.config_dir, smolvm)?;
     let prepared = load_material_lock(&paths.material_lock_path())?.ok_or_else(|| {
@@ -15,7 +16,7 @@ pub(super) fn verify_prepared_world(
             paths.material_lock_path().display()
         )
     })?;
-    verify_material_lock(config, paths, &prepared)?;
+    verify_material_lock(config, paths, &prepared, deep)?;
     Ok(prepared)
 }
 
@@ -108,6 +109,7 @@ fn prepare_one_machine_material(
             source_digest: preparation.source_digest,
             local_path: preparation.local_archive,
             image_digest: preparation.image_digest,
+            archive_identity: preparation.archive_identity,
         },
         seeds,
     })
@@ -119,6 +121,7 @@ fn verify_material_lock(
     config: &WorldConfig,
     paths: &WorldPaths,
     prepared: &MaterialLock,
+    deep: bool,
 ) -> Result<()> {
     prepared.validate()?;
     if prepared.resolver_abi != resolver_abi() {
@@ -145,7 +148,7 @@ fn verify_material_lock(
 
     let names: Vec<_> = config.machines.keys().cloned().collect();
     let mut expected_seeds = parallel_machine_map(&names, "verify material", |name| {
-        verify_one_machine_material(config, paths, prepared, name)
+        verify_one_machine_material(config, paths, prepared, name, deep)
     })?
     .into_iter()
     .flatten()
@@ -167,6 +170,7 @@ fn verify_one_machine_material(
     paths: &WorldPaths,
     prepared: &MaterialLock,
     name: &str,
+    deep: bool,
 ) -> Result<Vec<SeedObservation>> {
     let machine = config
         .machines
@@ -199,16 +203,19 @@ fn verify_one_machine_material(
             "prepared Smolfile for machine '{name}' no longer matches the material lock; run smolworld prepare again"
         ));
     }
-    let material = verify_prepared_world_smolfile(&observation.prepared_path)?;
+    let material = verify_prepared_world_smolfile(&observation.prepared_path, deep)?;
     let image = prepared
         .images
         .get(name)
         .ok_or_else(|| format!("world material is missing the image for machine '{name}'"))?;
-    if material.local_archive != image.local_path
-        || material.image_digest != image.image_digest
-    {
+    if material.local_archive != image.local_path || material.archive_identity != image.archive_identity {
         return Err(format!(
-            "prepared image for machine '{name}' no longer matches the material lock; run smolworld prepare again"
+            "prepared image identity for machine '{name}' no longer matches the material lock; run smolworld prepare again"
+        ));
+    }
+    if deep && material.image_digest.as_deref() != Some(image.image_digest.as_str()) {
+        return Err(format!(
+            "prepared image content for machine '{name}' no longer matches the material lock; run smolworld prepare again"
         ));
     }
     machine

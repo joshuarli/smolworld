@@ -196,11 +196,16 @@ local archive and generates local-only material. Every local input is recorded
 in `.smolworld.lock`; changing any input requires another explicit `prepare`.
 
 `prepare` is the only preparation mutation. It validates all referenced
-Smolfiles and local image archives, computes BLAKE3 identities, and writes the
+Smolfiles and local image archives, computes BLAKE3 identities, seals a
+same-host regular-file identity receipt for every local archive, and writes the
 lock beside the authored world. It does not allocate runtime state, bind a
-listener, or create a machine. `check` repeats host/runtime prerequisite and
-material-lock validation; it is read-only and must run after `prepare`. `up`
-refuses unprepared or changed material.
+listener, or create a machine. Normal `check` and `up` repeat host/runtime
+prerequisite validation and compare the sealed archive receipts without
+rereading large immutable archives. `check --deep` is the explicit full
+content audit: it recomputes every sealed archive BLAKE3 identity. The receipt
+is a bounded same-user-host mutation check, not a portable cryptographic
+content audit; changed or incompatible material always requires another
+explicit `prepare`.
 
 ## Network and lifecycle invariants
 
@@ -253,7 +258,7 @@ The command surface is:
 smolworld config [-f PATH] [--format yaml|json]     Validate and render resolved configuration.
 smolworld convert [-f PATH] [--format yaml|json]    Alias for config.
 smolworld prepare [-f PATH]                         Resolve and seal local material.
-smolworld check [-f PATH]                           Validate prepared material read-only.
+smolworld check [-f PATH] [--deep]                  Validate prepared material read-only.
 smolworld up [-f PATH] [-d] [SERVICE...]            Create/start services under the supervisor.
 smolworld create [-f PATH] [SERVICE...]             Create recorded service configurations only.
 smolworld start [-f PATH] [SERVICE...]              Start recorded services without deleting them.

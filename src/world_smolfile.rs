@@ -2,7 +2,7 @@
 
 use crate::model::ImageSourceKind;
 use crate::smolvm::materialize_registry_archive;
-use crate::state::{digest_file, ensure_private_dir, WorldPaths};
+use crate::state::{archive_identity, digest_file, ensure_private_dir, ArchiveIdentity, WorldPaths};
 use crate::Result;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -21,13 +21,15 @@ pub(crate) struct PreparedWorldSmolfile {
     pub(crate) source_digest: String,
     pub(crate) local_archive: PathBuf,
     pub(crate) image_digest: String,
+    pub(crate) archive_identity: ArchiveIdentity,
 }
 
 /// The verified local image input named by a prepared world Smolfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedWorldSmolfile {
     pub(crate) local_archive: PathBuf,
-    pub(crate) image_digest: String,
+    pub(crate) archive_identity: ArchiveIdentity,
+    pub(crate) image_digest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,7 @@ enum WorldImage {
         reference: String,
         path: PathBuf,
         digest: String,
+        identity: ArchiveIdentity,
     },
     Registry {
         reference: String,
@@ -67,6 +70,7 @@ pub(crate) fn prepare_world_smolfile(
             reference,
             path,
             digest,
+            identity,
         } => Ok(PreparedWorldSmolfile {
             authored_smolfile: authored_smolfile.clone(),
             prepared_smolfile: authored_smolfile,
@@ -75,6 +79,7 @@ pub(crate) fn prepare_world_smolfile(
             source_digest: digest.clone(),
             local_archive: path,
             image_digest: digest,
+            archive_identity: identity,
         }),
         WorldImage::Registry { reference, digest } => {
             let material = materialize_registry_archive(smolvm, &reference)?;
@@ -84,7 +89,8 @@ pub(crate) fn prepare_world_smolfile(
                         .into(),
                 );
             }
-            if digest_file(&material.archive_path)? != material.archive_digest {
+            let (archive_digest, archive_identity) = audited_archive_digest(&material.archive_path)?;
+            if archive_digest != material.archive_digest {
                 return Err("smolvm materialized archive does not match its reported digest".into());
             }
             let prepared_smolfile = write_prepared_world_smolfile(
@@ -102,6 +108,7 @@ pub(crate) fn prepare_world_smolfile(
                 source_digest: digest,
                 local_archive: material.archive_path,
                 image_digest: material.archive_digest,
+                archive_identity,
             })
         }
     }
@@ -109,17 +116,36 @@ pub(crate) fn prepare_world_smolfile(
 
 /// Re-parse a locked prepared Smolfile and prove that it still names a sealed
 /// local archive. Registry references cannot appear after preparation.
-pub(crate) fn verify_prepared_world_smolfile(path: &Path) -> Result<VerifiedWorldSmolfile> {
-    let parsed = parse_world_smolfile(path)?;
-    match parsed.image {
-        WorldImage::LocalArchive { path, digest, .. } => Ok(VerifiedWorldSmolfile {
-            local_archive: path,
-            image_digest: digest,
-        }),
-        WorldImage::Registry { .. } => {
-            Err("prepared world Smolfile still names a registry image; run smolworld prepare again".into())
-        }
+pub(crate) fn verify_prepared_world_smolfile(
+    path: &Path,
+    deep: bool,
+) -> Result<VerifiedWorldSmolfile> {
+    let path = canonical_regular_file(path, "prepared world Smolfile")?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("read prepared world Smolfile {}: {error}", path.display()))?;
+    let document: toml::Value = text
+        .parse()
+        .map_err(|error| format!("parse prepared world Smolfile {}: {error}", path.display()))?;
+    validate_world_profile(&document)?;
+    let reference = document
+        .get("image")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| "prepared world Smolfile image must be a string".to_string())?;
+    if !looks_local(reference) {
+        return Err("prepared world Smolfile still names a registry image; run smolworld prepare again".into());
     }
+    let local_archive = resolve_local_archive_path(&path, reference)?;
+    let (image_digest, archive_identity) = if deep {
+        let (digest, identity) = audited_archive_digest(&local_archive)?;
+        (Some(digest), identity)
+    } else {
+        (None, archive_identity(&local_archive)?)
+    };
+    Ok(VerifiedWorldSmolfile {
+        local_archive,
+        archive_identity,
+        image_digest,
+    })
 }
 
 fn parse_world_smolfile(path: &Path) -> Result<ParsedWorldSmolfile> {
@@ -248,32 +274,13 @@ fn resolve_world_image(smolfile: &Path, reference: &str) -> Result<WorldImage> {
         return Err("world Smolfiles cannot use stdin image material; prepare a local archive first".into());
     }
     if looks_local(reference) {
-        let path = Path::new(reference);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            smolfile.parent().expect("canonical file has a parent").join(path)
-        };
-        let path = canonical_regular_file(&path, "world image archive")?;
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("inspect world image archive {}: {error}", path.display()))?;
-        if metadata.len() > max_archive_bytes() {
-            return Err(format!(
-                "world image archive is {} bytes, over the {}-byte limit",
-                metadata.len(),
-                max_archive_bytes()
-            ));
-        }
-        if looks_like_dockerfile(&path) {
-            return Err(format!(
-                "world image archive {} looks like a Dockerfile; build and export an image first",
-                path.display()
-            ));
-        }
+        let path = resolve_local_archive_path(smolfile, reference)?;
+        let (digest, identity) = audited_archive_digest(&path)?;
         return Ok(WorldImage::LocalArchive {
             reference: reference.to_string(),
-            digest: digest_file(&path)?,
+            digest,
             path,
+            identity,
         });
     }
     let digest = reference
@@ -297,6 +304,45 @@ fn resolve_world_image(smolfile: &Path, reference: &str) -> Result<WorldImage> {
         reference: reference.to_string(),
         digest: format!("sha256:{digest}"),
     })
+}
+
+fn resolve_local_archive_path(smolfile: &Path, reference: &str) -> Result<PathBuf> {
+    let path = Path::new(reference);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        smolfile.parent().expect("canonical file has a parent").join(path)
+    };
+    let path = canonical_regular_file(&path, "world image archive")?;
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("inspect world image archive {}: {error}", path.display()))?;
+    if metadata.len() > max_archive_bytes() {
+        return Err(format!(
+            "world image archive is {} bytes, over the {}-byte limit",
+            metadata.len(),
+            max_archive_bytes()
+        ));
+    }
+    if looks_like_dockerfile(&path) {
+        return Err(format!(
+            "world image archive {} looks like a Dockerfile; build and export an image first",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn audited_archive_digest(path: &Path) -> Result<(String, ArchiveIdentity)> {
+    let before = archive_identity(path)?;
+    let digest = digest_file(path)?;
+    let after = archive_identity(path)?;
+    if before != after {
+        return Err(format!(
+            "world image archive changed while preparing {}",
+            path.display()
+        ));
+    }
+    Ok((digest, after))
 }
 
 fn looks_local(reference: &str) -> bool {
@@ -442,12 +488,24 @@ mod tests {
         fs::write(&smolfile, "image = \"./image.tar\"\ncpus = 2\nmemory = 128\n").unwrap();
         let parsed = parse_world_smolfile(&smolfile).unwrap();
         match parsed.image {
-            WorldImage::LocalArchive { path, digest, .. } => {
+            WorldImage::LocalArchive {
+                path,
+                digest,
+                identity,
+                ..
+            } => {
                 assert_eq!(path, archive.canonicalize().unwrap());
                 assert_eq!(digest, digest_file(&archive).unwrap());
+                assert_eq!(identity, archive_identity(&archive).unwrap());
             }
             WorldImage::Registry { .. } => panic!("expected local archive"),
         }
+        let fast = verify_prepared_world_smolfile(&smolfile, false).unwrap();
+        assert_eq!(fast.local_archive, archive.canonicalize().unwrap());
+        assert_eq!(fast.archive_identity, archive_identity(&archive).unwrap());
+        assert_eq!(fast.image_digest, None);
+        let deep = verify_prepared_world_smolfile(&smolfile, true).unwrap();
+        assert_eq!(deep.image_digest, Some(digest_file(&archive).unwrap()));
         fs::remove_dir_all(directory).unwrap();
     }
 

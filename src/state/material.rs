@@ -6,9 +6,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-const MATERIAL_LOCK_VERSION: u8 = 5;
+const MATERIAL_LOCK_VERSION: u8 = 6;
 pub(crate) const MAX_MACHINE_CHECKPOINT_RECEIPT_BYTES: u64 = 1024 * 1024;
 
 /// A content digest observation for one machine's Smolfile.
@@ -52,6 +53,30 @@ pub(crate) struct ImageMaterial {
     pub(crate) source_digest: String,
     pub(crate) local_path: PathBuf,
     pub(crate) image_digest: String,
+    /// Fast same-host identity sealed alongside the deep archive digest.
+    ///
+    /// Normal `check` and `up` use this receipt to reject changed local
+    /// archives without rereading multi-gigabyte immutable material. A deep
+    /// check recomputes `image_digest`; the receipt is not a replacement for
+    /// that content audit.
+    pub(crate) archive_identity: ArchiveIdentity,
+}
+
+/// A local regular file identity used to make hot material validation bounded.
+///
+/// This is intentionally a same-host receipt, not a portable content digest:
+/// it records filesystem identity and mutation observations that normal writes
+/// cannot preserve. The material lock retains the BLAKE3 content digest for an
+/// explicit deep validation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanoseconds: i64,
 }
 
 /// Identity of the world declaration captured by a material record. The
@@ -178,6 +203,7 @@ impl MaterialLock {
                 }
             }
             validate_blake3_digest(&material.image_digest, "image digest")?;
+            validate_archive_identity(&material.archive_identity)?;
         }
         Ok(())
     }
@@ -204,6 +230,28 @@ pub(crate) fn digest_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+/// Observe a regular archive's same-host identity without reading its contents.
+///
+/// `prepare` captures this receipt only after its full BLAKE3 audit has
+/// completed. Normal validation compares a newly observed receipt with this
+/// sealed one; a deliberate deep check recomputes the BLAKE3 digest instead.
+pub(crate) fn archive_identity(path: &Path) -> Result<ArchiveIdentity> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("inspect archive {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("archive {} must be a regular file", path.display()));
+    }
+    Ok(ArchiveIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
 }
 
 /// Hash the small receipt that smolvm publishes beside each durable machine
@@ -364,7 +412,22 @@ fn parse_material_lock(content: &str) -> Result<MaterialLock> {
                     digest: (*digest).to_string(),
                 });
             }
-            ["image", machine, source_kind, source_reference, source_digest, local_path, digest] => {
+            [
+                "image",
+                machine,
+                source_kind,
+                source_reference,
+                source_digest,
+                local_path,
+                digest,
+                device,
+                inode,
+                size,
+                modified_seconds,
+                modified_nanoseconds,
+                changed_seconds,
+                changed_nanoseconds,
+            ] => {
                 if images
                     .insert(
                         (*machine).to_string(),
@@ -377,6 +440,37 @@ fn parse_material_lock(content: &str) -> Result<MaterialLock> {
                             source_digest: (*source_digest).to_string(),
                             local_path: PathBuf::from(local_path),
                             image_digest: (*digest).to_string(),
+                            archive_identity: ArchiveIdentity {
+                                device: device.parse().map_err(|_| {
+                                    format!("material lock image '{machine}' has invalid device")
+                                })?,
+                                inode: inode.parse().map_err(|_| {
+                                    format!("material lock image '{machine}' has invalid inode")
+                                })?,
+                                size: size.parse().map_err(|_| {
+                                    format!("material lock image '{machine}' has invalid size")
+                                })?,
+                                modified_seconds: modified_seconds.parse().map_err(|_| {
+                                    format!(
+                                        "material lock image '{machine}' has invalid modified seconds"
+                                    )
+                                })?,
+                                modified_nanoseconds: modified_nanoseconds.parse().map_err(|_| {
+                                    format!(
+                                        "material lock image '{machine}' has invalid modified nanoseconds"
+                                    )
+                                })?,
+                                changed_seconds: changed_seconds.parse().map_err(|_| {
+                                    format!(
+                                        "material lock image '{machine}' has invalid changed seconds"
+                                    )
+                                })?,
+                                changed_nanoseconds: changed_nanoseconds.parse().map_err(|_| {
+                                    format!(
+                                        "material lock image '{machine}' has invalid changed nanoseconds"
+                                    )
+                                })?,
+                            },
                         },
                     )
                     .is_some()
@@ -450,12 +544,19 @@ fn serialize_material_lock(record: &MaterialLock) -> String {
     }
     for (machine, material) in &record.images {
         output.push_str(&format!(
-            "image\t{machine}\t{}\t{}\t{}\t{}\t{}\n",
+            "image\t{machine}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             material.source_kind.as_str(),
             material.source_reference,
             material.source_digest,
             material.local_path.display(),
-            material.image_digest
+            material.image_digest,
+            material.archive_identity.device,
+            material.archive_identity.inode,
+            material.archive_identity.size,
+            material.archive_identity.modified_seconds,
+            material.archive_identity.modified_nanoseconds,
+            material.archive_identity.changed_seconds,
+            material.archive_identity.changed_nanoseconds,
         ));
     }
     output
@@ -469,6 +570,23 @@ fn validate_field(value: &str, label: &str) -> Result<()> {
         return Err(format!(
             "material lock {label} contains a control character"
         ));
+    }
+    Ok(())
+}
+
+fn validate_archive_identity(identity: &ArchiveIdentity) -> Result<()> {
+    if identity.inode == 0 {
+        return Err("material lock archive identity has an invalid inode".into());
+    }
+    for (value, label) in [
+        (identity.modified_nanoseconds, "modified nanoseconds"),
+        (identity.changed_nanoseconds, "changed nanoseconds"),
+    ] {
+        if !(0..1_000_000_000).contains(&value) {
+            return Err(format!(
+                "material lock archive identity has invalid {label}: {value}"
+            ));
+        }
     }
     Ok(())
 }

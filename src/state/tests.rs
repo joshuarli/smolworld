@@ -110,6 +110,15 @@ fn material_lock() -> MaterialLock {
                 source_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
                 local_path: PathBuf::from("/tmp/smolworld/material/postgres.ext4"),
                 image_digest: "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                archive_identity: ArchiveIdentity {
+                    device: 1,
+                    inode: 2,
+                    size: 3,
+                    modified_seconds: 4,
+                    modified_nanoseconds: 5,
+                    changed_seconds: 6,
+                    changed_nanoseconds: 7,
+                },
             },
         )]),
     }
@@ -127,13 +136,27 @@ fn material_lock_round_trips_all_material_identity() {
     write_material_lock(&paths, &record).unwrap();
 
     let serialized = fs::read_to_string(paths.material_lock_path()).unwrap();
-    assert!(serialized.starts_with("version\t5\nresolver_abi\tsmolworld-world-smolfile/v1\n"));
+    assert!(serialized.starts_with("version\t6\nresolver_abi\tsmolworld-world-smolfile/v1\n"));
+    assert!(serialized.contains("\t1\t2\t3\t4\t5\t6\t7\n"));
     assert!(!serialized.contains(&world.root.display().to_string()));
     assert!(!paths.state_dir.exists());
     assert_eq!(
         load_material_lock(&paths.material_lock_path()).unwrap(),
         Some(record)
     );
+}
+
+#[test]
+fn archive_identity_receipt_changes_when_a_sealed_file_is_rewritten() {
+    let world = TemporaryWorld::new();
+    let archive = world.root.join("image.tar");
+    fs::write(&archive, b"first archive bytes").unwrap();
+    let original = archive_identity(&archive).unwrap();
+
+    fs::write(&archive, b"rewritten archive bytes with a different length").unwrap();
+    let rewritten = archive_identity(&archive).unwrap();
+
+    assert_ne!(original, rewritten);
 }
 
 #[test]

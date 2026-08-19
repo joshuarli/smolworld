@@ -90,7 +90,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
             lifecycle(&config, LifecycleCommand::Restart, &services)
         }
         Cli::Rm { config, services } => lifecycle(&config, LifecycleCommand::Rm, &services),
-        Cli::Check { config } => check(&config),
+        Cli::Check { config, deep } => check(&config, deep),
         Cli::Prepare { config } => prepare(&config),
         Cli::Checkpoint { config, output } => checkpoint(&config, &output),
         Cli::Restore { config, checkpoint } => restore(&config, &checkpoint),
@@ -144,11 +144,11 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
     }
 }
 
-pub(crate) fn check(config_path: &Path) -> Result<()> {
+pub(crate) fn check(config_path: &Path, deep: bool) -> Result<()> {
     let config = load_config(config_path)?;
     topological_order(&config)?;
     let paths = world_paths(config_path)?;
-    verify_prepared_world(&config, &paths, &smolvm_program())?;
+    verify_prepared_world(&config, &paths, &smolvm_program(), deep)?;
     println!("smolworld: {} is ready", config.name);
     Ok(())
 }
@@ -329,7 +329,7 @@ pub(crate) fn create(config_path: &Path, requested_services: &[String]) -> Resul
     let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
     let _world_lock = WorldLock::acquire(&paths)?;
-    let material = verify_prepared_world(&config, &paths, &smolvm)?;
+    let material = verify_prepared_world(&config, &paths, &smolvm, false)?;
     let recovery = inspect_recovery(&paths)?;
     if recovery.lifecycle.state.retains_checkpoint_sources() {
         return Err("cannot create services for a world with a retained checkpoint".into());
@@ -424,7 +424,7 @@ fn spawn_detached_up(config_path: &Path, services: &[String]) -> Result<()> {
     let config = load_config(config_path)?;
     selected_services_with_dependencies(&config, services)?;
     let paths = world_paths(config_path)?;
-    verify_prepared_world(&config, &paths, &smolvm_program())?;
+    verify_prepared_world(&config, &paths, &smolvm_program(), false)?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve smolworld executable: {error}"))?;
     let mut command = Command::new(executable);
@@ -718,7 +718,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
     let _world_lock = WorldLock::acquire(&paths)?;
-    let material = verify_prepared_world(&config, &paths, &smolvm)?;
+    let material = verify_prepared_world(&config, &paths, &smolvm, false)?;
     let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
     if !matches!(
         lifecycle.state,
@@ -1070,7 +1070,7 @@ pub(crate) fn up(config_path: &Path, requested_services: &[String], detach: bool
     let paths = world_paths(config_path)?;
     let smolvm = smolvm_program();
     let _world_lock = WorldLock::acquire(&paths)?;
-    let material = verify_prepared_world(&config, &paths, &smolvm)?;
+    let material = verify_prepared_world(&config, &paths, &smolvm, false)?;
 
     let recovery = inspect_recovery(&paths)?;
     if recovery.lifecycle.state.retains_checkpoint_sources() {

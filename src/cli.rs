@@ -152,6 +152,7 @@ pub(crate) enum Cli {
     },
     Check {
         config: PathBuf,
+        deep: bool,
     },
     Prepare {
         config: PathBuf,
@@ -314,6 +315,16 @@ pub(crate) const CONFIG_QUIET_OPTION: OptionSpec = OptionSpec {
     repeatable: false,
     default: None,
     help: "Validate without rendering configuration",
+};
+
+pub(crate) const DEEP_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "deep",
+    value_name: None,
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Recompute sealed local archive digests",
 };
 
 pub(crate) const VERSION_FORMAT_OPTION: OptionSpec = OptionSpec {

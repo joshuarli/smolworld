@@ -28,9 +28,11 @@ smolworld up -d
 ```
 
 `prepare` seals material, `check` verifies it read-only, and `up -d` launches
-the world supervisor in the background. The background supervisor owns the
-private L2 switch and is the only process allowed to stop, restart, remove, or
-delete its recorded machines.
+the world supervisor in the background. Normal `check` uses the archive
+identity receipts sealed by `prepare`; `check --deep` explicitly rereads and
+rehashes every local archive. The background supervisor owns the private L2
+switch and is the only process allowed to stop, restart, remove, or delete its
+recorded machines.
 
 ## Configuration and inspection
 
