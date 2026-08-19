@@ -12,8 +12,9 @@ scaling matrix with separate signals:
 * world startup: a real smolworld supervisor records material preparation,
   each reported private-NIC attachment, and the all-machines-ready barrier.
 * prepared-world attachment: an externally prepared, sealed world records
-  configuration/check, startup, a selected declared service becoming host
-  visible, and a successful exact command attachment.
+  configuration/check, each declared machine's create/start/attachment
+  boundaries, a selected declared service becoming host visible, and a
+  successful exact command attachment.
 
 The direct scenarios never configure a NIC: attaching a raw Unix listener is
 not a substitute for the smolworld L2 switch and gateway. The world scenarios
@@ -395,6 +396,21 @@ def parse_startup_trace(stderr: str) -> dict[str, float]:
     elapsed("layer_materialization_to_overlay", "layer_materialization", "persistent_overlay")
     elapsed("agent_ready_to_workload_start", "agent_ready", "workload_start")
     return stages
+
+
+def prepared_world_lifecycle_event(line: str) -> tuple[str, str] | None:
+    """Read one stable supervisor lifecycle boundary without parsing smolvm output."""
+
+    for phase, prefix in (
+        ("machine_created", "smolworld: created "),
+        ("machine_started", "smolworld: started "),
+        ("nic_attach", "smolworld: attached "),
+    ):
+        if line.startswith(prefix):
+            service = line.removeprefix(prefix)
+            if service and service == service.strip() and not any(char.isspace() for char in service):
+                return phase, service
+    return None
 
 
 def summarize_samples(
@@ -1047,24 +1063,38 @@ def run_world_probe(
             reader.start()
         started = time.monotonic_ns()
         deadline = time.monotonic() + WORLD_READY_TIMEOUT_SECONDS
+        created: dict[str, int] = {}
+        started_machines: dict[str, int] = {}
         attachments: dict[str, int] = {}
         ready_ns: int | None = None
         while time.monotonic() < deadline and ready_ns is None:
             with events_lock:
                 for observed_ns, line in events:
-                    if line.startswith("smolworld: attached "):
-                        service = line.removeprefix("smolworld: attached ")
-                        attachments.setdefault(service, observed_ns)
+                    lifecycle_event = prepared_world_lifecycle_event(line)
+                    if lifecycle_event is not None:
+                        lifecycle_phase, service = lifecycle_event
+                        if lifecycle_phase == "machine_created":
+                            created.setdefault(service, observed_ns)
+                        elif lifecycle_phase == "machine_started":
+                            started_machines.setdefault(service, observed_ns)
+                        else:
+                            attachments.setdefault(service, observed_ns)
                     if line == "smolworld: world is up; press Ctrl-C to stop it":
                         ready_ns = observed_ns
             if process.poll() is not None and ready_ns is None:
                 break
             time.sleep(0.001)
-        if ready_ns is None or set(attachments) != set(services):
+        expected_services = set(services)
+        if (
+            ready_ns is None
+            or set(created) != expected_services
+            or set(started_machines) != expected_services
+            or set(attachments) != expected_services
+        ):
             with events_lock:
                 rendered = "\n".join(line for _timestamp, line in events)
             raise BenchmarkError(
-                f"smolworld up did not reach all attachments and ready state: {rendered}"
+                f"smolworld up did not reach all create/start/attachment boundaries and ready state: {rendered}"
             )
         for service in services:
             sample = TimingSample(
@@ -1226,6 +1256,8 @@ def run_prepared_world_profile(
             reader.start()
         started = time.monotonic_ns()
         deadline = time.monotonic() + WORLD_READY_TIMEOUT_SECONDS
+        created: dict[str, int] = {}
+        started_machines: dict[str, int] = {}
         attachments: dict[str, int] = {}
         ready_ns: int | None = None
         visible_ns: int | None = None
@@ -1235,9 +1267,15 @@ def run_prepared_world_profile(
         while time.monotonic() < deadline:
             with events_lock:
                 for observed_ns, line in events:
-                    if line.startswith("smolworld: attached "):
-                        service = line.removeprefix("smolworld: attached ")
-                        attachments.setdefault(service, observed_ns)
+                    lifecycle_event = prepared_world_lifecycle_event(line)
+                    if lifecycle_event is not None:
+                        lifecycle_phase, service = lifecycle_event
+                        if lifecycle_phase == "machine_created":
+                            created.setdefault(service, observed_ns)
+                        elif lifecycle_phase == "machine_started":
+                            started_machines.setdefault(service, observed_ns)
+                        else:
+                            attachments.setdefault(service, observed_ns)
                     if line == "smolworld: world is up; press Ctrl-C to stop it":
                         ready_ns = observed_ns
             if visible_ns is None:
@@ -1309,7 +1347,14 @@ def run_prepared_world_profile(
             if process.poll() is not None:
                 break
             time.sleep(0.2)
-        if ready_ns is None or attached_command_ns is None:
+        expected_services = {json.loads(line)["service"] for line in idle.stdout.splitlines() if line}
+        if (
+            ready_ns is None
+            or attached_command_ns is None
+            or set(created) != expected_services
+            or set(started_machines) != expected_services
+            or set(attachments) != expected_services
+        ):
             with events_lock:
                 event_output = "\n".join(line for _observed_ns, line in events)
             detail = "; ".join(
@@ -1318,10 +1363,47 @@ def run_prepared_world_profile(
                 if value
             )
             raise BenchmarkError(
-                "smolworld up did not reach both the world-ready and declared-service "
-                f"command-attachment boundaries" + (f": {detail}" if detail else "")
+                "smolworld up did not reach all create/start/attachment, world-ready, and "
+                "declared-service command-attachment boundaries"
+                + (f": {detail}" if detail else "")
             )
-        for service, attached_ns in sorted(attachments.items()):
+        for service in sorted(expected_services):
+            created_ns = created[service]
+            machine_started_ns = started_machines[service]
+            attached_ns = attachments[service]
+            emit_timing_sample(
+                samples,
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                "machine_created",
+                service,
+                started,
+                created_ns,
+            )
+            emit_timing_sample(
+                samples,
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                "machine_started",
+                service,
+                started,
+                machine_started_ns,
+            )
+            emit_timing_sample(
+                samples,
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                "created_to_started",
+                service,
+                created_ns,
+                machine_started_ns,
+            )
             emit_timing_sample(
                 samples,
                 profile,
@@ -1331,6 +1413,17 @@ def run_prepared_world_profile(
                 "nic_attach",
                 service,
                 started,
+                attached_ns,
+            )
+            emit_timing_sample(
+                samples,
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                "started_to_nic_attach",
+                service,
+                machine_started_ns,
                 attached_ns,
             )
         emit_wave_sample(

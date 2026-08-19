@@ -91,6 +91,22 @@ class BenchmarkConfigurationTests(unittest.TestCase):
 
 
 class PreparedWorldLifecycleTests(unittest.TestCase):
+    def test_prepared_world_lifecycle_events_use_only_supervisor_boundaries(self) -> None:
+        self.assertEqual(
+            benchmark.prepared_world_lifecycle_event("smolworld: created runner"),
+            ("machine_created", "runner"),
+        )
+        self.assertEqual(
+            benchmark.prepared_world_lifecycle_event("smolworld: started runner"),
+            ("machine_started", "runner"),
+        )
+        self.assertEqual(
+            benchmark.prepared_world_lifecycle_event("smolworld: attached runner"),
+            ("nic_attach", "runner"),
+        )
+        self.assertIsNone(benchmark.prepared_world_lifecycle_event("Created machine: runner"))
+        self.assertIsNone(benchmark.prepared_world_lifecycle_event("smolworld: started runner now"))
+
     def test_closed_ps_rows_distinguish_absence_from_running_visibility(self) -> None:
         absent_rows = (
             '{"service":"database","ip":"10.0.0.2","mac":"02:00:00:00:00:02","status":"absent"}\n'
@@ -123,6 +139,8 @@ class PreparedWorldLifecycleTests(unittest.TestCase):
                 self.returncode: int | None = None
                 self.stdout = io.StringIO("")
                 self.stderr = io.StringIO(
+                    "smolworld: created runner\n"
+                    "smolworld: started runner\n"
                     "smolworld: attached runner\n"
                     "smolworld: world is up; press Ctrl-C to stop it\n"
                 )
@@ -173,7 +191,18 @@ class PreparedWorldLifecycleTests(unittest.TestCase):
         self.assertIn(("exec", "runner", "--", "/bin/true"), commands)
         self.assertEqual(
             {sample.phase for sample in samples},
-            {"config", "check", "host_visible", "command_attach", "attached_command", "nic_attach"},
+            {
+                "config",
+                "check",
+                "host_visible",
+                "command_attach",
+                "attached_command",
+                "machine_created",
+                "machine_started",
+                "created_to_started",
+                "nic_attach",
+                "started_to_nic_attach",
+            },
         )
         self.assertEqual([wave.phase for wave in waves], ["world_ready"])
 

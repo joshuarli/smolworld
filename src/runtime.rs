@@ -370,7 +370,9 @@ pub(crate) fn create(config_path: &Path, requested_services: &[String]) -> Resul
                         smolfile: &smolfile.prepared_path,
                     },
                     &config.network,
-                )
+                )?;
+                eprintln!("smolworld: created {name}");
+                Ok(())
             })?;
         }
         mark_created_detached(&paths)?;
@@ -1184,7 +1186,9 @@ pub(crate) fn up(config_path: &Path, requested_services: &[String], detach: bool
                         smolfile: &smolfile.prepared_path,
                     },
                     &config.network,
-                )
+                )?;
+                eprintln!("smolworld: created {name}");
+                Ok(())
             })?;
         }
         mark_created(&paths)?;
@@ -1202,7 +1206,9 @@ pub(crate) fn up(config_path: &Path, requested_services: &[String], detach: bool
                         .get(name)
                         .expect("allocated machine")
                         .smolvm_name,
-                )
+                )?;
+                eprintln!("smolworld: started {name}");
+                Ok(())
             })?;
             parallel_machine_operations(&selected_wave, "install sealed seed files", |name| {
                 let assignment = state.assignments.get(name).expect("allocated machine");

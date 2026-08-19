@@ -431,8 +431,9 @@ The opt-in cold-transition harness, `tests/benchmark_world_transitions.py`,
 records separate `create`, `start`, agent-exec, and fsynced guest-mutation
 samples for archive-backed machines across serial and simultaneous 1/2/4
 machine waves. It also uses a real `smolworld up` supervisor to record
-material `prepare` and read-only `check`, each switch-reported private-NIC attachment, and the
-all-machines-ready barrier. The direct machine matrix deliberately omits a
+material `prepare` and read-only `check`, each machine's supervisor-reported
+`created` and `started` boundaries, each switch-reported private-NIC
+attachment, and the all-machines-ready barrier. The direct machine matrix deliberately omits a
 NIC; a raw Unix listener is not a valid substitute for the authoritative
 switch, gateway, and attachment boundary. `start` remains the aggregate
 upstream cost of image setup, VM creation, guest boot, agent readiness, and
@@ -446,9 +447,10 @@ requests from one golden are serialized because a fork pauses that golden.
 The optional prepared-world attachment profile takes an already sealed
 configuration and one declared service through `SMOLWORLD_TRANSITION_PREPARED_WORLD`
 and `SMOLWORLD_TRANSITION_ATTACH_SERVICE`. It records `config`, read-only
-`check`, switch-reported attachments, the world-ready barrier, the selected
-service's host-lifecycle visibility from `ps --format json`, and successful
-`exec SERVICE -- /bin/true` attachment. It first requires every declared
+`check`, per-service `machine_created`, `machine_started`, and their elapsed
+intervals to switch attachment, the world-ready barrier, the selected service's
+host-lifecycle visibility from `ps --format json`, and successful `exec SERVICE
+-- /bin/true` attachment. It first requires every declared
 service to be `absent`; it does not invoke `prepare`, remove sealed material,
 or adopt a non-idle world. The host-visible `running` observation and command
 attachment remain distinct measurements: neither adds a service-health or
