@@ -11,6 +11,9 @@ scaling matrix with separate signals:
   mode smolworld uses for durable checkpoint coordination.
 * world startup: a real smolworld supervisor records material preparation,
   each reported private-NIC attachment, and the all-machines-ready barrier.
+* prepared-world attachment: an externally prepared, sealed world records
+  configuration/check, startup, a selected declared service becoming host
+  visible, and a successful exact command attachment.
 
 The direct scenarios never configure a NIC: attaching a raw Unix listener is
 not a substitute for the smolworld L2 switch and gateway. The world scenarios
@@ -24,7 +27,11 @@ Required environment:
     SMOLWORLD_TRANSITION_BENCH=1
     SMOLVM_BIN=/absolute/path/to/smolvm
     SMOLVM_AGENT_ROOTFS=/absolute/path/to/agent-rootfs
+
+At least one benchmark scenario:
     SMOLWORLD_TRANSITION_ARCHIVE=/absolute/path/to/prepared/archive.tar
+    SMOLWORLD_TRANSITION_PREPARED_WORLD=/absolute/path/to/prepared/.smolworld
+    SMOLWORLD_TRANSITION_ATTACH_SERVICE=<declared-service>
 
 Optional environment:
     SMOLWORLD_TRANSITION_ITERATIONS=3
@@ -34,6 +41,7 @@ Optional environment:
     SMOLVM_LIB_DIR=/absolute/path/to/libkrun
     DYLD_LIBRARY_PATH=/absolute/path/to/libkrun
     SMOLWORLD_TRANSITION_TRACE=1
+    SMOLWORLD_TRANSITION_ATTACH_SETTLE_SECONDS=2
     RUST_LOG=smolvm::agent::manager=debug
 
 The output is TSV. machine_sample rows are per-machine latencies and
@@ -49,6 +57,14 @@ Set SMOLWORLD_TRANSITION_TRACE=1 to emit trace_sample and trace_summary rows
 from smolvm's existing boot instrumentation. Trace stages are nested upstream
 spans, not additive wall-clock timings; the start and NIC-attachment rows
 remain the authoritative external boundaries.
+
+The prepared-world profile never invokes `prepare` or removes sealed material.
+It requires every declared service to be absent before it starts, then owns
+only the supervisor it started for the measurement; cleanup is through that
+supervisor or its exact `down` command. Its `ps` observation is deliberately
+distinct from command attachment: lifecycle status is not application
+readiness, while the successful exact command proves only the command
+transport boundary.
 """
 
 from __future__ import annotations
@@ -77,6 +93,10 @@ MUTATION_BYTES = 4 * 1024 * 1024
 MAX_CONCURRENCY = 250
 WORLD_READY_TIMEOUT_SECONDS = 120.0
 TRACE_ENVIRONMENT_VARIABLE = "SMOLWORLD_TRANSITION_TRACE"
+PREPARED_WORLD_VARIABLE = "SMOLWORLD_TRANSITION_PREPARED_WORLD"
+ATTACH_SERVICE_VARIABLE = "SMOLWORLD_TRANSITION_ATTACH_SERVICE"
+ATTACH_SETTLE_SECONDS_VARIABLE = "SMOLWORLD_TRANSITION_ATTACH_SETTLE_SECONDS"
+DEFAULT_ATTACH_SETTLE_SECONDS = 2.0
 BOOT_TIMING_PATTERN = re.compile(
     r"^\[(?P<scope>proc|boot)\]\s+(?P<label>.+?)\s+(?P<milliseconds>\d+)ms\s*$",
     re.MULTILINE,
@@ -169,6 +189,47 @@ def positive_integer(variable: str, default: int) -> int:
     return parsed
 
 
+def nonnegative_seconds(variable: str, default: float) -> float:
+    """Read a finite attachment delay while allowing an explicit zero delay."""
+
+    value = os.environ.get(variable, str(default))
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise BenchmarkError(f"{variable} must be a non-negative number of seconds: {value}") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise BenchmarkError(f"{variable} must be a non-negative number of seconds: {value}")
+    return parsed
+
+
+def prepared_world_profile_from_environment() -> PreparedWorldProfile | None:
+    """Select the optional external-world profile without accepting a partial one."""
+
+    config_value = os.environ.get(PREPARED_WORLD_VARIABLE, "")
+    service = os.environ.get(ATTACH_SERVICE_VARIABLE, "")
+    settle_value = os.environ.get(ATTACH_SETTLE_SECONDS_VARIABLE)
+    if not config_value:
+        if service or settle_value is not None:
+            raise BenchmarkError(
+                f"{PREPARED_WORLD_VARIABLE} is required when configuring prepared-world attachment"
+            )
+        return None
+    config = Path(config_value)
+    if not config.is_file():
+        raise BenchmarkError(f"{PREPARED_WORLD_VARIABLE} must name a regular file: {config_value}")
+    if not service or service != service.strip() or any(character.isspace() for character in service):
+        raise BenchmarkError(
+            f"{ATTACH_SERVICE_VARIABLE} must name one non-whitespace declared service"
+        )
+    return PreparedWorldProfile(
+        config=config,
+        service=service,
+        attach_settle_seconds=nonnegative_seconds(
+            ATTACH_SETTLE_SECONDS_VARIABLE, DEFAULT_ATTACH_SETTLE_SECONDS
+        ),
+    )
+
+
 def parse_concurrency_levels(value: str) -> list[int]:
     """Parse one bounded, duplicate-free cold-start scaling matrix."""
 
@@ -241,6 +302,15 @@ class WaveResult:
     started_ns: int
     finished_ns: int
     timings: list[tuple[str, int, int]]
+
+
+@dataclass(frozen=True)
+class PreparedWorldProfile:
+    """One external fixture and declared service attachment to measure."""
+
+    config: Path
+    service: str
+    attach_settle_seconds: float
 
 
 @dataclass(frozen=True)
@@ -733,6 +803,117 @@ def command_environment(smolvm_bin: Path) -> dict[str, str]:
     return environment
 
 
+def smolworld_command(
+    smolworld_bin: Path,
+    config: Path,
+    arguments: Sequence[str],
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one bounded CLI observation or operation against an exact world."""
+
+    return subprocess.run(
+        [str(smolworld_bin), "--file", str(config), *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+
+def parse_ps_json_rows(output: str) -> list[dict[str, str]]:
+    """Validate the closed `ps --format json` rows before using their status."""
+
+    rows: list[dict[str, str]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise BenchmarkError(f"smolworld ps emitted invalid JSON: {error}") from error
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"service", "ip", "mac", "status"}
+            or not all(isinstance(value, str) for value in row.values())
+        ):
+            raise BenchmarkError(f"smolworld ps emitted an invalid closed row: {row!r}")
+        rows.append(row)
+    if not rows:
+        raise BenchmarkError("smolworld ps emitted no JSON rows")
+    return rows
+
+
+def prepared_world_is_idle(output: str) -> bool:
+    """Require the external fixture to have no allocated lifecycle to adopt."""
+
+    return all(row["status"] == "absent" for row in parse_ps_json_rows(output))
+
+
+def service_is_running_in_ps_json(output: str, service: str) -> bool:
+    """Read one exact declared-service lifecycle observation, not readiness."""
+
+    rows = parse_ps_json_rows(output)
+    if len(rows) != 1 or rows[0]["service"] != service:
+        raise BenchmarkError(
+            f"smolworld ps did not return one row for declared service {service!r}: {rows!r}"
+        )
+    return rows[0]["status"] == "running"
+
+
+def emit_timing_sample(
+    samples: list[TimingSample],
+    profile: str,
+    mode: str,
+    iteration: int,
+    concurrency: int,
+    phase: str,
+    machine: str,
+    started_ns: int,
+    finished_ns: int,
+) -> None:
+    sample = TimingSample(
+        profile,
+        mode,
+        iteration,
+        concurrency,
+        phase,
+        machine,
+        milliseconds(started_ns, finished_ns),
+    )
+    samples.append(sample)
+    emit(
+        f"machine_sample\t{sample.profile}\t{sample.mode}\t{sample.iteration}\t"
+        f"{sample.concurrency}\t{sample.phase}\t{sample.machine}\t{sample.wall_ms:.3f}"
+    )
+
+
+def emit_wave_sample(
+    waves: list[WaveSample],
+    profile: str,
+    mode: str,
+    iteration: int,
+    concurrency: int,
+    phase: str,
+    started_ns: int,
+    finished_ns: int,
+) -> None:
+    wave = WaveSample(
+        profile,
+        mode,
+        iteration,
+        concurrency,
+        phase,
+        milliseconds(started_ns, finished_ns),
+    )
+    waves.append(wave)
+    emit(
+        f"wave_sample\t{wave.profile}\t{wave.mode}\t{wave.iteration}\t{wave.concurrency}\t"
+        f"{wave.phase}\t{wave.wall_ms:.3f}"
+    )
+
+
 def recorded_world_machine_names(state_dir: Path) -> list[str]:
     """Read only exact benchmark identities from its generated allocation state."""
 
@@ -941,6 +1122,288 @@ def run_world_probe(
             f"failure_sample\tworld\tparallel\t{iteration}\t{concurrency}\t{phase}\t"
             f"{tsv_field(failure)}"
         )
+
+
+def run_prepared_world_profile(
+    smolworld_bin: Path,
+    smolvm_bin: Path,
+    prepared: PreparedWorldProfile,
+    iteration: int,
+    samples: list[TimingSample],
+    waves: list[WaveSample],
+) -> None:
+    """Measure a sealed world's declared-service command attachment boundary.
+
+    This profile intentionally treats the configured world as an external
+    fixture. It verifies material with read-only commands, refuses to adopt
+    non-absent lifecycle state, and never deletes the fixture's state or
+    material. Once `up` has started, only the owning supervisor (or its exact
+    control-path `down`) is allowed to clean the world.
+    """
+
+    profile = "prepared_world"
+    mode = "declared_service"
+    concurrency = 1
+    config = prepared.config
+    environment = command_environment(smolvm_bin)
+    process: subprocess.Popen[str] | None = None
+    readers: list[threading.Thread] = []
+    phase = "config"
+    failure: BenchmarkError | None = None
+    cleanup_failure: BenchmarkError | None = None
+    started_supervisor = False
+    try:
+        config_started = time.monotonic_ns()
+        rendered = smolworld_command(smolworld_bin, config, ["config", "--quiet"], environment)
+        config_finished = time.monotonic_ns()
+        if rendered.returncode != 0:
+            raise BenchmarkError(f"smolworld config failed: {rendered.stderr.strip()}")
+        emit_timing_sample(
+            samples,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "config",
+            "world",
+            config_started,
+            config_finished,
+        )
+
+        phase = "check"
+        check_started = time.monotonic_ns()
+        checked = smolworld_command(smolworld_bin, config, ["check"], environment)
+        check_finished = time.monotonic_ns()
+        if checked.returncode != 0:
+            raise BenchmarkError(f"smolworld check failed: {checked.stderr.strip()}")
+        emit_timing_sample(
+            samples,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "check",
+            "world",
+            check_started,
+            check_finished,
+        )
+
+        phase = "idle_preflight"
+        idle = smolworld_command(smolworld_bin, config, ["ps", "--all", "--format", "json"], environment)
+        if idle.returncode != 0:
+            raise BenchmarkError(f"smolworld ps preflight failed: {idle.stderr.strip()}")
+        if not prepared_world_is_idle(idle.stdout):
+            raise BenchmarkError("prepared-world attachment requires every declared service to be absent")
+
+        phase = "up"
+        process = subprocess.Popen(
+            [str(smolworld_bin), "--file", str(config), "up"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+        started_supervisor = True
+        events: list[tuple[int, str]] = []
+        events_lock = threading.Lock()
+
+        def collect(stream: object) -> None:
+            assert hasattr(stream, "readline")
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                with events_lock:
+                    events.append((time.monotonic_ns(), line.rstrip("\n")))
+
+        readers = [
+            threading.Thread(target=collect, args=(process.stdout,), daemon=True),
+            threading.Thread(target=collect, args=(process.stderr,), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        started = time.monotonic_ns()
+        deadline = time.monotonic() + WORLD_READY_TIMEOUT_SECONDS
+        attachments: dict[str, int] = {}
+        ready_ns: int | None = None
+        visible_ns: int | None = None
+        attached_command_ns: int | None = None
+        last_ps_error = ""
+        last_command_error = ""
+        while time.monotonic() < deadline:
+            with events_lock:
+                for observed_ns, line in events:
+                    if line.startswith("smolworld: attached "):
+                        service = line.removeprefix("smolworld: attached ")
+                        attachments.setdefault(service, observed_ns)
+                    if line == "smolworld: world is up; press Ctrl-C to stop it":
+                        ready_ns = observed_ns
+            if visible_ns is None:
+                observed = smolworld_command(
+                    smolworld_bin,
+                    config,
+                    ["ps", "--format", "json", prepared.service],
+                    environment,
+                )
+                observed_finished = time.monotonic_ns()
+                if observed.returncode == 0:
+                    if service_is_running_in_ps_json(observed.stdout, prepared.service):
+                        visible_ns = observed_finished
+                        emit_timing_sample(
+                            samples,
+                            profile,
+                            mode,
+                            iteration,
+                            concurrency,
+                            "host_visible",
+                            prepared.service,
+                            started,
+                            visible_ns,
+                        )
+                else:
+                    last_ps_error = observed.stderr.strip()
+            if (
+                visible_ns is not None
+                and attached_command_ns is None
+                and time.monotonic_ns() - visible_ns
+                >= int(prepared.attach_settle_seconds * 1_000_000_000)
+            ):
+                command_started = time.monotonic_ns()
+                attached = smolworld_command(
+                    smolworld_bin,
+                    config,
+                    ["exec", prepared.service, "--", "/bin/true"],
+                    environment,
+                )
+                command_finished = time.monotonic_ns()
+                if attached.returncode == 0:
+                    attached_command_ns = command_finished
+                    emit_timing_sample(
+                        samples,
+                        profile,
+                        mode,
+                        iteration,
+                        concurrency,
+                        "command_attach",
+                        prepared.service,
+                        command_started,
+                        command_finished,
+                    )
+                    emit_timing_sample(
+                        samples,
+                        profile,
+                        mode,
+                        iteration,
+                        concurrency,
+                        "attached_command",
+                        prepared.service,
+                        started,
+                        attached_command_ns,
+                    )
+                else:
+                    last_command_error = attached.stderr.strip()
+            if ready_ns is not None and attached_command_ns is not None:
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.2)
+        if ready_ns is None or attached_command_ns is None:
+            with events_lock:
+                event_output = "\n".join(line for _observed_ns, line in events)
+            detail = "; ".join(
+                value
+                for value in (last_ps_error, last_command_error, event_output)
+                if value
+            )
+            raise BenchmarkError(
+                "smolworld up did not reach both the world-ready and declared-service "
+                f"command-attachment boundaries" + (f": {detail}" if detail else "")
+            )
+        for service, attached_ns in sorted(attachments.items()):
+            emit_timing_sample(
+                samples,
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                "nic_attach",
+                service,
+                started,
+                attached_ns,
+            )
+        emit_wave_sample(
+            waves,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "world_ready",
+            started,
+            ready_ns,
+        )
+    except BenchmarkError as error:
+        failure = error
+    finally:
+        supervisor_cleaned = False
+        if process is not None and process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=60)
+                supervisor_cleaned = process.returncode == 0
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                cleanup_failure = BenchmarkError("smolworld supervisor did not cleanly stop")
+        elif process is not None:
+            supervisor_cleaned = process.returncode == 0
+        for reader in readers:
+            reader.join(timeout=1)
+        if started_supervisor and not supervisor_cleaned:
+            post_exit = smolworld_command(
+                smolworld_bin, config, ["ps", "--all", "--format", "json"], environment
+            )
+            try:
+                already_idle = post_exit.returncode == 0 and prepared_world_is_idle(post_exit.stdout)
+            except BenchmarkError:
+                already_idle = False
+            if not already_idle:
+                down = smolworld_command(smolworld_bin, config, ["down"], environment)
+                if down.returncode != 0:
+                    cleanup_failure = BenchmarkError(
+                        "smolworld supervisor did not cleanly stop and exact down failed: "
+                        f"{down.stderr.strip()}"
+                    )
+        if started_supervisor and cleanup_failure is None:
+            idle = smolworld_command(
+                smolworld_bin, config, ["ps", "--all", "--format", "json"], environment
+            )
+            try:
+                idle_after_cleanup = idle.returncode == 0 and prepared_world_is_idle(idle.stdout)
+            except BenchmarkError as error:
+                cleanup_failure = BenchmarkError(
+                    "prepared-world attachment cleanup could not read closed lifecycle rows: "
+                    f"{error}"
+                )
+                idle_after_cleanup = False
+            if cleanup_failure is None and not idle_after_cleanup:
+                cleanup_failure = BenchmarkError(
+                    "prepared-world attachment cleanup did not restore all declared services to absent"
+                    + (f": {idle.stderr.strip()}" if idle.stderr.strip() else "")
+                )
+    if cleanup_failure is not None:
+        if failure is None:
+            failure = cleanup_failure
+        else:
+            failure = BenchmarkError(f"{failure}; cleanup also failed: {cleanup_failure}")
+    if failure is not None:
+        emit(
+            f"failure_sample\t{profile}\t{mode}\t{iteration}\t{concurrency}\t{phase}\t"
+            f"{tsv_field(failure)}"
+        )
+    if cleanup_failure is not None:
+        raise cleanup_failure
 
 
 def run_cold_scenario(
@@ -1180,7 +1643,14 @@ def main() -> int:
         "SMOLWORLD_BIN", Path(__file__).resolve().parents[1] / "target" / "debug" / "smolworld"
     )
     agent_rootfs = require_directory("SMOLVM_AGENT_ROOTFS")
-    archive = require_file("SMOLWORLD_TRANSITION_ARCHIVE")
+    archive_value = os.environ.get("SMOLWORLD_TRANSITION_ARCHIVE", "")
+    archive = require_file("SMOLWORLD_TRANSITION_ARCHIVE") if archive_value else None
+    prepared_world = prepared_world_profile_from_environment()
+    if archive is None and prepared_world is None:
+        raise BenchmarkError(
+            "configure SMOLWORLD_TRANSITION_ARCHIVE or both "
+            f"{PREPARED_WORLD_VARIABLE} and {ATTACH_SERVICE_VARIABLE}"
+        )
     iterations = positive_integer("SMOLWORLD_TRANSITION_ITERATIONS", 3)
     branches = positive_integer("SMOLWORLD_TRANSITION_BRANCHES", 3)
     concurrency = parse_concurrency_levels(
@@ -1197,9 +1667,16 @@ def main() -> int:
     waves: list[WaveSample] = []
     traces: list[TraceSample] = []
     emit("# smolworld transition substrate benchmark v2")
-    emit(f"# archive={archive}")
+    emit(f"# archive={archive if archive is not None else 'not-requested'}")
+    if prepared_world is not None:
+        emit(
+            f"# prepared_world={prepared_world.config} attach_service={prepared_world.service} "
+            f"attach_settle_seconds={prepared_world.attach_settle_seconds:g}"
+        )
+    direct_branches = str(branches) if archive is not None else "not-requested"
+    direct_concurrency = ",".join(map(str, concurrency)) if archive is not None else "not-requested"
     emit(
-        f"# iterations={iterations} branches={branches} concurrency={','.join(map(str, concurrency))} "
+        f"# iterations={iterations} branches={direct_branches} concurrency={direct_concurrency} "
         f"cpus=1 memory_mib=256 mutation_bytes={MUTATION_BYTES}"
     )
     emit("# archive cache is user-owned and is never cleared by this benchmark")
@@ -1217,30 +1694,40 @@ def main() -> int:
     emit("failure_sample\tprofile\tmode\titeration\tconcurrency\tphase\terror")
 
     for iteration in range(1, iterations + 1):
-        for count in concurrency:
-            for mode in ("serial", "parallel"):
-                for profile in ("archive", "archive_forkable"):
-                    run_cold_scenario(
-                        smolvm_bin,
-                        archive,
-                        iteration,
-                        count,
-                        profile,
-                        mode,
-                        samples,
-                        waves,
-                        traces,
-                    )
-            run_world_probe(
+        if prepared_world is not None:
+            run_prepared_world_profile(
                 smolworld_bin,
                 smolvm_bin,
-                archive,
+                prepared_world,
                 iteration,
-                count,
                 samples,
                 waves,
             )
-        run_fork_reference(smolvm_bin, archive, iteration, branches, samples, waves)
+        if archive is not None:
+            for count in concurrency:
+                for mode in ("serial", "parallel"):
+                    for profile in ("archive", "archive_forkable"):
+                        run_cold_scenario(
+                            smolvm_bin,
+                            archive,
+                            iteration,
+                            count,
+                            profile,
+                            mode,
+                            samples,
+                            waves,
+                            traces,
+                        )
+                run_world_probe(
+                    smolworld_bin,
+                    smolvm_bin,
+                    archive,
+                    iteration,
+                    count,
+                    samples,
+                    waves,
+                )
+            run_fork_reference(smolvm_bin, archive, iteration, branches, samples, waves)
 
     emit("summary\tprofile\tmode\tconcurrency\tphase\tsamples\tp50_ms\tp95_ms")
     emit_summary(samples)

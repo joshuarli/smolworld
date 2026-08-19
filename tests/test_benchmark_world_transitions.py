@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import io
 import importlib.util
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,6 +39,143 @@ class BenchmarkConfigurationTests(unittest.TestCase):
             benchmark.tsv_field("database is locked\nretry\tagain"),
             "database is locked retry again",
         )
+
+    def test_prepared_world_profile_requires_an_exact_declared_service(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="smolworld-transition-profile-") as directory:
+            config = Path(directory) / ".smolworld"
+            config.write_text("format: 2\n", encoding="utf-8")
+            with mock.patch.dict(
+                benchmark.os.environ,
+                {benchmark.PREPARED_WORLD_VARIABLE: str(config)},
+                clear=True,
+            ):
+                with self.assertRaises(benchmark.BenchmarkError):
+                    benchmark.prepared_world_profile_from_environment()
+            with mock.patch.dict(
+                benchmark.os.environ,
+                {
+                    benchmark.PREPARED_WORLD_VARIABLE: str(config),
+                    benchmark.ATTACH_SERVICE_VARIABLE: "runner",
+                    benchmark.ATTACH_SETTLE_SECONDS_VARIABLE: "0.25",
+                },
+                clear=True,
+            ):
+                profile = benchmark.prepared_world_profile_from_environment()
+
+        self.assertEqual(profile.config, config)
+        self.assertEqual(profile.service, "runner")
+        self.assertEqual(profile.attach_settle_seconds, 0.25)
+
+    def test_prepared_world_profile_rejects_a_partial_or_invalid_delay(self) -> None:
+        with mock.patch.dict(
+            benchmark.os.environ,
+            {benchmark.ATTACH_SERVICE_VARIABLE: "runner"},
+            clear=True,
+        ):
+            with self.assertRaises(benchmark.BenchmarkError):
+                benchmark.prepared_world_profile_from_environment()
+        with tempfile.TemporaryDirectory(prefix="smolworld-transition-profile-") as directory:
+            config = Path(directory) / ".smolworld"
+            config.write_text("format: 2\n", encoding="utf-8")
+            with mock.patch.dict(
+                benchmark.os.environ,
+                {
+                    benchmark.PREPARED_WORLD_VARIABLE: str(config),
+                    benchmark.ATTACH_SERVICE_VARIABLE: "runner",
+                    benchmark.ATTACH_SETTLE_SECONDS_VARIABLE: "-1",
+                },
+                clear=True,
+            ):
+                with self.assertRaises(benchmark.BenchmarkError):
+                    benchmark.prepared_world_profile_from_environment()
+
+
+class PreparedWorldLifecycleTests(unittest.TestCase):
+    def test_closed_ps_rows_distinguish_absence_from_running_visibility(self) -> None:
+        absent_rows = (
+            '{"service":"database","ip":"10.0.0.2","mac":"02:00:00:00:00:02","status":"absent"}\n'
+            '{"service":"runner","ip":"10.0.0.3","mac":"02:00:00:00:00:03","status":"absent"}\n'
+        )
+        running_row = (
+            '{"service":"runner","ip":"10.0.0.3","mac":"02:00:00:00:00:03","status":"running"}\n'
+        )
+
+        self.assertTrue(benchmark.prepared_world_is_idle(absent_rows))
+        self.assertTrue(benchmark.service_is_running_in_ps_json(running_row, "runner"))
+        self.assertFalse(benchmark.service_is_running_in_ps_json(absent_rows.splitlines()[1], "runner"))
+
+    def test_rejects_non_closed_or_unexpected_ps_rows(self) -> None:
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.prepared_world_is_idle('{"service":"runner","status":"absent"}\n')
+        with self.assertRaises(benchmark.BenchmarkError):
+            benchmark.service_is_running_in_ps_json(
+                '{"service":"other","ip":"10.0.0.3","mac":"02:00:00:00:00:03","status":"running"}\n',
+                "runner",
+            )
+
+    def test_attachment_profile_never_prepares_or_removes_external_material(self) -> None:
+        absent = '{"service":"runner","ip":"10.0.0.3","mac":"02:00:00:00:00:03","status":"absent"}\n'
+        running = '{"service":"runner","ip":"10.0.0.3","mac":"02:00:00:00:00:03","status":"running"}\n'
+        commands: list[tuple[str, ...]] = []
+
+        class FakeSupervisor:
+            def __init__(self) -> None:
+                self.returncode: int | None = None
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO(
+                    "smolworld: attached runner\n"
+                    "smolworld: world is up; press Ctrl-C to stop it\n"
+                )
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def send_signal(self, _signal: int) -> None:
+                self.returncode = 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                self.returncode = 0
+                return 0
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        def fake_command(
+            _smolworld_bin: Path,
+            _config: Path,
+            arguments: list[str],
+            _environment: dict[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(tuple(arguments))
+            if arguments == ["config", "--quiet"] or arguments == ["check"]:
+                return subprocess.CompletedProcess([], 0, "", "")
+            if arguments == ["ps", "--all", "--format", "json"]:
+                return subprocess.CompletedProcess([], 0, absent, "")
+            if arguments == ["ps", "--format", "json", "runner"]:
+                return subprocess.CompletedProcess([], 0, running, "")
+            if arguments == ["exec", "runner", "--", "/bin/true"]:
+                return subprocess.CompletedProcess([], 0, "", "")
+            self.fail(f"unexpected command: {arguments!r}")
+
+        samples: list[benchmark.TimingSample] = []
+        waves: list[benchmark.WaveSample] = []
+        profile = benchmark.PreparedWorldProfile(Path("/fixture/.smolworld"), "runner", 0.0)
+        with (
+            mock.patch.object(benchmark, "smolworld_command", side_effect=fake_command),
+            mock.patch.object(benchmark.subprocess, "Popen", return_value=FakeSupervisor()),
+            mock.patch.object(benchmark, "emit"),
+        ):
+            benchmark.run_prepared_world_profile(
+                Path("/smolworld"), Path("/smolvm"), profile, 1, samples, waves
+            )
+
+        self.assertNotIn(("prepare",), commands)
+        self.assertIn(("exec", "runner", "--", "/bin/true"), commands)
+        self.assertEqual(
+            {sample.phase for sample in samples},
+            {"config", "check", "host_visible", "command_attach", "attached_command", "nic_attach"},
+        )
+        self.assertEqual([wave.phase for wave in waves], ["world_ready"])
 
 
 class BenchmarkSummaryTests(unittest.TestCase):

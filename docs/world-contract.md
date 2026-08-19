@@ -438,6 +438,17 @@ spans; those trace values are not additive substitutes for the external start
 or attachment boundaries. A retained-fork reference is reported separately;
 requests from one golden are serialized because a fork pauses that golden.
 
+The optional prepared-world attachment profile takes an already sealed
+configuration and one declared service through `SMOLWORLD_TRANSITION_PREPARED_WORLD`
+and `SMOLWORLD_TRANSITION_ATTACH_SERVICE`. It records `config`, read-only
+`check`, switch-reported attachments, the world-ready barrier, the selected
+service's host-lifecycle visibility from `ps --format json`, and successful
+`exec SERVICE -- /bin/true` attachment. It first requires every declared
+service to be `absent`; it does not invoke `prepare`, remove sealed material,
+or adopt a non-idle world. The host-visible `running` observation and command
+attachment remain distinct measurements: neither adds a service-health or
+application-readiness contract.
+
 APFS clonefile observations distinguish addressed/accounted file blocks from
 physical volume deltas. Accounted blocks may double-count shared clones;
 volume-used bytes include unrelated host activity; neither is a proportional
