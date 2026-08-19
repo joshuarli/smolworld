@@ -74,6 +74,70 @@ class BenchmarkSummaryTests(unittest.TestCase):
             ],
         )
 
+    def test_summarize_traces_keeps_nested_boot_spans_out_of_wall_samples(self) -> None:
+        traces = [
+            benchmark.TraceSample("archive", "parallel", 1, 2, "agent_ready", "one", 100.0),
+            benchmark.TraceSample("archive", "parallel", 2, 2, "agent_ready", "two", 120.0),
+        ]
+
+        self.assertEqual(
+            benchmark.summarize_traces(traces),
+            [("archive", "parallel", 2, "agent_ready", 2, 110.0, 120.0)],
+        )
+
+
+class StartupTraceTests(unittest.TestCase):
+    def test_parses_parent_and_boot_helper_stages(self) -> None:
+        trace = benchmark.parse_startup_trace(
+            "[proc] fds closed               4ms\n"
+            "[boot] libkrun started           19ms\n"
+            "2026-08-18T12:00:00Z INFO elapsed_ms=23 boot: disks ready\n"
+            "2026-08-18T12:00:00Z INFO elapsed_ms=25 boot: config written\n"
+            "2026-08-18T12:00:00Z INFO spawn_ms=4 boot: subprocess spawned\n"
+            "2026-08-18T12:00:00Z DEBUG elapsed_ms=141 agent ready (doorbell)\n"
+            "2026-08-18T12:00:00Z INFO boot_ms=143.5 agent VM is ready\n"
+        )
+
+        self.assertEqual(
+            trace,
+            {
+                "proc_fds_closed": 4.0,
+                "boot_libkrun_started": 19.0,
+                "launch_disks_ready": 23.0,
+                "launch_config_written": 25.0,
+                "launch_subprocess_spawn": 4.0,
+                "agent_ready": 141.0,
+                "agent_boot_complete": 143.5,
+            },
+        )
+
+    def test_trace_environment_is_explicit_and_preserves_existing_filters(self) -> None:
+        with mock.patch.dict(
+            benchmark.os.environ,
+            {
+                benchmark.TRACE_ENVIRONMENT_VARIABLE: "1",
+                "RUST_LOG": "smolvm=info",
+            },
+            clear=True,
+        ):
+            self.assertTrue(benchmark.configure_trace_environment())
+            self.assertEqual(
+                benchmark.os.environ["RUST_LOG"], "smolvm=info,smolvm::agent=debug"
+            )
+            self.assertEqual(benchmark.os.environ["SMOLVM_BOOT_DEBUG"], "1")
+
+    def test_derives_local_layer_materialization_from_timestamped_progress(self) -> None:
+        trace = benchmark.parse_startup_trace(
+            "2026-08-19T01:43:45.100000Z DEBUG agent ready (doorbell) elapsed_ms=100\n"
+            "2026-08-19T01:43:45.125000Z  INFO detached start progress extracting local image layers\n"
+            "2026-08-19T01:43:45.725000Z  INFO detached start progress preparing persistent overlay\n"
+            "2026-08-19T01:43:45.727000Z  INFO detached start progress starting detached container\n"
+        )
+
+        self.assertEqual(trace["agent_ready_to_layer_materialization"], 25.0)
+        self.assertEqual(trace["layer_materialization_to_overlay"], 600.0)
+        self.assertEqual(trace["agent_ready_to_workload_start"], 627.0)
+
 
 class ForkReferenceTests(unittest.TestCase):
     def test_serializes_forks_from_a_single_golden(self) -> None:

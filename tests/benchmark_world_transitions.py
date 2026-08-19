@@ -33,6 +33,7 @@ Optional environment:
     SMOLWORLD_BIN=/absolute/path/to/smolworld
     SMOLVM_LIB_DIR=/absolute/path/to/libkrun
     DYLD_LIBRARY_PATH=/absolute/path/to/libkrun
+    SMOLWORLD_TRANSITION_TRACE=1
     RUST_LOG=smolvm::agent::manager=debug
 
 The output is TSV. machine_sample rows are per-machine latencies and
@@ -43,12 +44,18 @@ p50/p95 over their matching successful records. Storage accounting is
 intentionally out of scope: current macOS smolvm does not expose an
 isolatable per-benchmark runtime root, and a synthetic directory would report
 misleading zeroes.
+
+Set SMOLWORLD_TRANSITION_TRACE=1 to emit trace_sample and trace_summary rows
+from smolvm's existing boot instrumentation. Trace stages are nested upstream
+spans, not additive wall-clock timings; the start and NIC-attachment rows
+remain the authoritative external boundaries.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
 import os
@@ -69,6 +76,52 @@ from typing import Callable, Sequence
 MUTATION_BYTES = 4 * 1024 * 1024
 MAX_CONCURRENCY = 250
 WORLD_READY_TIMEOUT_SECONDS = 120.0
+TRACE_ENVIRONMENT_VARIABLE = "SMOLWORLD_TRANSITION_TRACE"
+BOOT_TIMING_PATTERN = re.compile(
+    r"^\[(?P<scope>proc|boot)\]\s+(?P<label>.+?)\s+(?P<milliseconds>\d+)ms\s*$",
+    re.MULTILINE,
+)
+PARENT_BOOT_PATTERNS = (
+    (
+        "launch_disks_ready",
+        re.compile(
+            r"\bboot: disks ready\b.*\belapsed_ms=(\d+)"
+            r"|\belapsed_ms=(\d+).*\bboot: disks ready\b"
+        ),
+    ),
+    (
+        "launch_config_written",
+        re.compile(
+            r"\bboot: config written\b.*\belapsed_ms=(\d+)"
+            r"|\belapsed_ms=(\d+).*\bboot: config written\b"
+        ),
+    ),
+    (
+        "launch_subprocess_spawn",
+        re.compile(
+            r"\bboot: subprocess spawned\b.*\bspawn_ms=(\d+)"
+            r"|\bspawn_ms=(\d+).*\bboot: subprocess spawned\b"
+        ),
+    ),
+    (
+        "agent_ready",
+        re.compile(
+            r"\b(?:clone )?agent ready (?:\([^)]*\)|via socket).*\belapsed_ms=(\d+)"
+            r"|\belapsed_ms=(\d+).*\b(?:clone )?agent ready (?:\([^)]*\)|via socket)"
+        ),
+    ),
+    (
+        "agent_boot_complete",
+        re.compile(
+            r"\bagent VM is ready\b.*\bboot_ms=(\d+(?:\.\d+)?)"
+            r"|\bboot_ms=(\d+(?:\.\d+)?).*\bagent VM is ready\b"
+        ),
+    ),
+)
+TRACING_LINE_PATTERN = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z).*?(?P<message>.+)$",
+    re.MULTILINE,
+)
 
 
 class BenchmarkError(Exception):
@@ -190,6 +243,90 @@ class WaveResult:
     timings: list[tuple[str, int, int]]
 
 
+@dataclass(frozen=True)
+class TraceSample:
+    profile: str
+    mode: str
+    iteration: int
+    concurrency: int
+    stage: str
+    machine: str
+    elapsed_ms: float
+
+
+def trace_enabled() -> bool:
+    """Enable only the explicit boot trace; reject ambiguous environment values."""
+
+    value = os.environ.get(TRACE_ENVIRONMENT_VARIABLE, "0")
+    if value in {"", "0"}:
+        return False
+    if value == "1":
+        return True
+    raise BenchmarkError(f"{TRACE_ENVIRONMENT_VARIABLE} must be 0 or 1")
+
+
+def configure_trace_environment() -> bool:
+    """Request upstream diagnostic spans without changing normal benchmark output."""
+
+    if not trace_enabled():
+        return False
+    existing_filter = os.environ.get("RUST_LOG", "")
+    trace_filter = "smolvm::agent=debug"
+    if trace_filter not in existing_filter.split(","):
+        os.environ["RUST_LOG"] = ",".join(
+            part for part in (existing_filter, trace_filter) if part
+        )
+    # The boot helper normally redirects its diagnostics to the per-VM startup
+    # log. Surface them only for this opt-in measurement run so the parent
+    # command can retain the helper's process and libkrun sub-stages.
+    os.environ.setdefault("SMOLVM_BOOT_DEBUG", "1")
+    return True
+
+
+def trace_stage_name(scope: str, label: str) -> str:
+    """Convert one stable helper label into a TSV-safe stage name."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    return f"{scope}_{normalized}"
+
+
+def parse_startup_trace(stderr: str) -> dict[str, float]:
+    """Read structured parent and boot-helper timing without inferring a boundary."""
+
+    stages: dict[str, float] = {}
+    for scope, label, elapsed in BOOT_TIMING_PATTERN.findall(stderr):
+        stages[trace_stage_name(scope, label)] = float(elapsed)
+    for stage, pattern in PARENT_BOOT_PATTERNS:
+        match = pattern.search(stderr)
+        if match is not None:
+            value = next((capture for capture in match.groups() if capture is not None), None)
+            if value is not None:
+                stages[stage] = float(value)
+    trace_times: dict[str, datetime] = {}
+    for match in TRACING_LINE_PATTERN.finditer(stderr):
+        timestamp = datetime.fromisoformat(match.group("timestamp").replace("Z", "+00:00"))
+        message = match.group("message")
+        if "agent ready" in message:
+            trace_times.setdefault("agent_ready", timestamp)
+        elif "detached start progress extracting local image layers" in message:
+            trace_times.setdefault("layer_materialization", timestamp)
+        elif "detached start progress preparing persistent overlay" in message:
+            trace_times.setdefault("persistent_overlay", timestamp)
+        elif "detached start progress starting detached container" in message:
+            trace_times.setdefault("workload_start", timestamp)
+
+    def elapsed(stage: str, started: str, finished: str) -> None:
+        if started in trace_times and finished in trace_times:
+            stages[stage] = (
+                trace_times[finished] - trace_times[started]
+            ).total_seconds() * 1000
+
+    elapsed("agent_ready_to_layer_materialization", "agent_ready", "layer_materialization")
+    elapsed("layer_materialization_to_overlay", "layer_materialization", "persistent_overlay")
+    elapsed("agent_ready_to_workload_start", "agent_ready", "workload_start")
+    return stages
+
+
 def summarize_samples(
     samples: Sequence[TimingSample],
 ) -> list[tuple[str, str, int, str, int, float, float]]:
@@ -236,12 +373,37 @@ def summarize_waves(
     ]
 
 
+def summarize_traces(
+    samples: Sequence[TraceSample],
+) -> list[tuple[str, str, int, str, int, float, float]]:
+    """Group opt-in upstream spans separately from external wall-clock samples."""
+
+    grouped: dict[tuple[str, str, int, str], list[float]] = defaultdict(list)
+    for sample in samples:
+        grouped[(sample.profile, sample.mode, sample.concurrency, sample.stage)].append(
+            sample.elapsed_ms
+        )
+    return [
+        (
+            profile,
+            mode,
+            concurrency,
+            stage,
+            len(values),
+            statistics.median(values),
+            percentile(values, 0.95),
+        )
+        for (profile, mode, concurrency, stage), values in sorted(grouped.items())
+    ]
+
+
 class SmolvmBenchmark:
     def __init__(self, smolvm_bin: Path, archive: Path, runtime_root: Path) -> None:
         self.smolvm_bin = smolvm_bin
         self.archive = archive
         self.runtime_root = runtime_root
         self.owned_names: list[str] = []
+        self.startup_traces: dict[str, dict[str, float]] = {}
 
     def command(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
@@ -358,7 +520,8 @@ class SmolvmBenchmark:
         arguments = ["machine", "start", "--name", name]
         if forkable:
             arguments.append("--forkable")
-        self.command(arguments)
+        completed = self.command(arguments)
+        self.startup_traces[name] = parse_startup_trace(completed.stderr)
 
     def fork(self, golden: str, clone: str) -> None:
         self.command(["machine", "fork", "--golden", golden, "--name", clone])
@@ -473,6 +636,36 @@ def emit_wave(
         f"{wave.phase}\t{wave.wall_ms:.3f}"
     )
     return result
+
+
+def emit_startup_traces(
+    traces: list[TraceSample],
+    benchmark: SmolvmBenchmark,
+    names: Sequence[str],
+    profile: str,
+    mode: str,
+    iteration: int,
+    concurrency: int,
+) -> None:
+    """Emit one opt-in stage value per direct machine start, when available."""
+
+    for name in names:
+        for stage, elapsed_ms in sorted(benchmark.startup_traces.get(name, {}).items()):
+            sample = TraceSample(
+                profile,
+                mode,
+                iteration,
+                concurrency,
+                stage,
+                name,
+                elapsed_ms,
+            )
+            traces.append(sample)
+            emit(
+                f"trace_sample\t{sample.profile}\t{sample.mode}\t{sample.iteration}\t"
+                f"{sample.concurrency}\t{sample.stage}\t{sample.machine}\t"
+                f"{sample.elapsed_ms:.3f}"
+            )
 
 
 def scenario_names(prefix: str, count: int) -> list[str]:
@@ -759,6 +952,7 @@ def run_cold_scenario(
     mode: str,
     samples: list[TimingSample],
     waves: list[WaveSample],
+    traces: list[TraceSample],
 ) -> None:
     """Measure one private machine-runtime scenario and remove its exact identities."""
 
@@ -799,6 +993,15 @@ def run_cold_scenario(
             "start",
             runtime_root,
             lambda: run_wave(names, mode, lambda name: benchmark.start_machine(name, forkable)),
+        )
+        emit_startup_traces(
+            traces,
+            benchmark,
+            names,
+            profile,
+            mode,
+            iteration,
+            concurrency,
         )
         phase = "agent_exec"
         emit_wave(
@@ -957,6 +1160,17 @@ def emit_wave_summary(waves: Sequence[WaveSample]) -> None:
         )
 
 
+def emit_trace_summary(traces: Sequence[TraceSample]) -> None:
+    """Report nested upstream spans without mixing them into wall-time summaries."""
+
+    emit("trace_summary\tprofile\tmode\tconcurrency\tstage\tsamples\tp50_ms\tp95_ms")
+    for profile, mode, concurrency, stage, count, p50_ms, p95_ms in summarize_traces(traces):
+        emit(
+            f"trace_summary\t{profile}\t{mode}\t{concurrency}\t{stage}\t{count}\t"
+            f"{p50_ms:.3f}\t{p95_ms:.3f}"
+        )
+
+
 def main() -> int:
     if os.environ.get("SMOLWORLD_TRANSITION_BENCH") != "1":
         raise BenchmarkError("set SMOLWORLD_TRANSITION_BENCH=1 to run VM-transition measurements")
@@ -973,6 +1187,7 @@ def main() -> int:
         os.environ.get("SMOLWORLD_TRANSITION_CONCURRENCY", "1,2,4")
     )
     os.environ["SMOLVM_AGENT_ROOTFS"] = str(agent_rootfs)
+    trace = configure_trace_environment()
 
     def interrupt(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -980,6 +1195,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, interrupt)
     samples: list[TimingSample] = []
     waves: list[WaveSample] = []
+    traces: list[TraceSample] = []
     emit("# smolworld transition substrate benchmark v2")
     emit(f"# archive={archive}")
     emit(
@@ -987,12 +1203,17 @@ def main() -> int:
         f"cpus=1 memory_mib=256 mutation_bytes={MUTATION_BYTES}"
     )
     emit("# archive cache is user-owned and is never cleared by this benchmark")
+    emit(f"# upstream_boot_trace={'enabled' if trace else 'disabled'}")
     emit(
         "machine_sample\tprofile\tmode\titeration\tconcurrency\tphase\tmachine\twall_ms"
     )
     emit(
         "wave_sample\tprofile\tmode\titeration\tconcurrency\tphase\twall_ms"
     )
+    if trace:
+        emit(
+            "trace_sample\tprofile\tmode\titeration\tconcurrency\tstage\tmachine\telapsed_ms"
+        )
     emit("failure_sample\tprofile\tmode\titeration\tconcurrency\tphase\terror")
 
     for iteration in range(1, iterations + 1):
@@ -1008,6 +1229,7 @@ def main() -> int:
                         mode,
                         samples,
                         waves,
+                        traces,
                     )
             run_world_probe(
                 smolworld_bin,
@@ -1023,6 +1245,8 @@ def main() -> int:
     emit("summary\tprofile\tmode\tconcurrency\tphase\tsamples\tp50_ms\tp95_ms")
     emit_summary(samples)
     emit_wave_summary(waves)
+    if trace:
+        emit_trace_summary(traces)
     return 0
 
 

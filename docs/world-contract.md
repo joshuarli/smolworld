@@ -432,8 +432,11 @@ NIC; a raw Unix listener is not a valid substitute for the authoritative
 switch, gateway, and attachment boundary. `start` remains the aggregate
 upstream cost of image setup, VM creation, guest boot, agent readiness, and
 workload launch until that external interface exposes stable lower-level
-events. A retained-fork reference is reported separately; requests from one
-golden are serialized because a fork pauses that golden.
+events. With `SMOLWORLD_TRANSITION_TRACE=1`, the harness also records nested
+smolvm boot diagnostics, including agent-ready and local-layer-materialization
+spans; those trace values are not additive substitutes for the external start
+or attachment boundaries. A retained-fork reference is reported separately;
+requests from one golden are serialized because a fork pauses that golden.
 
 APFS clonefile observations distinguish addressed/accounted file blocks from
 physical volume deltas. Accounted blocks may double-count shared clones;
