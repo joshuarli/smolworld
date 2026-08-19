@@ -207,6 +207,64 @@ impl MaterialLock {
         }
         Ok(())
     }
+
+    /// Stable checkpoint identity for material that can be regenerated into a
+    /// fresh private configuration tree. The ordinary lock remains the exact
+    /// local validation record: it includes generated Smolfile paths and fast
+    /// same-host archive metadata. Neither can be a same-lineage checkpoint
+    /// identity because both legitimately change when a sealed manifest is
+    /// materialized at a new private path.
+    pub(crate) fn checkpoint_identity_digest(&self) -> Result<String> {
+        self.validate()?;
+        let mut output = String::from("version\tsmolworld-material-identity/v1\n");
+        output.push_str(&format!("resolver_abi\t{}\n", self.resolver_abi));
+        output.push_str(&format!("world\t{}\n", self.world.config_digest));
+        for (machine, observation) in &self.smolfiles {
+            output.push_str(&format!(
+                "smolfile\t{machine}\t{}\t{}\t{}\n",
+                observation.authored_relative_path.display(),
+                observation.authored_digest,
+                observation.prepared_digest,
+            ));
+        }
+        let mut seeds = self.seeds.clone();
+        seeds.sort_by(|left, right| {
+            (
+                &left.machine,
+                &left.source_relative_path,
+                &left.destination,
+                left.mode,
+                &left.digest,
+            )
+                .cmp(&(
+                    &right.machine,
+                    &right.source_relative_path,
+                    &right.destination,
+                    right.mode,
+                    &right.digest,
+                ))
+        });
+        for seed in seeds {
+            output.push_str(&format!(
+                "seed\t{}\t{}\t{}\t{:o}\t{}\n",
+                seed.machine,
+                seed.source_relative_path.display(),
+                seed.destination,
+                seed.mode,
+                seed.digest,
+            ));
+        }
+        for (machine, image) in &self.images {
+            output.push_str(&format!(
+                "image\t{machine}\t{}\t{}\t{}\t{}\n",
+                image.source_kind.as_str(),
+                image.source_reference,
+                image.source_digest,
+                image.image_digest,
+            ));
+        }
+        Ok(digest_bytes(output.as_bytes()))
+    }
 }
 
 /// Compute the stable BLAKE3 representation used for world declarations and

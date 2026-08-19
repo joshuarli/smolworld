@@ -168,7 +168,7 @@ fn world_checkpoint_receipt_round_trips_stable_world_identity() {
         schema_version: WORLD_CHECKPOINT_RECEIPT_VERSION,
         world_name: "sentry".to_string(),
         config_digest: digest_bytes(b"world config"),
-        material_lock_digest: digest_bytes(b"prepared material"),
+        material_identity_digest: digest_bytes(b"prepared material"),
         allocation: WorldAllocationState {
             seed: 0x1234,
             assignments: BTreeMap::from([(
@@ -198,17 +198,18 @@ fn world_checkpoint_receipt_round_trips_stable_world_identity() {
 
     assert_eq!(load_world_checkpoint_receipt(&checkpoint).unwrap(), receipt);
     let serialized = fs::read_to_string(world_checkpoint_receipt_path(&checkpoint)).unwrap();
-    assert!(serialized.starts_with("version\t2\nworld\tsentry\n"));
+    assert!(serialized.starts_with("version\t3\nworld\tsentry\n"));
+    assert!(serialized.contains("material-identity\tblake3:"));
     assert!(serialized.contains("machine-receipt\trunner\tblake3:"));
 
     fs::write(
         world_checkpoint_receipt_path(&checkpoint),
-        serialized.replacen("version\t2", "version\t1", 1),
+        serialized.replacen("version\t3", "version\t1", 1),
     )
     .unwrap();
     assert!(load_world_checkpoint_receipt(&checkpoint)
         .unwrap_err()
-        .contains("not version 2"));
+        .contains("not version 3"));
 }
 
 #[test]
@@ -269,6 +270,38 @@ fn world_paths_do_not_adopt_legacy_state() {
     );
     assert!(world.legacy_state_file().exists());
     assert!(!paths.state_dir.exists());
+}
+
+#[test]
+fn explicit_state_root_is_a_canonical_private_namespace() {
+    let world = TemporaryWorld::new();
+    let private_root = world.root.join("private-state");
+    ensure_private_dir(&private_root).unwrap();
+
+    assert_eq!(
+        state_root(Some(private_root.as_os_str()), None).unwrap(),
+        fs::canonicalize(&private_root).unwrap()
+    );
+    assert!(state_root(Some(std::ffi::OsStr::new("relative")), None)
+        .unwrap_err()
+        .contains("must be an absolute directory"));
+}
+
+#[test]
+fn checkpoint_material_identity_omits_private_materialization_paths() {
+    let record = material_lock();
+    let mut rematerialized = record.clone();
+    let smolfile = rematerialized.smolfiles.get_mut("postgres").unwrap();
+    smolfile.prepared_path = PathBuf::from("/private/runtime/material/postgres.Smolfile");
+    let image = rematerialized.images.get_mut("postgres").unwrap();
+    image.local_path = PathBuf::from("/private/runtime/images/postgres.tar");
+    image.archive_identity.inode = 99;
+    image.archive_identity.changed_seconds = 12;
+
+    assert_eq!(
+        record.checkpoint_identity_digest().unwrap(),
+        rematerialized.checkpoint_identity_digest().unwrap()
+    );
 }
 
 #[test]

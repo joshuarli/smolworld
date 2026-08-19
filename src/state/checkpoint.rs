@@ -95,8 +95,8 @@ fn validate_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Result
     })?;
     validate_blake3_digest(&receipt.config_digest, "world checkpoint config digest")?;
     validate_blake3_digest(
-        &receipt.material_lock_digest,
-        "world checkpoint material lock digest",
+        &receipt.material_identity_digest,
+        "world checkpoint material identity digest",
     )?;
     if receipt.allocation.assignments.is_empty() {
         return Err("world checkpoint receipt has no machine allocations".into());
@@ -164,7 +164,10 @@ fn serialize_world_checkpoint_receipt(receipt: &WorldCheckpointReceipt) -> Strin
     output.push_str(&format!("version\t{WORLD_CHECKPOINT_RECEIPT_VERSION}\n"));
     output.push_str(&format!("world\t{}\n", receipt.world_name));
     output.push_str(&format!("config\t{}\n", receipt.config_digest));
-    output.push_str(&format!("material\t{}\n", receipt.material_lock_digest));
+    output.push_str(&format!(
+        "material-identity\t{}\n",
+        receipt.material_identity_digest
+    ));
     output.push_str(&format!("seed\t{:016x}\n", receipt.allocation.seed));
     output.push_str(&format!("switch-epoch\t{}\n", receipt.switch.epoch));
     output.push_str(&format!("switch-queue\t{}\n", receipt.switch.queued_frames));
@@ -195,7 +198,7 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
     let mut version = None;
     let mut world_name = None;
     let mut config_digest = None;
-    let mut material_lock_digest = None;
+    let mut material_identity_digest = None;
     let mut seed = None;
     let mut switch_epoch = None;
     let mut switch_queue = None;
@@ -220,8 +223,8 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
             ["config", value] if config_digest.is_none() => {
                 config_digest = Some((*value).to_string())
             }
-            ["material", value] if material_lock_digest.is_none() => {
-                material_lock_digest = Some((*value).to_string())
+            ["material-identity", value] if material_identity_digest.is_none() => {
+                material_identity_digest = Some((*value).to_string())
             }
             ["seed", value] if seed.is_none() => {
                 seed = Some(
@@ -331,8 +334,9 @@ fn parse_world_checkpoint_receipt(content: &str) -> Result<WorldCheckpointReceip
             .ok_or_else(|| "world checkpoint receipt is missing world".to_string())?,
         config_digest: config_digest
             .ok_or_else(|| "world checkpoint receipt is missing config digest".to_string())?,
-        material_lock_digest: material_lock_digest
-            .ok_or_else(|| "world checkpoint receipt is missing material digest".to_string())?,
+        material_identity_digest: material_identity_digest.ok_or_else(|| {
+            "world checkpoint receipt is missing material identity digest".to_string()
+        })?,
         allocation: WorldAllocationState {
             seed: seed.ok_or_else(|| "world checkpoint receipt is missing seed".to_string())?,
             assignments,

@@ -299,6 +299,14 @@ or `--filter status=STATE` narrows by the closed label, and `--quiet` /
 `--json` remains its spelling-compatible alias. Table columns deliberately
 describe only world-owned observations: `SERVICE`, `IP`, `MAC`, and `STATUS`.
 
+`SMOLWORLD_STATE_ROOT`, when set, selects an already-created absolute regular
+directory for this world's local allocation namespace. Smolworld rejects a
+relative, missing, or symlinked value; it never creates or follows a
+caller-selected root. Sealed local executors use this boundary to keep their
+disposable allocation, lifecycle, and generated-material state with the
+private configuration materialization. With the variable unset, the ordinary
+per-user `~/.smolworld` namespace remains the local CLI default.
+
 ### Stats schema
 
 `stats` is read-only. It reads only world allocation records and never lists
@@ -358,9 +366,18 @@ guest path because that is the selected companion's transfer capability.
 `checkpoint` asks the foreground supervisor to close the switch at a new epoch,
 capture every machine concurrently, seal one world receipt, publish it by
 rename, and retain exactly those machine sources. `restore` accepts only a
-receipt whose configuration, material lock, allocation, and topology match the
-selected world; it creates fresh agent and Unix-stream NIC handles. `release`
-is the normal deletion path for a retained checkpoint.
+receipt whose configuration, stable material identity, allocation, and topology
+match the selected world. The identity binds resolver inputs and content
+digests, while excluding regenerated private Smolfile paths and same-host fast
+archive metadata; ordinary material verification checks those exact local
+records before restore. If the selected world is a blank private materialization,
+`restore` first records the receipt's exact allocation as captured state; it
+never adopts a partial namespace. It then creates fresh agent and Unix-stream
+NIC handles, passes each new listener path explicitly to SmolVM restore, and
+rehydrates each restored machine as a new forkable base. A
+restored world can therefore capture a later same-lineage checkpoint without
+retaining the prior checkpoint source as a live VM. `release` is the normal
+deletion path for a retained checkpoint.
 
 The receipt is a durable same-lineage world artifact. Higher-level systems may
 record or reference it, but smolworld does not define their workflow, lease, or

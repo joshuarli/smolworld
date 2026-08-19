@@ -1,8 +1,15 @@
 use crate::Result;
+use std::ffi::OsStr;
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+/// An optional already-created private root for Smolworld's mutable local
+/// allocation state. Callers that execute a sealed configuration copy use
+/// this to keep lifecycle and material records with that copy rather than in
+/// the developer's long-lived home directory.
+pub const STATE_ROOT_ENV: &str = "SMOLWORLD_STATE_ROOT";
 
 /// Paths owned by the world materializer. These paths are derived only from
 /// the canonical configuration, so cleanup never reads, adopts, or removes
@@ -49,10 +56,11 @@ pub(crate) fn world_paths(config_path: &Path) -> Result<WorldPaths> {
         .ok_or_else(|| "configuration path has no parent directory".to_string())?
         .to_path_buf();
     let hash = fnv1a(canonical_config.as_os_str().as_encoded_bytes());
-    let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-    let state_dir = PathBuf::from(home)
-        .join(".smolworld")
-        .join(format!("world-{hash:012x}"));
+    let state_dir = state_root(
+        env::var_os(STATE_ROOT_ENV).as_deref(),
+        env::var_os("HOME").as_deref(),
+    )?
+    .join(format!("world-{hash:012x}"));
     let state_file = state_dir.join("state");
     let runtime_dir = PathBuf::from("/tmp").join(format!("smw-{hash:012x}"));
     Ok(WorldPaths {
@@ -63,6 +71,31 @@ pub(crate) fn world_paths(config_path: &Path) -> Result<WorldPaths> {
         state_file,
         runtime_dir,
     })
+}
+
+/// Resolve the allocation-state namespace without creating or following a
+/// caller-selected directory. The explicit root must already be a canonical
+/// private directory; that makes a sealed executor's ownership boundary
+/// observable before Smolworld writes a lifecycle record inside it.
+pub(crate) fn state_root(explicit: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
+    let Some(explicit) = explicit else {
+        let home = home.ok_or_else(|| "HOME is not set".to_string())?;
+        return Ok(PathBuf::from(home).join(".smolworld"));
+    };
+    let root = PathBuf::from(explicit);
+    if !root.is_absolute() {
+        return Err(format!("{STATE_ROOT_ENV} must be an absolute directory"));
+    }
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("inspect {STATE_ROOT_ENV} {}: {error}", root.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{STATE_ROOT_ENV} is not a regular directory: {}",
+            root.display()
+        ));
+    }
+    fs::canonicalize(&root)
+        .map_err(|error| format!("canonicalize {STATE_ROOT_ENV} {}: {error}", root.display()))
 }
 
 pub(crate) fn fnv1a(input: &[u8]) -> u64 {

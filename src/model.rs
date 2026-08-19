@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 /// On-disk schema for the published world checkpoint receipt. A version bump
 /// is an intentional compatibility boundary: restore and release reject
 /// receipts whose integrity contract they cannot prove.
-pub(crate) const WORLD_CHECKPOINT_RECEIPT_VERSION: u8 = 2;
+pub(crate) const WORLD_CHECKPOINT_RECEIPT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldConfig {
@@ -111,7 +111,10 @@ pub(crate) struct WorldCheckpointReceipt {
     pub(crate) schema_version: u8,
     pub(crate) world_name: String,
     pub(crate) config_digest: String,
-    pub(crate) material_lock_digest: String,
+    /// Stable material identity. This excludes local generated-file paths and
+    /// fast archive metadata, which are re-established and verified inside a
+    /// fresh private materialization before a checkpoint can be restored.
+    pub(crate) material_identity_digest: String,
     pub(crate) allocation: WorldAllocationState,
     /// One BLAKE3 digest for each opaque smolvm machine receipt. Smolworld
     /// does not duplicate smolvm's RAM/disk verifier; it binds the exact

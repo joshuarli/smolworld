@@ -18,7 +18,7 @@ pub(super) fn verify_world_checkpoint_receipt(
     if receipt.config_digest != digest_file(&paths.canonical_config)? {
         return Err("checkpoint world declaration no longer matches this configuration".into());
     }
-    if receipt.material_lock_digest != digest_file(&paths.material_lock_path())? {
+    if receipt.material_identity_digest != checkpoint_material_identity_digest(paths)? {
         return Err("checkpoint prepared material no longer matches this world".into());
     }
     if receipt.allocation != *state {
@@ -148,7 +148,7 @@ pub(super) fn checkpoint_running_world(
         schema_version: WORLD_CHECKPOINT_RECEIPT_VERSION,
         world_name: config.name.clone(),
         config_digest: digest_file(&paths.canonical_config)?,
-        material_lock_digest: digest_file(&paths.material_lock_path())?,
+        material_identity_digest: checkpoint_material_identity_digest(paths)?,
         allocation: state.clone(),
         machine_receipts,
         switch,
@@ -175,6 +175,16 @@ pub(super) fn checkpoint_running_world(
     // verification.
     mark_captured(paths)?;
     Ok(())
+}
+
+/// Read the exact local lock only after the ordinary prepare/check boundary
+/// has already verified its paths and same-host archive receipts. The
+/// checkpoint receipt binds the stable semantic identity, not transient paths
+/// under that private materialization.
+fn checkpoint_material_identity_digest(paths: &WorldPaths) -> Result<String> {
+    load_material_lock(&paths.material_lock_path())?
+        .ok_or_else(|| "checkpoint prepared material is missing its lock".to_string())?
+        .checkpoint_identity_digest()
 }
 
 fn abandon_unstarted_world_checkpoint(
@@ -342,6 +352,7 @@ fn rollback_world_checkpoint(
             rollback.smolvm,
             &assignment.smolvm_name,
             &rollback.staging.join("machines").join(name),
+            &port_socket_path(&rollback.paths.runtime_dir, name),
         )
     });
     let attached = restore.and_then(|()| {

@@ -6,8 +6,9 @@ use crate::cli::{
 use crate::config::{load_config, topological_order, topological_waves};
 use crate::gateway::Gateway;
 use crate::model::{
-    format_mac, LifecycleState, MachineCheckpointReceipt, MachineLaunch, SeedFile,
-    WorldCheckpointReceipt, WorldConfig, WORLD_CHECKPOINT_RECEIPT_VERSION,
+    format_mac, LifecycleMetadata, LifecycleState, MachineCheckpointReceipt, MachineLaunch,
+    SeedFile, WorldAllocationState, WorldCheckpointReceipt, WorldConfig,
+    WORLD_CHECKPOINT_RECEIPT_VERSION,
 };
 use crate::smolvm::{
     checkpoint_machine, cleanup_machines, copy_machine, create_machine, delete_machine,
@@ -23,9 +24,10 @@ use crate::state::{
     mark_absent, mark_attached, mark_capture_rolled_back, mark_captured, mark_capturing,
     mark_created, mark_created_detached, mark_running, mark_starting,
     normalize_relative_path, prepare_runtime_dir, remove_runtime_dir, remove_stale_temporary_files,
-    world_paths, write_allocation_state, write_material_lock, write_world_checkpoint_receipt,
-    ImageMaterial, MaterialLock, SeedObservation, SmolfileObservation, WorldLock, WorldPaths,
-    validate_recorded_smolvm_name, MACHINE_CHECKPOINT_RECEIPT_NAME,
+    world_paths, write_allocation_state, write_lifecycle, write_material_lock,
+    write_world_checkpoint_receipt, ImageMaterial, MaterialLock, SeedObservation,
+    SmolfileObservation, WorldLock, WorldPaths, validate_recorded_smolvm_name,
+    MACHINE_CHECKPOINT_RECEIPT_NAME,
 };
 use crate::switch::{
     port_socket_path, print_allocations, run_switch, spawn_port_acceptor, wait_for_attachments,
@@ -705,11 +707,12 @@ pub(crate) fn checkpoint(config_path: &Path, output: &Path) -> Result<()> {
     }
 }
 
-/// Reopen a captured world under the same recorded machine identities. The
-/// checkpoint receipt owns RAM/device/disk state; the still-present allocation
-/// state owns the static IP/MAC tuple and namespaced SmolVM records. This
-/// supervisor recreates only ephemeral listeners and then asks each machine to
-/// restore with fresh host vsock/NIC descriptors.
+/// Reopen a captured world under the checkpoint's recorded machine identities.
+/// A pre-existing captured world keeps its allocation record as usual. A
+/// manifest-materialized private world has no allocation namespace yet, so
+/// restore rehydrates exactly the receipt's allocation into an otherwise blank
+/// state directory before it recreates ephemeral listeners and asks each
+/// machine to restore with fresh host vsock/NIC descriptors.
 pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     STOP_REQUESTED.store(false, Ordering::SeqCst);
     if !checkpoint.is_absolute() {
@@ -721,7 +724,15 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
     let smolvm = smolvm_program();
     let _world_lock = WorldLock::acquire(&paths)?;
     let material = verify_prepared_world(&config, &paths, &smolvm, false)?;
-    let lifecycle = load_lifecycle(&paths.lifecycle_path())?.unwrap_or_default();
+    let receipt = load_world_checkpoint_receipt(checkpoint)?;
+    let state = rehydrate_checkpoint_allocation(
+        &paths,
+        load_allocation_state(&paths.state_file)?,
+        load_lifecycle(&paths.lifecycle_path())?,
+        &receipt.allocation,
+    )?;
+    let lifecycle = load_lifecycle(&paths.lifecycle_path())?
+        .ok_or_else(|| "checkpoint allocation rehydration did not record lifecycle state".to_string())?;
     if !matches!(
         lifecycle.state,
         LifecycleState::Captured | LifecycleState::Capturing
@@ -732,9 +743,6 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
             lifecycle.state.as_str()
         ));
     }
-    let state = load_allocation_state(&paths.state_file)?
-        .ok_or_else(|| "captured world has no allocation state".to_string())?;
-    let receipt = load_world_checkpoint_receipt(checkpoint)?;
     verify_world_checkpoint_receipt(&config, &paths, &state, checkpoint, &receipt)?;
     remove_stale_temporary_files(&paths)?;
     remove_runtime_dir(&paths)?;
@@ -781,6 +789,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
                 &smolvm,
                 &assignment.smolvm_name,
                 &checkpoint.join("machines").join(name),
+                &port_socket_path(&paths.runtime_dir, name),
             )
         })?;
         wait_for_attachments(&attached_rx, &config)?;
@@ -892,6 +901,33 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
         let _ = mark_captured(&paths);
     }
     result
+}
+
+/// Rehydrate an exact checkpoint allocation only when this private world has
+/// no prior lifecycle state at all. A partial or non-captured namespace is not
+/// adoptable: it may belong to an interrupted owner rather than this receipt.
+fn rehydrate_checkpoint_allocation(
+    paths: &WorldPaths,
+    state: Option<WorldAllocationState>,
+    lifecycle: Option<LifecycleMetadata>,
+    checkpoint_allocation: &WorldAllocationState,
+) -> Result<WorldAllocationState> {
+    match (state, lifecycle) {
+        (Some(state), Some(_lifecycle)) => Ok(state),
+        (None, None) => {
+            write_allocation_state(paths, checkpoint_allocation)?;
+            write_lifecycle(
+                paths,
+                LifecycleMetadata::new(LifecycleState::Captured, None, 1)?,
+            )?;
+            Ok(checkpoint_allocation.clone())
+        }
+        (state, lifecycle) => Err(format!(
+            "checkpoint restore requires both allocation and lifecycle state or a blank private world (allocation present: {}; lifecycle present: {})",
+            state.is_some(),
+            lifecycle.is_some()
+        )),
+    }
 }
 
 /// Permanently release one retained state. This is the only durable-world path
@@ -2029,6 +2065,49 @@ mod tests {
             state_file: root.join("state/state"),
             runtime_dir: root.join("runtime"),
         }
+    }
+
+    #[test]
+    fn blank_private_world_rehydrates_exact_checkpoint_allocation() {
+        let root = temporary_runtime_test_directory();
+        let paths = runtime_test_paths(&root);
+        let allocation = WorldAllocationState {
+            seed: 0x1234,
+            assignments: BTreeMap::from([(
+                "runner".into(),
+                crate::model::Assignment {
+                    ip: "10.89.0.2".parse().unwrap(),
+                    mac: [0x02, 0, 0, 0, 0, 2],
+                    smolvm_name: "smw-00000000002a-runner".into(),
+                },
+            )]),
+        };
+
+        assert_eq!(
+            rehydrate_checkpoint_allocation(&paths, None, None, &allocation)
+                .expect("rehydrate blank private world"),
+            allocation
+        );
+        assert_eq!(
+            load_allocation_state(&paths.state_file)
+                .expect("read rehydrated allocation")
+                .expect("allocation was written"),
+            allocation
+        );
+        assert_eq!(
+            load_lifecycle(&paths.lifecycle_path())
+                .expect("read rehydrated lifecycle")
+                .expect("lifecycle was written")
+                .state,
+            LifecycleState::Captured
+        );
+        assert!(rehydrate_checkpoint_allocation(&paths, Some(allocation), None, &WorldAllocationState {
+            seed: 0x5678,
+            assignments: BTreeMap::new(),
+        })
+        .is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn temporary_runtime_test_directory() -> PathBuf {

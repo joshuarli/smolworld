@@ -596,12 +596,21 @@ pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Re
     companion_adapter::captured_status(Operation::Checkpoint, &mut command)
 }
 
-/// Restore one stopped world machine from its receipt with fresh host handles.
-pub(crate) fn restore_machine(smolvm: &Path, name: &str, checkpoint: &Path) -> Result<()> {
+/// Restore one stopped world machine as the next forkable world base. A world
+/// checkpoint is addressable step state, so a resumed workload must be able to
+/// seal its own later checkpoint without retaining the previous source VM.
+pub(crate) fn restore_machine(
+    smolvm: &Path,
+    name: &str,
+    checkpoint: &Path,
+    net_unixstream: &Path,
+) -> Result<()> {
     let mut command = Command::new(smolvm);
     command
         .args(["machine", "restore", "--name", name, "--checkpoint"])
-        .arg(checkpoint);
+        .arg(checkpoint)
+        .args(["--forkable", "--net-unixstream"])
+        .arg(net_unixstream);
     companion_adapter::captured_status(Operation::Restore, &mut command)
 }
 
@@ -947,7 +956,13 @@ mod tests {
             .unwrap_err()
             .contains("start"));
         checkpoint_machine(&fake, "smw-runner", &root.join("checkpoint")).unwrap();
-        restore_machine(&fake, "smw-runner", &root.join("checkpoint")).unwrap();
+        restore_machine(
+            &fake,
+            "smw-runner",
+            &root.join("checkpoint"),
+            &root.join("runner.sock"),
+        )
+        .unwrap();
         exec_machine(
             &fake,
             "smw-runner",
@@ -1006,7 +1021,11 @@ mod tests {
         assert!(calls.contains("machine cp "));
         assert!(calls.contains("/bin/chmod 0640 /etc/demo/seed"));
         assert!(calls.contains("machine checkpoint --name smw-runner"));
-        assert!(calls.contains("machine restore --name smw-runner"));
+        assert!(calls.contains(&format!(
+            "machine restore --name smw-runner --checkpoint {} --forkable --net-unixstream {}",
+            root.join("checkpoint").display(),
+            root.join("runner.sock").display(),
+        )));
         assert!(calls.contains(
             "machine exec --name smw-runner --secret-env TOKEN=HOST_TOKEN -- /bin/sh -c true"
         ));
