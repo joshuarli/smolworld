@@ -422,6 +422,19 @@ restored world ready
 accounted storage and physical APFS bytes
 ```
 
+The opt-in cold-transition harness, `tests/benchmark_world_transitions.py`,
+records separate `create`, `start`, agent-exec, and fsynced guest-mutation
+samples for archive-backed machines across serial and simultaneous 1/2/4
+machine waves. It also uses a real `smolworld up` supervisor to record
+material `prepare` and read-only `check`, each switch-reported private-NIC attachment, and the
+all-machines-ready barrier. The direct machine matrix deliberately omits a
+NIC; a raw Unix listener is not a valid substitute for the authoritative
+switch, gateway, and attachment boundary. `start` remains the aggregate
+upstream cost of image setup, VM creation, guest boot, agent readiness, and
+workload launch until that external interface exposes stable lower-level
+events. A retained-fork reference is reported separately; requests from one
+golden are serialized because a fork pauses that golden.
+
 APFS clonefile observations distinguish addressed/accounted file blocks from
 physical volume deltas. Accounted blocks may double-count shared clones;
 volume-used bytes include unrelated host activity; neither is a proportional

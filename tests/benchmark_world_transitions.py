@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
-"""Measure the currently available one-to-many SmolVM transition substrate.
+"""Measure cold SmolVM transition costs without collapsing their boundaries.
 
-This is deliberately not a durable smolworld checkpoint benchmark. A SmolVM
-fork freezes one golden machine and creates non-forkable, disposable children.
-It measures that primitive against fresh, local-archive cold starts.
+This measures the upstream per-machine substrate rather than a durable
+smolworld checkpoint. It retains a fork reference and adds a cold-start
+scaling matrix with separate signals:
 
-The harness never pulls an image or uses a host network. Its caller supplies
-the prepared OCI archive that a Smolworld material lock has already sealed.
+* archive creation/start: prepared local-image staging, guest boot, agent
+  readiness, local-image setup, and configured workload launch.
+* archive_forkable creation/start: the same image path with the forkable launch
+  mode smolworld uses for durable checkpoint coordination.
+* world startup: a real smolworld supervisor records material preparation,
+  each reported private-NIC attachment, and the all-machines-ready barrier.
+
+The direct scenarios never configure a NIC: attaching a raw Unix listener is
+not a substitute for the smolworld L2 switch and gateway. The world scenarios
+exercise that boundary through smolworld itself. The harness never lists,
+cleans, or otherwise acts on machines outside exact names recorded by its
+generated worlds. The content-addressed local-image cache is user-owned and is
+deliberately not cleared, so archive-create timings include the real
+hash/staging path with the cache state that existed at run time.
 
 Required environment:
     SMOLWORLD_TRANSITION_BENCH=1
@@ -17,31 +29,46 @@ Required environment:
 Optional environment:
     SMOLWORLD_TRANSITION_ITERATIONS=3
     SMOLWORLD_TRANSITION_BRANCHES=3
+    SMOLWORLD_TRANSITION_CONCURRENCY=1,2,4
+    SMOLWORLD_BIN=/absolute/path/to/smolworld
     SMOLVM_LIB_DIR=/absolute/path/to/libkrun
     DYLD_LIBRARY_PATH=/absolute/path/to/libkrun
+    RUST_LOG=smolvm::agent::manager=debug
 
-The process always creates and removes an isolated SMOLVM_RUNTIME_ROOT. This
-is SmolVM's cross-platform per-machine storage boundary, so prior machine state
-cannot affect timing or byte measurements.
+The output is TSV. machine_sample rows are per-machine latencies and
+wave_sample rows are wall-clock times for one serial or parallel wave.
+failure_sample rows preserve an unsuccessful wave (including lock contention)
+without relabeling it as a timing sample. summary and wave_summary report
+p50/p95 over their matching successful records. Storage accounting is
+intentionally out of scope: current macOS smolvm does not expose an
+isolatable per-benchmark runtime root, and a synthetic directory would report
+misleading zeroes.
 """
 
 from __future__ import annotations
 
-import os
+from collections import defaultdict
+from dataclasses import dataclass
 import json
+import math
+import os
+import re
 import secrets
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Sequence
 
 
-MIB = 1024 * 1024
-MUTATION_BYTES = 4 * MIB
+MUTATION_BYTES = 4 * 1024 * 1024
+MAX_CONCURRENCY = 250
+WORLD_READY_TIMEOUT_SECONDS = 120.0
 
 
 class BenchmarkError(Exception):
@@ -49,7 +76,7 @@ class BenchmarkError(Exception):
 
 
 def emit(line: str) -> None:
-    """Write a benchmark record promptly when stdout is captured by a runner."""
+    """Write one benchmark record promptly when stdout is captured by a runner."""
 
     print(line, flush=True)
 
@@ -70,6 +97,14 @@ def require_directory(variable: str) -> Path:
     return path
 
 
+def require_executable(variable: str, default: Path) -> Path:
+    value = os.environ.get(variable)
+    path = Path(value) if value else default
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise BenchmarkError(f"{variable} must name an executable file: {path}")
+    return path
+
+
 def positive_integer(variable: str, default: int) -> int:
     value = os.environ.get(variable, str(default))
     try:
@@ -81,42 +116,124 @@ def positive_integer(variable: str, default: int) -> int:
     return parsed
 
 
-def accounted_file_blocks_bytes(root: Path) -> int:
-    """Return the sum of each file's allocated blocks beneath ``root``.
+def parse_concurrency_levels(value: str) -> list[int]:
+    """Parse one bounded, duplicate-free cold-start scaling matrix."""
 
-    This is a portable per-world accounting upper bound, not physical APFS
-    consumption: clonefile reports shared blocks for both the golden and its
-    clone. It deliberately excludes live guest RAM; macOS offers no stable
-    per-process proportional-set-size interface, while RSS double-counts CoW
-    pages.
-    """
+    if not value.strip():
+        raise BenchmarkError("SMOLWORLD_TRANSITION_CONCURRENCY must not be empty")
+    levels: list[int] = []
+    for raw in value.split(","):
+        try:
+            level = int(raw.strip())
+        except ValueError as error:
+            raise BenchmarkError(
+                "SMOLWORLD_TRANSITION_CONCURRENCY must be comma-separated positive integers"
+            ) from error
+        if not 1 <= level <= MAX_CONCURRENCY:
+            raise BenchmarkError(
+                f"SMOLWORLD_TRANSITION_CONCURRENCY values must be between 1 and {MAX_CONCURRENCY}"
+            )
+        if level in levels:
+            raise BenchmarkError(
+                f"SMOLWORLD_TRANSITION_CONCURRENCY repeats concurrency level {level}"
+            )
+        levels.append(level)
+    return sorted(levels)
 
-    total = 0
-    for directory, subdirectories, filenames in os.walk(root, followlinks=False):
-        entries = [Path(directory)]
-        entries.extend(Path(directory, name) for name in subdirectories)
-        entries.extend(Path(directory, name) for name in filenames)
-        for entry in entries:
-            try:
-                total += entry.lstat().st_blocks * 512
-            except FileNotFoundError:
-                # A SmolVM teardown or Unix socket can disappear while being
-                # sampled. The benchmark only samples between foreground calls,
-                # so treating it as absent is the least surprising result.
-                continue
-    return total
+
+def milliseconds(started_ns: int, finished_ns: int) -> float:
+    return (finished_ns - started_ns) / 1_000_000
 
 
-def volume_used_bytes(root: Path) -> int:
-    """Return used bytes on root's enclosing volume.
+def tsv_field(value: object) -> str:
+    """Keep diagnostic records to one TSV row without discarding their cause."""
 
-    This captures APFS clonefile sharing correctly, but it is necessarily noisy:
-    unrelated host writes to the same volume are visible. Small deltas therefore
-    represent a range around zero, not an exact per-world quota.
-    """
+    return " ".join(str(value).split())
 
-    filesystem = os.statvfs(root)
-    return (filesystem.f_blocks - filesystem.f_bavail) * filesystem.f_frsize
+
+def percentile(values: Sequence[float], quantile: float) -> float:
+    """Return nearest-rank percentile so small benchmark samples stay obvious."""
+
+    if not values:
+        raise BenchmarkError("cannot summarize an empty timing sample")
+    if not 0 < quantile <= 1:
+        raise BenchmarkError(f"invalid percentile {quantile}")
+    ordered = sorted(values)
+    return ordered[math.ceil(len(ordered) * quantile) - 1]
+
+
+@dataclass(frozen=True)
+class TimingSample:
+    profile: str
+    mode: str
+    iteration: int
+    concurrency: int
+    phase: str
+    machine: str
+    wall_ms: float
+
+
+@dataclass(frozen=True)
+class WaveSample:
+    profile: str
+    mode: str
+    iteration: int
+    concurrency: int
+    phase: str
+    wall_ms: float
+
+
+@dataclass(frozen=True)
+class WaveResult:
+    started_ns: int
+    finished_ns: int
+    timings: list[tuple[str, int, int]]
+
+
+def summarize_samples(
+    samples: Sequence[TimingSample],
+) -> list[tuple[str, str, int, str, int, float, float]]:
+    """Group per-machine data into stable p50/p95 rows for the final TSV block."""
+
+    grouped: dict[tuple[str, str, int, str], list[float]] = defaultdict(list)
+    for sample in samples:
+        grouped[(sample.profile, sample.mode, sample.concurrency, sample.phase)].append(
+            sample.wall_ms
+        )
+    return [
+        (
+            profile,
+            mode,
+            concurrency,
+            phase,
+            len(values),
+            statistics.median(values),
+            percentile(values, 0.95),
+        )
+        for (profile, mode, concurrency, phase), values in sorted(grouped.items())
+    ]
+
+
+def summarize_waves(
+    waves: Sequence[WaveSample],
+) -> list[tuple[str, str, int, str, int, float, float]]:
+    """Group end-to-end barriers, including the world-ready milestone."""
+
+    grouped: dict[tuple[str, str, int, str], list[float]] = defaultdict(list)
+    for wave in waves:
+        grouped[(wave.profile, wave.mode, wave.concurrency, wave.phase)].append(wave.wall_ms)
+    return [
+        (
+            profile,
+            mode,
+            concurrency,
+            phase,
+            len(values),
+            statistics.median(values),
+            percentile(values, 0.95),
+        )
+        for (profile, mode, concurrency, phase), values in sorted(grouped.items())
+    ]
 
 
 class SmolvmBenchmark:
@@ -125,7 +242,6 @@ class SmolvmBenchmark:
         self.archive = archive
         self.runtime_root = runtime_root
         self.owned_names: list[str] = []
-        self.iteration_names: list[str] = []
 
     def command(self, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
@@ -140,19 +256,15 @@ class SmolvmBenchmark:
             if completed.stderr:
                 sys.stderr.write(completed.stderr)
             rendered = " ".join(arguments)
+            detail = completed.stderr.strip()
             raise BenchmarkError(
                 f"smolvm command failed with exit {completed.returncode}: {rendered}"
+                + (f": {detail}" if detail else "")
             )
         return completed
 
-    def register_machine(self, name: str) -> None:
-        # Children and cold controls are registered after their golden. Deleting
-        # in reverse creation order always removes a child before its disk base.
-        self.owned_names.append(name)
-        self.iteration_names.append(name)
-
-    def assert_name_absent(self, name: str) -> None:
-        """Refuse to claim a machine name which this benchmark did not create."""
+    def reserve_names(self, names: Sequence[str]) -> None:
+        """Check all exact identities before a concurrent create wave begins."""
 
         output = self.command(["machine", "ls", "--json"]).stdout
         try:
@@ -166,10 +278,14 @@ class SmolvmBenchmark:
             for machine in machines
             if isinstance(machine, dict) and isinstance(machine.get("name"), str)
         }
-        if name in observed:
-            raise BenchmarkError(
-                f"refusing to reuse existing machine name {name}; benchmark owns only newly created names"
-            )
+        repeated = len(set(names)) != len(names)
+        conflicts = sorted(set(names).intersection(observed))
+        if repeated or conflicts:
+            detail = "repeats benchmark names" if repeated else f"found existing names {conflicts}"
+            raise BenchmarkError(f"refusing to reuse machine identities: {detail}")
+        # Register before starting work so cleanup covers a command that makes a
+        # record and then fails before its caller returns.
+        self.owned_names.extend(names)
 
     def delete_names(self, names: Sequence[str]) -> None:
         failures: list[str] = []
@@ -177,65 +293,80 @@ class SmolvmBenchmark:
             try:
                 self.command(["machine", "delete", "--name", name, "-f"])
             except BenchmarkError as error:
+                if self.machine_is_absent(name):
+                    self.owned_names.remove(name)
+                    continue
                 failures.append(str(error))
                 continue
-            self.owned_names.remove(name)
-            if name in self.iteration_names:
-                self.iteration_names.remove(name)
+            if name in self.owned_names:
+                self.owned_names.remove(name)
         if failures:
             raise BenchmarkError("benchmark cleanup failed: " + "; ".join(failures))
 
-    def cleanup_iteration(self) -> None:
-        self.delete_names(self.iteration_names[:])
+    def machine_is_absent(self, name: str) -> bool:
+        """Confirm one reserved identity is absent before ignoring a failed delete."""
+
+        completed = subprocess.run(
+            [str(self.smolvm_bin), "machine", "status", "--name", name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode == 0:
+            return False
+        if "vm not found" in completed.stderr.lower():
+            return True
+        raise BenchmarkError(
+            f"cannot confirm cleanup state for machine '{name}': "
+            f"smolvm machine status exited with {completed.returncode}: "
+            f"{completed.stderr.strip()}"
+        )
 
     def cleanup(self) -> None:
-        self.delete_names(self.owned_names[:])
-        shutil.rmtree(self.runtime_root)
+        try:
+            self.delete_names(self.owned_names[:])
+        finally:
+            shutil.rmtree(self.runtime_root)
         if self.runtime_root.exists():
             raise BenchmarkError(
                 f"benchmark cleanup left its private runtime root: {self.runtime_root}"
             )
 
-    def create_machine(self, name: str) -> None:
-        self.assert_name_absent(name)
-        self.command(
-            [
-                "machine",
-                "create",
-                "--name",
-                name,
-                "--image",
-                str(self.archive),
-                "--cpus",
-                "1",
-                "--mem",
-                "256",
-                "--storage",
-                "2",
-                "--overlay",
-                "1",
-                "--",
-                "/bin/sh",
-                "-c",
-                "exec sleep infinity",
-            ]
-        )
-        self.register_machine(name)
+    def create_machine(self, name: str, image: Path | None) -> None:
+        arguments = [
+            "machine",
+            "create",
+            "--name",
+            name,
+            "--cpus",
+            "1",
+            "--mem",
+            "256",
+            "--storage",
+            "2",
+            "--overlay",
+            "1",
+        ]
+        if image is not None:
+            arguments.extend(["--image", str(image)])
+        arguments.extend(["--", "/bin/sh", "-c", "exec sleep infinity"])
+        self.command(arguments)
 
-    def start_golden(self, name: str) -> None:
-        self.command(["machine", "start", "--name", name, "--forkable"])
-
-    def start_cold(self, name: str) -> None:
-        self.command(["machine", "start", "--name", name])
+    def start_machine(self, name: str, forkable: bool = False) -> None:
+        arguments = ["machine", "start", "--name", name]
+        if forkable:
+            arguments.append("--forkable")
+        self.command(arguments)
 
     def fork(self, golden: str, clone: str) -> None:
-        self.assert_name_absent(clone)
         self.command(["machine", "fork", "--golden", golden, "--name", clone])
-        self.register_machine(clone)
+
+    def verify_guest_agent(self, name: str) -> None:
+        self.command(["machine", "exec", "--name", name, "--", "test", "-x", "/bin/sh"])
 
     def write_mutation(self, name: str, marker: str) -> None:
-        # `marker` is an argument, not source text. Keeping the guest script
-        # constant makes this a test of state transition, not host-shell quoting.
         guest_script = """set -eu
 marker=$1
 directory=/workspace/world-transition-benchmark
@@ -260,25 +391,569 @@ test "$(wc -c < "$directory/$marker.bin")" = 4194304
             ]
         )
 
-    def measure(
-        self,
-        operation: str,
-        iteration: int,
-        branch: str,
-        action: Callable[[], None],
-    ) -> None:
-        accounted_before = accounted_file_blocks_bytes(self.runtime_root)
-        volume_before = volume_used_bytes(self.runtime_root)
-        started = time.monotonic_ns()
-        action()
-        finished = time.monotonic_ns()
-        accounted_after = accounted_file_blocks_bytes(self.runtime_root)
-        volume_after = volume_used_bytes(self.runtime_root)
+
+def run_wave(
+    names: Sequence[str], mode: str, action: Callable[[str], None]
+) -> WaveResult:
+    """Run exact machine work serially or behind one simultaneous start gate."""
+
+    if mode not in {"serial", "parallel"}:
+        raise BenchmarkError(f"unknown benchmark wave mode {mode}")
+    timings: list[tuple[str, int, int]] = []
+    if mode == "serial":
+        wave_started = time.monotonic_ns()
+        for name in names:
+            started = time.monotonic_ns()
+            action(name)
+            timings.append((name, started, time.monotonic_ns()))
+        return WaveResult(wave_started, time.monotonic_ns(), timings)
+
+    barrier = threading.Barrier(len(names) + 1)
+    lock = threading.Lock()
+    errors: dict[str, BaseException] = {}
+
+    def worker(name: str) -> None:
+        try:
+            barrier.wait()
+            started = time.monotonic_ns()
+            action(name)
+            finished = time.monotonic_ns()
+            with lock:
+                timings.append((name, started, finished))
+        except BaseException as error:  # preserve cleanup after a subprocess failure
+            with lock:
+                errors[name] = error
+
+    workers = [threading.Thread(target=worker, args=(name,)) for name in names]
+    for worker_thread in workers:
+        worker_thread.start()
+    barrier.wait()
+    wave_started = time.monotonic_ns()
+    for worker_thread in workers:
+        worker_thread.join()
+    finished = time.monotonic_ns()
+    if errors:
+        name = next(name for name in names if name in errors)
+        raise BenchmarkError(f"parallel machine '{name}' failed: {errors[name]}")
+    return WaveResult(wave_started, finished, sorted(timings))
+
+
+def emit_wave(
+    samples: list[TimingSample],
+    waves: list[WaveSample],
+    profile: str,
+    mode: str,
+    iteration: int,
+    concurrency: int,
+    phase: str,
+    runtime_root: Path,
+    action: Callable[[], WaveResult],
+) -> WaveResult:
+    result = action()
+    for name, started_ns, finished_ns in result.timings:
+        sample = TimingSample(
+            profile, mode, iteration, concurrency, phase, name, milliseconds(started_ns, finished_ns)
+        )
+        samples.append(sample)
         emit(
-            f"{operation}\t{iteration}\t{branch}\t"
-            f"{(finished - started) / 1_000_000:.3f}\t"
-            f"{accounted_after - accounted_before}\t"
-            f"{volume_after - volume_before}"
+            f"machine_sample\t{sample.profile}\t{sample.mode}\t{sample.iteration}\t"
+            f"{sample.concurrency}\t{sample.phase}\t{sample.machine}\t{sample.wall_ms:.3f}"
+        )
+    wave = WaveSample(
+        profile,
+        mode,
+        iteration,
+        concurrency,
+        phase,
+        milliseconds(result.started_ns, result.finished_ns),
+    )
+    waves.append(wave)
+    emit(
+        f"wave_sample\t{wave.profile}\t{wave.mode}\t{wave.iteration}\t{wave.concurrency}\t"
+        f"{wave.phase}\t{wave.wall_ms:.3f}"
+    )
+    return result
+
+
+def scenario_names(prefix: str, count: int) -> list[str]:
+    return [f"{prefix}-{index}" for index in range(1, count + 1)]
+
+
+def fnv1a(value: bytes) -> str:
+    """Match smolworld's stable runtime/state directory namespace hash."""
+
+    result = 0xCBF29CE484222325
+    for byte in value:
+        result ^= byte
+        result = (result * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{result:012x}"
+
+
+def generated_world_state_dir(config: Path) -> Path:
+    return Path.home() / ".smolworld" / f"world-{fnv1a(os.fsencode(config.resolve()))}"
+
+
+def write_world_fixture(root: Path, archive: Path, iteration: int, count: int) -> tuple[Path, list[str]]:
+    """Write only the temporary, image-backed world material for one live probe."""
+
+    services = [f"machine-{index}" for index in range(1, count + 1)]
+    world_name = f"transition-{os.getpid()}-{secrets.token_hex(4)}"
+    subnet_octet = (iteration % 250) + 1
+    config = root / ".smolworld"
+    lines = [
+        "format: 2",
+        "",
+        "world:",
+        f"  name: {world_name}",
+        "",
+        "network:",
+        f"  subnet: 10.253.{subnet_octet}.0/24",
+        f"  domain: {world_name}.test",
+        "",
+        "machines:",
+    ]
+    for service in services:
+        smolfile = root / f"{service}.Smolfile"
+        smolfile.write_text(
+            "\n".join(
+                [
+                    f'image = "{archive}"',
+                    'entrypoint = ["/bin/sh", "-c"]',
+                    'cmd = ["exec sleep infinity"]',
+                    "cpus = 1",
+                    "memory = 256",
+                    "storage = 2",
+                    "overlay = 1",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        lines.extend([f"  {service}:", f"    smolfile: ./{smolfile.name}"])
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return config, services
+
+
+def command_environment(smolvm_bin: Path) -> dict[str, str]:
+    environment = dict(os.environ)
+    environment["SMOLWORLD_SMOLVM"] = str(smolvm_bin)
+    return environment
+
+
+def recorded_world_machine_names(state_dir: Path) -> list[str]:
+    """Read only exact benchmark identities from its generated allocation state."""
+
+    state_file = state_dir / "state"
+    try:
+        lines = state_file.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise BenchmarkError(f"read benchmark world allocation {state_file}: {error}") from error
+    names: list[str] = []
+    for line in lines:
+        fields = line.split("\t")
+        if not fields or fields[0] != "machine":
+            continue
+        if len(fields) != 5 or not re.fullmatch(r"smw-[0-9a-f]+-[0-9a-f]+", fields[4]):
+            raise BenchmarkError(
+                f"benchmark world allocation contains an invalid machine record: {line!r}"
+            )
+        names.append(fields[4])
+    if len(names) != len(set(names)):
+        raise BenchmarkError("benchmark world allocation repeats a machine identity")
+    return names
+
+
+def cleanup_recorded_benchmark_world_machines(smolvm_bin: Path, state_dir: Path) -> None:
+    """Finish exact generated-world cleanup after its supervisor failed early."""
+
+    benchmark = SmolvmBenchmark(smolvm_bin, Path("/unused-archive"), Path("/unused-root"))
+    names = recorded_world_machine_names(state_dir)
+    benchmark.owned_names = names[:]
+    benchmark.delete_names(names)
+
+
+def run_world_probe(
+    smolworld_bin: Path,
+    smolvm_bin: Path,
+    archive: Path,
+    iteration: int,
+    concurrency: int,
+    samples: list[TimingSample],
+    waves: list[WaveSample],
+) -> None:
+    """Measure the real switch attachment path without reimplementing L2 in Python."""
+
+    root = Path(tempfile.mkdtemp(prefix=f"smw-world-transition-{secrets.token_hex(6)}.", dir="/tmp"))
+    config, services = write_world_fixture(root, archive, iteration, concurrency)
+    state_dir = generated_world_state_dir(config)
+    if state_dir.exists():
+        raise BenchmarkError(f"refusing to reuse existing benchmark world state {state_dir}")
+    environment = command_environment(smolvm_bin)
+    process: subprocess.Popen[str] | None = None
+    readers: list[threading.Thread] = []
+    phase = "prepare"
+    failure: BenchmarkError | None = None
+    try:
+        prepare_started = time.monotonic_ns()
+        prepared = subprocess.run(
+            [str(smolworld_bin), "--file", str(config), "prepare"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        prepare_finished = time.monotonic_ns()
+        if prepared.returncode != 0:
+            raise BenchmarkError(f"smolworld prepare failed: {prepared.stderr.strip()}")
+        prepare_sample = TimingSample(
+            "world", "parallel", iteration, concurrency, "prepare", "world",
+            milliseconds(prepare_started, prepare_finished),
+        )
+        samples.append(prepare_sample)
+        emit(
+            f"machine_sample\t{prepare_sample.profile}\t{prepare_sample.mode}\t"
+            f"{prepare_sample.iteration}\t{prepare_sample.concurrency}\t{prepare_sample.phase}\t"
+            f"{prepare_sample.machine}\t{prepare_sample.wall_ms:.3f}"
+        )
+
+        phase = "check"
+        check_started = time.monotonic_ns()
+        checked = subprocess.run(
+            [str(smolworld_bin), "--file", str(config), "check"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        check_finished = time.monotonic_ns()
+        if checked.returncode != 0:
+            raise BenchmarkError(f"smolworld check failed: {checked.stderr.strip()}")
+        check_sample = TimingSample(
+            "world", "parallel", iteration, concurrency, "check", "world",
+            milliseconds(check_started, check_finished),
+        )
+        samples.append(check_sample)
+        emit(
+            f"machine_sample\t{check_sample.profile}\t{check_sample.mode}\t"
+            f"{check_sample.iteration}\t{check_sample.concurrency}\t{check_sample.phase}\t"
+            f"{check_sample.machine}\t{check_sample.wall_ms:.3f}"
+        )
+
+        phase = "up"
+        process = subprocess.Popen(
+            [str(smolworld_bin), "--file", str(config), "up"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+        events: list[tuple[int, str]] = []
+        events_lock = threading.Lock()
+
+        def collect(stream: object) -> None:
+            assert hasattr(stream, "readline")
+            while True:
+                line = stream.readline()
+                if not line:
+                    return
+                with events_lock:
+                    events.append((time.monotonic_ns(), line.rstrip("\n")))
+
+        readers = [
+            threading.Thread(target=collect, args=(process.stdout,), daemon=True),
+            threading.Thread(target=collect, args=(process.stderr,), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        started = time.monotonic_ns()
+        deadline = time.monotonic() + WORLD_READY_TIMEOUT_SECONDS
+        attachments: dict[str, int] = {}
+        ready_ns: int | None = None
+        while time.monotonic() < deadline and ready_ns is None:
+            with events_lock:
+                for observed_ns, line in events:
+                    if line.startswith("smolworld: attached "):
+                        service = line.removeprefix("smolworld: attached ")
+                        attachments.setdefault(service, observed_ns)
+                    if line == "smolworld: world is up; press Ctrl-C to stop it":
+                        ready_ns = observed_ns
+            if process.poll() is not None and ready_ns is None:
+                break
+            time.sleep(0.001)
+        if ready_ns is None or set(attachments) != set(services):
+            with events_lock:
+                rendered = "\n".join(line for _timestamp, line in events)
+            raise BenchmarkError(
+                f"smolworld up did not reach all attachments and ready state: {rendered}"
+            )
+        for service in services:
+            sample = TimingSample(
+                "world", "parallel", iteration, concurrency, "nic_attach", service,
+                milliseconds(started, attachments[service]),
+            )
+            samples.append(sample)
+            emit(
+                f"machine_sample\t{sample.profile}\t{sample.mode}\t{sample.iteration}\t"
+                f"{sample.concurrency}\t{sample.phase}\t{sample.machine}\t{sample.wall_ms:.3f}"
+            )
+        ready = WaveSample(
+            "world", "parallel", iteration, concurrency, "world_ready",
+            milliseconds(started, ready_ns),
+        )
+        waves.append(ready)
+        emit(
+            f"wave_sample\t{ready.profile}\t{ready.mode}\t{ready.iteration}\t"
+            f"{ready.concurrency}\t{ready.phase}\t{ready.wall_ms:.3f}"
+        )
+    except BenchmarkError as error:
+        failure = error
+    finally:
+        supervisor_cleaned = False
+        if process is not None and process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=60)
+                supervisor_cleaned = process.returncode == 0
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                process.wait()
+                raise BenchmarkError("smolworld supervisor did not cleanly stop") from error
+        elif process is not None:
+            supervisor_cleaned = process.returncode == 0
+        for reader in readers:
+            reader.join(timeout=1)
+        if not supervisor_cleaned and state_dir.exists():
+            down = subprocess.run(
+                [str(smolworld_bin), "--file", str(config), "down"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=environment,
+                check=False,
+            )
+            if down.returncode != 0 and state_dir.exists():
+                cleanup_recorded_benchmark_world_machines(smolvm_bin, state_dir)
+        if state_dir.exists():
+            shutil.rmtree(state_dir)
+        shutil.rmtree(root)
+    if failure is not None:
+        emit(
+            f"failure_sample\tworld\tparallel\t{iteration}\t{concurrency}\t{phase}\t"
+            f"{tsv_field(failure)}"
+        )
+
+
+def run_cold_scenario(
+    smolvm_bin: Path,
+    archive: Path,
+    iteration: int,
+    concurrency: int,
+    profile: str,
+    mode: str,
+    samples: list[TimingSample],
+    waves: list[WaveSample],
+) -> None:
+    """Measure one private machine-runtime scenario and remove its exact identities."""
+
+    runtime_root = Path(tempfile.mkdtemp(prefix=f"smw-transition-{secrets.token_hex(6)}.", dir="/tmp"))
+    benchmark = SmolvmBenchmark(smolvm_bin, archive, runtime_root)
+    names = scenario_names(
+        f"smw-bench-{os.getpid()}-{iteration}-{profile[0]}-{mode[0]}-{concurrency}", concurrency
+    )
+    forkable = profile == "archive_forkable"
+    phase = "reserve"
+    failure: BenchmarkError | None = None
+    try:
+        benchmark.reserve_names(names)
+        phase = "create"
+        emit_wave(
+            samples,
+            waves,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "create",
+            runtime_root,
+            lambda: run_wave(
+                names,
+                mode,
+                lambda name: benchmark.create_machine(name, archive),
+            ),
+        )
+        phase = "start"
+        emit_wave(
+            samples,
+            waves,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "start",
+            runtime_root,
+            lambda: run_wave(names, mode, lambda name: benchmark.start_machine(name, forkable)),
+        )
+        phase = "agent_exec"
+        emit_wave(
+            samples,
+            waves,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "agent_exec",
+            runtime_root,
+            lambda: run_wave(names, mode, benchmark.verify_guest_agent),
+        )
+        phase = "mutation"
+        emit_wave(
+            samples,
+            waves,
+            profile,
+            mode,
+            iteration,
+            concurrency,
+            "mutation",
+            runtime_root,
+            lambda: run_wave(
+                names,
+                mode,
+                lambda name: benchmark.write_mutation(name, f"{profile}-{iteration}-{name}"),
+            ),
+        )
+    except BenchmarkError as error:
+        failure = error
+    try:
+        benchmark.cleanup()
+    except BenchmarkError as cleanup_error:
+        if failure is None:
+            raise
+        raise BenchmarkError(f"{failure}; cleanup also failed: {cleanup_error}") from cleanup_error
+    if failure is not None:
+        emit(
+            f"failure_sample\t{profile}\t{mode}\t{iteration}\t{concurrency}\t{phase}\t"
+            f"{tsv_field(failure)}"
+        )
+
+
+def run_fork_reference(
+    smolvm_bin: Path,
+    archive: Path,
+    iteration: int,
+    branches: int,
+    samples: list[TimingSample],
+    waves: list[WaveSample],
+) -> None:
+    """Retain a one-to-many fork reference against the cold matrix.
+
+    A golden is paused as part of a fork request, so the upstream lifecycle
+    contract permits only one request against a golden at a time.  Keep fork
+    creation serial and measure clone work separately, rather than turning
+    rejected concurrent requests into a misleading performance result.
+    """
+
+    runtime_root = Path(
+        tempfile.mkdtemp(prefix=f"smw-fork-reference-{secrets.token_hex(6)}.", dir="/tmp")
+    )
+    benchmark = SmolvmBenchmark(smolvm_bin, archive, runtime_root)
+    golden = f"smw-fork-{os.getpid()}-{iteration}-golden"
+    clones = scenario_names(f"smw-fork-{os.getpid()}-{iteration}-clone", branches)
+    try:
+        benchmark.reserve_names([golden])
+        emit_wave(
+            samples,
+            waves,
+            "fork",
+            "serial",
+            iteration,
+            1,
+            "create_golden",
+            runtime_root,
+            lambda: run_wave(
+                [golden], "serial", lambda name: benchmark.create_machine(name, archive)
+            ),
+        )
+        emit_wave(
+            samples,
+            waves,
+            "fork",
+            "serial",
+            iteration,
+            1,
+            "start_golden",
+            runtime_root,
+            lambda: run_wave([golden], "serial", lambda name: benchmark.start_machine(name, True)),
+        )
+        benchmark.reserve_names(clones)
+        emit_wave(
+            samples,
+            waves,
+            "fork",
+            "serial",
+            iteration,
+            branches,
+            "fork",
+            runtime_root,
+            lambda: run_wave(clones, "serial", lambda clone: benchmark.fork(golden, clone)),
+        )
+        emit_wave(
+            samples,
+            waves,
+            "fork",
+            "parallel",
+            iteration,
+            branches,
+            "mutation",
+            runtime_root,
+            lambda: run_wave(
+                clones,
+                "parallel",
+                lambda clone: benchmark.write_mutation(clone, f"fork-{iteration}-{clone}"),
+            ),
+        )
+    finally:
+        benchmark.cleanup()
+
+
+def emit_summary(samples: Sequence[TimingSample]) -> None:
+    for profile, mode, concurrency, phase, count, p50_ms, p95_ms in summarize_samples(samples):
+        emit(
+            f"summary\t{profile}\t{mode}\t{concurrency}\t{phase}\t{count}\t"
+            f"{p50_ms:.3f}\t{p95_ms:.3f}"
+        )
+
+    grouped = {
+        (profile, mode, concurrency, phase): p50_ms
+        for profile, mode, concurrency, phase, _count, p50_ms, _p95_ms in summarize_samples(samples)
+    }
+    for profile in ("archive", "archive_forkable"):
+        for concurrency in sorted(
+            {sample.concurrency for sample in samples if sample.profile == profile}
+        ):
+            serial = grouped.get((profile, "serial", concurrency, "start"))
+            parallel = grouped.get((profile, "parallel", concurrency, "start"))
+            if serial is not None and parallel is not None:
+                emit(
+                    f"comparison\tparallel_over_serial_start\t{profile}\t{concurrency}\t"
+                    f"{parallel - serial:.3f}"
+                )
+
+
+def emit_wave_summary(waves: Sequence[WaveSample]) -> None:
+    """Emit p50/p95 for barriers that cannot be reduced to one machine sample."""
+
+    emit("wave_summary\tprofile\tmode\tconcurrency\tphase\tsamples\tp50_ms\tp95_ms")
+    for profile, mode, concurrency, phase, count, p50_ms, p95_ms in summarize_waves(waves):
+        emit(
+            f"wave_summary\t{profile}\t{mode}\t{concurrency}\t{phase}\t{count}\t"
+            f"{p50_ms:.3f}\t{p95_ms:.3f}"
         )
 
 
@@ -287,84 +962,67 @@ def main() -> int:
         raise BenchmarkError("set SMOLWORLD_TRANSITION_BENCH=1 to run VM-transition measurements")
 
     smolvm_bin = require_file("SMOLVM_BIN")
+    smolworld_bin = require_executable(
+        "SMOLWORLD_BIN", Path(__file__).resolve().parents[1] / "target" / "debug" / "smolworld"
+    )
     agent_rootfs = require_directory("SMOLVM_AGENT_ROOTFS")
     archive = require_file("SMOLWORLD_TRANSITION_ARCHIVE")
     iterations = positive_integer("SMOLWORLD_TRANSITION_ITERATIONS", 3)
     branches = positive_integer("SMOLWORLD_TRANSITION_BRANCHES", 3)
-
-    # A deep macOS TMPDIR forces SmolVM to a shared fallback socket root. A
-    # unique direct child of /tmp stays below Darwin's sockaddr_un path limit,
-    # preserving both private state and a valid byte census.
-    runtime_root = Path(
-        tempfile.mkdtemp(prefix=f"smolworld-transition-benchmark-{secrets.token_hex(8)}.", dir="/tmp")
+    concurrency = parse_concurrency_levels(
+        os.environ.get("SMOLWORLD_TRANSITION_CONCURRENCY", "1,2,4")
     )
     os.environ["SMOLVM_AGENT_ROOTFS"] = str(agent_rootfs)
-    os.environ["SMOLVM_RUNTIME_ROOT"] = str(runtime_root)
-    benchmark = SmolvmBenchmark(smolvm_bin, archive, runtime_root)
 
     def interrupt(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupt)
-
-    emit("# smolworld transition substrate benchmark")
+    samples: list[TimingSample] = []
+    waves: list[WaveSample] = []
+    emit("# smolworld transition substrate benchmark v2")
     emit(f"# archive={archive}")
     emit(
-        f"# iterations={iterations} branches={branches} cpus=1 memory_mib=256 "
-        f"mutation_bytes={MUTATION_BYTES}"
+        f"# iterations={iterations} branches={branches} concurrency={','.join(map(str, concurrency))} "
+        f"cpus=1 memory_mib=256 mutation_bytes={MUTATION_BYTES}"
     )
-    emit(f"# smolvm_runtime_root={runtime_root} (removed after the run)")
+    emit("# archive cache is user-owned and is never cleared by this benchmark")
     emit(
-        "# accounted_file_blocks_delta_bytes counts APFS-shared clone blocks per file; "
-        "volume_used_delta_bytes is physical but host-noisy"
+        "machine_sample\tprofile\tmode\titeration\tconcurrency\tphase\tmachine\twall_ms"
     )
     emit(
-        "operation\titeration\tbranch\twall_ms\t"
-        "accounted_file_blocks_delta_bytes\tvolume_used_delta_bytes"
+        "wave_sample\tprofile\tmode\titeration\tconcurrency\tphase\twall_ms"
     )
+    emit("failure_sample\tprofile\tmode\titeration\tconcurrency\tphase\terror")
 
-    try:
-        for iteration in range(1, iterations + 1):
-            golden = f"smw-transition-bench-{os.getpid()}-{iteration}-golden"
-            benchmark.measure("create", iteration, "base", lambda: benchmark.create_machine(golden))
-            benchmark.measure("start", iteration, "base", lambda: benchmark.start_golden(golden))
-            benchmark.measure(
-                "base_mutation",
+    for iteration in range(1, iterations + 1):
+        for count in concurrency:
+            for mode in ("serial", "parallel"):
+                for profile in ("archive", "archive_forkable"):
+                    run_cold_scenario(
+                        smolvm_bin,
+                        archive,
+                        iteration,
+                        count,
+                        profile,
+                        mode,
+                        samples,
+                        waves,
+                    )
+            run_world_probe(
+                smolworld_bin,
+                smolvm_bin,
+                archive,
                 iteration,
-                "base",
-                lambda: benchmark.write_mutation(golden, f"base-{iteration}"),
+                count,
+                samples,
+                waves,
             )
+        run_fork_reference(smolvm_bin, archive, iteration, branches, samples, waves)
 
-            for branch in range(1, branches + 1):
-                clone = f"smw-transition-bench-{os.getpid()}-{iteration}-clone-{branch}"
-                benchmark.measure("fork", iteration, str(branch), lambda: benchmark.fork(golden, clone))
-                benchmark.measure(
-                    "fork_mutation",
-                    iteration,
-                    str(branch),
-                    lambda: benchmark.write_mutation(clone, f"fork-{iteration}-{branch}"),
-                )
-
-                cold = f"smw-transition-bench-{os.getpid()}-{iteration}-cold-{branch}"
-                benchmark.measure(
-                    "cold_create", iteration, str(branch), lambda: benchmark.create_machine(cold)
-                )
-                benchmark.measure(
-                    "cold_start", iteration, str(branch), lambda: benchmark.start_cold(cold)
-                )
-                benchmark.measure(
-                    "cold_mutation",
-                    iteration,
-                    str(branch),
-                    lambda: benchmark.write_mutation(cold, f"cold-{iteration}-{branch}"),
-                )
-
-            # Bound disk use and ensure the next sample has no earlier base or
-            # clone competing for VMM or filesystem resources.
-            benchmark.cleanup_iteration()
-    finally:
-        benchmark.cleanup()
-
+    emit("summary\tprofile\tmode\tconcurrency\tphase\tsamples\tp50_ms\tp95_ms")
+    emit_summary(samples)
+    emit_wave_summary(waves)
     return 0
 
 
@@ -375,5 +1033,5 @@ if __name__ == "__main__":
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(2)
     except KeyboardInterrupt:
-        print("interrupted: cleaned exact benchmark machines and runtime root", file=sys.stderr)
+        print("interrupted: cleaned exact benchmark machines and runtime roots", file=sys.stderr)
         raise SystemExit(130)
