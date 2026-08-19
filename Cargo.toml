@@ -13,3 +13,14 @@ yaml-rust2 = "0.11"
 [[bin]]
 name = "smolworld"
 path = "src/main.rs"
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+panic = "abort"
+strip = true
