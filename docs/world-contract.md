@@ -308,6 +308,16 @@ disposable allocation, lifecycle, and generated-material state with the
 private configuration materialization. With the variable unset, the ordinary
 per-user `~/.smolworld` namespace remains the local CLI default.
 
+`SMOLVM_DATA_DIR`, when set by the caller, is forwarded unchanged to every
+selected upstream SmolVM command, including commands issued by the detached
+world supervisor. It selects SmolVM's separate caller-owned VM and image-data
+namespace; SmolVM validates the root and never falls back to an unrelated
+temporary directory for a selected root. This is host execution placement, not
+world definition: it has no `.smolworld` field, receipt field, or plan
+projection, and it remains distinct from `SMOLWORLD_STATE_ROOT`. A caller that
+requires exact ownership must set it consistently for `prepare`, lifecycle,
+checkpoint, restore, and release.
+
 ### Stats schema
 
 `stats` is read-only. It reads only world allocation records and never lists
