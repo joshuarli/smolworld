@@ -271,7 +271,8 @@ smolworld images [-f PATH] [--format table|json]    Show sealed service image ma
 smolworld exec [-f PATH] [OPTIONS] SERVICE CMD...   Delegate one command to a running service.
 smolworld shell [-f PATH] SERVICE                    Open /bin/sh in a running service.
 smolworld cp [-f PATH] SOURCE DEST                  Copy one regular file through the agent.
-smolworld checkpoint [-f PATH] --output DIR         Capture and retain the running world.
+smolworld checkpoint [-f PATH] --output DIR [--parent DIR]
+                                                   Capture and retain the running world.
 smolworld restore [-f PATH] --checkpoint DIR        Restore a retained same-lineage world.
 smolworld release [-f PATH] --checkpoint DIR        Delete exactly a retained world.
 smolworld down [-f PATH]                            Stop and delete this world's machines.
@@ -396,6 +397,15 @@ Restoring RAM from one point with disk or network state from another is
 invalid. The initial implementation may exit captured VMs and restore a fresh
 child; capture-and-continue is an optimization and must not change the receipt
 or transaction contract.
+
+With `--parent DIR`, the supplied parent is first verified as an exact
+same-lineage world checkpoint. Smolworld then passes each exact
+`machines/<name>` parent only to its matching SmolVM machine capture. SmolVM
+may persist that machine as a changed-block durable descendant instead of a
+second complete RAM/disk artifact; Smolworld keeps the machine receipt opaque
+and still seals its bounded digest in the coherent world receipt. A missing or
+altered parent, mixed machine set, incompatible material/configuration, or
+unsupported chain is rejected before any child receipt is published.
 
 The published checkpoint receipt includes a bounded BLAKE3 digest for each
 opaque machine checkpoint-control receipt. `restore` and `release` recompute

@@ -588,11 +588,19 @@ pub(crate) fn start_machine(smolvm: &Path, name: &str) -> Result<()> {
 }
 
 /// Capture one forkable world machine into a checkpoint-owned subdirectory.
-pub(crate) fn checkpoint_machine(smolvm: &Path, name: &str, output: &Path) -> Result<()> {
+pub(crate) fn checkpoint_machine(
+    smolvm: &Path,
+    name: &str,
+    output: &Path,
+    parent: Option<&Path>,
+) -> Result<()> {
     let mut command = Command::new(smolvm);
     command
         .args(["machine", "checkpoint", "--name", name, "--output"])
         .arg(output);
+    if let Some(parent) = parent {
+        command.arg("--parent").arg(parent);
+    }
     companion_adapter::captured_status(Operation::Checkpoint, &mut command)
 }
 
@@ -955,7 +963,7 @@ mod tests {
         assert!(start_machine(&fake, "smw-runner")
             .unwrap_err()
             .contains("start"));
-        checkpoint_machine(&fake, "smw-runner", &root.join("checkpoint")).unwrap();
+        checkpoint_machine(&fake, "smw-runner", &root.join("checkpoint"), None).unwrap();
         restore_machine(
             &fake,
             "smw-runner",

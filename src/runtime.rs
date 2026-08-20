@@ -27,7 +27,7 @@ use crate::state::{
     world_paths, write_allocation_state, write_lifecycle, write_material_lock,
     write_world_checkpoint_receipt, ImageMaterial, MaterialLock, SeedObservation,
     SmolfileObservation, WorldLock, WorldPaths, validate_recorded_smolvm_name,
-    MACHINE_CHECKPOINT_RECEIPT_NAME,
+    machine_checkpoint_receipt_path,
 };
 use crate::switch::{
     port_socket_path, print_allocations, run_switch, spawn_port_acceptor, wait_for_attachments,
@@ -94,7 +94,7 @@ pub(crate) fn run(cli: Cli) -> Result<()> {
         Cli::Rm { config, services } => lifecycle(&config, LifecycleCommand::Rm, &services),
         Cli::Check { config, deep } => check(&config, deep),
         Cli::Prepare { config } => prepare(&config),
-        Cli::Checkpoint { config, output } => checkpoint(&config, &output),
+        Cli::Checkpoint { config, output, parent } => checkpoint(&config, &output, parent.as_deref()),
         Cli::Restore { config, checkpoint } => restore(&config, &checkpoint),
         Cli::Release { config, checkpoint } => release(&config, &checkpoint),
         Cli::Down { config } => down(&config),
@@ -682,7 +682,7 @@ fn apply_lifecycle_control(
 /// Ask the current supervisor, rather than a second CLI process, to close the
 /// switch epoch and capture its live machines. The runtime directory socket is
 /// private to this exact world and vanishes when the supervisor exits.
-pub(crate) fn checkpoint(config_path: &Path, output: &Path) -> Result<()> {
+pub(crate) fn checkpoint(config_path: &Path, output: &Path, parent: Option<&Path>) -> Result<()> {
     if !output.is_absolute() {
         return Err("checkpoint --output must be an absolute directory".into());
     }
@@ -693,8 +693,13 @@ pub(crate) fn checkpoint(config_path: &Path, output: &Path) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(30 * 60)))
         .map_err(|error| format!("set checkpoint reply timeout: {error}"))?;
+    let request = match parent {
+        Some(parent) if parent.is_absolute() => format!("checkpoint\t{}\t{}\n", output.display(), parent.display()),
+        Some(_) => return Err("checkpoint --parent must be an absolute directory".into()),
+        None => format!("checkpoint\t{}\n", output.display()),
+    };
     stream
-        .write_all(format!("checkpoint\t{}\n", output.display()).as_bytes())
+        .write_all(request.as_bytes())
         .map_err(|error| format!("write checkpoint request: {error}"))?;
     let reply = read_runtime_control_line(&mut stream)?;
     if reply == "OK captured" {
@@ -812,7 +817,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
                         RuntimeControlCommand::Ping => {
                             let _ = write_runtime_control_reply(&mut stream, "OK\n");
                         }
-                        RuntimeControlCommand::Checkpoint { output } => {
+                        RuntimeControlCommand::Checkpoint { output, parent } => {
                             match checkpoint_running_world(
                                 &config,
                                 &state,
@@ -821,6 +826,7 @@ pub(crate) fn restore(config_path: &Path, checkpoint: &Path) -> Result<()> {
                                 &switch_tx,
                                 &attached_rx,
                                 &output,
+                                parent.as_deref(),
                             ) {
                                 Ok(()) => {
                                     STOP_REQUESTED.store(true, Ordering::SeqCst);
@@ -982,6 +988,7 @@ enum RuntimeControlCommand {
     Ping,
     Checkpoint {
         output: PathBuf,
+        parent: Option<PathBuf>,
     },
     Lifecycle {
         action: LifecycleCommand,
@@ -1027,14 +1034,24 @@ fn read_runtime_control_command(stream: &mut UnixStream) -> Result<RuntimeContro
         .split_once('\t')
         .ok_or_else(|| "supervisor request is malformed".to_string())?;
     if verb == "checkpoint" {
-        if argument.is_empty()
-            || argument.contains(['\t', '\r', '\n'])
-            || !Path::new(argument).is_absolute()
+        let (output, parent) = match argument.split_once('\t') {
+            Some((output, parent)) => (output, Some(parent)),
+            None => (argument, None),
+        };
+        if output.is_empty()
+            || output.contains(['\t', '\r', '\n'])
+            || !Path::new(output).is_absolute()
+            || parent.is_some_and(|parent| {
+                parent.is_empty()
+                    || parent.contains(['\t', '\r', '\n'])
+                    || !Path::new(parent).is_absolute()
+            })
         {
             return Err("supervisor request is malformed".into());
         }
         return Ok(RuntimeControlCommand::Checkpoint {
-            output: PathBuf::from(argument),
+            output: PathBuf::from(output),
+            parent: parent.map(PathBuf::from),
         });
     }
     let action = match verb {
@@ -1274,7 +1291,7 @@ pub(crate) fn up(config_path: &Path, requested_services: &[String], detach: bool
                         RuntimeControlCommand::Ping => {
                             let _ = write_runtime_control_reply(&mut stream, "OK\n");
                         }
-                        RuntimeControlCommand::Checkpoint { output } => {
+                        RuntimeControlCommand::Checkpoint { output, parent } => {
                             match checkpoint_running_world(
                                 &config,
                                 &state,
@@ -1283,6 +1300,7 @@ pub(crate) fn up(config_path: &Path, requested_services: &[String], detach: bool
                                 &switch_tx,
                                 &attached_rx,
                                 &output,
+                                parent.as_deref(),
                             ) {
                                 Ok(()) => {
                                     retain_checkpoint_sources = true;
@@ -1968,8 +1986,9 @@ mod tests {
             read_runtime_control_command(&mut reader)
         };
         match parse("checkpoint\t/private/tmp/world\n") {
-            Ok(RuntimeControlCommand::Checkpoint { output }) => {
+            Ok(RuntimeControlCommand::Checkpoint { output, parent }) => {
                 assert_eq!(output, PathBuf::from("/private/tmp/world"));
+                assert_eq!(parent, None);
             }
             Err(error) => panic!("valid supervisor request failed: {error}"),
             Ok(

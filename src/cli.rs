@@ -163,6 +163,7 @@ pub(crate) enum Cli {
     Checkpoint {
         config: PathBuf,
         output: PathBuf,
+        parent: Option<PathBuf>,
     },
     /// Start a new supervisor around a previously captured world receipt.
     Restore {
@@ -445,6 +446,16 @@ pub(crate) const OUTPUT_OPTION: OptionSpec = OptionSpec {
     repeatable: false,
     default: None,
     help: "Write the new checkpoint into this directory",
+};
+
+pub(crate) const PARENT_OPTION: OptionSpec = OptionSpec {
+    short: None,
+    long: "parent",
+    value_name: Some("DIR"),
+    required: false,
+    repeatable: false,
+    default: None,
+    help: "Capture changed machine blocks against this exact retained world checkpoint",
 };
 
 pub(crate) const CHECKPOINT_OPTION: OptionSpec = OptionSpec {
@@ -1262,6 +1273,20 @@ mod tests {
             Cli::Ps { config, format: PsFormat::Table, .. } if config == *"demo"
         ));
         assert!(matches!(
+            parse_cli(vec![
+                "checkpoint".into(),
+                "--output".into(),
+                "/private/tmp/w2".into(),
+                "--parent".into(),
+                "/private/tmp/w1".into(),
+            ])
+            .unwrap(),
+            Cli::Checkpoint { config, output, parent: Some(parent) }
+                if config == *".smolworld"
+                    && output == *"/private/tmp/w2"
+                    && parent == *"/private/tmp/w1"
+        ));
+        assert!(matches!(
             parse_cli(vec!["ps".into(), "--file".into(), "demo".into()]).unwrap(),
             Cli::Ps { config, format: PsFormat::Table, .. } if config == *"demo"
         ));
@@ -1326,7 +1351,7 @@ mod tests {
                 "world.smolworld".into(),
             ])
             .unwrap(),
-            Cli::Checkpoint { config, output }
+            Cli::Checkpoint { config, output, parent: None }
                 if config == *"world.smolworld"
                     && output == *"/private/tmp/w1"
         ));

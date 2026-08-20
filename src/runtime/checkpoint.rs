@@ -36,10 +36,7 @@ pub(super) fn verify_world_checkpoint_receipt(
         return Err("checkpoint machine receipt set does not match the configured world".into());
     }
     for name in config.machines.keys() {
-        let receipt_path = checkpoint
-            .join("machines")
-            .join(name)
-            .join(MACHINE_CHECKPOINT_RECEIPT_NAME);
+        let receipt_path = machine_checkpoint_receipt_path(&checkpoint.join("machines").join(name))?;
         let actual = digest_machine_checkpoint_receipt(&receipt_path)
             .map_err(|error| format!("checkpoint machine '{name}' receipt: {error}"))?;
         let expected = &receipt
@@ -69,7 +66,15 @@ pub(super) fn checkpoint_running_world(
     switch_tx: &mpsc::Sender<SwitchEvent>,
     attached_rx: &mpsc::Receiver<String>,
     output: &Path,
+    parent_checkpoint: Option<&Path>,
 ) -> Result<()> {
+    if let Some(parent_checkpoint) = parent_checkpoint {
+        if !parent_checkpoint.is_absolute() {
+            return Err("checkpoint parent must be an absolute directory".into());
+        }
+        let parent_receipt = load_world_checkpoint_receipt(parent_checkpoint)?;
+        verify_world_checkpoint_receipt(config, paths, state, parent_checkpoint, &parent_receipt)?;
+    }
     let (parent, staging) = create_world_checkpoint_staging(output)?;
     if let Err(error) = mark_capturing(paths) {
         let _ = fs::remove_dir_all(&staging);
@@ -105,7 +110,13 @@ pub(super) fn checkpoint_running_world(
             "switch checkpoint cut does not match the running world ports".to_string(),
         );
     }
-    let captures = parallel_checkpoint_machines(&names, smolvm, state, &machines_root);
+    let captures = parallel_checkpoint_machines(
+        &names,
+        smolvm,
+        state,
+        &machines_root,
+        parent_checkpoint,
+    );
     let completed: Vec<_> = captures
         .iter()
         .filter_map(|(name, result)| result.is_ok().then_some(name.clone()))
@@ -126,9 +137,7 @@ pub(super) fn checkpoint_running_world(
     let machine_receipts = match names
         .iter()
         .map(|name| {
-            let path = machines_root
-                .join(name)
-                .join(MACHINE_CHECKPOINT_RECEIPT_NAME);
+            let path = machine_checkpoint_receipt_path(&machines_root.join(name))?;
             digest_machine_checkpoint_receipt(&path)
                 .map(|digest| (name.clone(), MachineCheckpointReceipt { digest }))
         })
@@ -300,6 +309,7 @@ fn parallel_checkpoint_machines(
     smolvm: &Path,
     state: &crate::model::WorldAllocationState,
     machines_root: &Path,
+    parent_checkpoint: Option<&Path>,
 ) -> Vec<(String, Result<()>)> {
     thread::scope(|scope| {
         let handles: Vec<_> = names
@@ -307,8 +317,15 @@ fn parallel_checkpoint_machines(
             .map(|name| {
                 let assignment = state.assignments.get(name).expect("allocated machine");
                 let checkpoint = machines_root.join(name);
-                scope
-                    .spawn(move || checkpoint_machine(smolvm, &assignment.smolvm_name, &checkpoint))
+                let parent = parent_checkpoint.map(|parent| parent.join("machines").join(name));
+                scope.spawn(move || {
+                    checkpoint_machine(
+                        smolvm,
+                        &assignment.smolvm_name,
+                        &checkpoint,
+                        parent.as_deref(),
+                    )
+                })
             })
             .collect();
         handles
